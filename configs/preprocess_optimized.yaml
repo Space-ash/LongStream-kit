@@ -1,0 +1,76 @@
+# LongStream 预处理模板：Optimized
+# 用途：
+# - 推荐的增强预处理
+# - 启用 Depth Anything V2 预计算
+# - 适合作为当前主要实验配置
+
+input:
+  mode: video
+  source_path: ../zhan/1/2026-03-27-14-15-51.avi
+  recursive_images: false
+
+io:
+  scene_name: terrains
+  camera_id: "00"
+  image_ext: png
+  overwrite: true
+  normalized_root: prepared_inputs/preprocess/raw
+  final_root: prepared_inputs/preprocess/final
+
+video:
+  enabled: true
+  target_fps: 1.0
+
+dynamic_filter:
+  enabled: false
+  backend: depth_pnp_lk
+  model_path: ./model/yolo11n-seg.pt
+  dynamic_class_ids: [0, 1, 2, 3, 5, 7]
+  conf: 0.25
+  iou: 0.5
+  max_corners: 1000
+  lk_win_size: [31, 31]
+  lk_max_level: 4
+  pixel_error_threshold: 4.0
+  dynamic_ratio_threshold: 0.6
+  min_motion_magnitude: 2.0
+  min_mask_area: 80
+  max_mask_points: 60
+  pnp_reprojection_error: 4.0
+  pnp_iterations_count: 100
+  pnp_confidence: 0.999
+  depth_error_threshold: 0.2
+  depth_error_min: 0.1
+  virtual_focal_scale: 1.2
+  depth_eps: 0.001
+  depth_floor_percentile: 1.0
+  mask_core_kernel_size: 0
+  mask_core_iterations: 1
+  dilation_kernel_size: 5
+  dilation_iterations: 2
+  temporal_consistency_enabled: true
+  temporal_window_size: 7
+  temporal_vote_ratio_threshold: 0.6
+  temporal_min_track_length: 3
+  temporal_match_iou_threshold: 0.2
+  temporal_max_center_distance_ratio: 0.75
+  sort_max_age: 15
+  sort_min_hits: 3
+  sort_iou_threshold: 0.3
+  non_rigid_flow_variance_threshold: 5.0
+  fallback_keep_semantic_if_geometry_fails: true
+  save_preview_video: true
+  preview_fps: 10.0
+  random_seed: 0
+
+depth_anything_v2:
+  enabled: true
+  repo_path: Depth-Anything-V2
+  checkpoint_path: model/depth_anything_v2_vits.pth
+  encoder: vits
+  input_size: 518
+  device: auto
+  grayscale: true
+  save_raw_npy: true
+  save_visualization: true
+  save_comparison: true

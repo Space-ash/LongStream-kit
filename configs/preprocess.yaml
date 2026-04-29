@@ -1,0 +1,103 @@
+# =========================
+# LongStream 预处理配置
+# 作用范围：
+# 1. 原始视频/图片 -> generalizable 标准目录
+# 2. 可选的 Depth Anything V2 深度预计算
+#
+# 说明：
+# - 这个文件只放“预处理阶段”参数。
+# - 重建 / 点云导出 / 评估参数统一放在 configs/longstream_infer.yaml。
+# - dynamic_filter 当前作为预留配置保留在这里，便于后续接入和做对比实验。
+# =========================
+
+# -------------------------
+# 输入源配置
+# -------------------------
+input:
+  mode: video                # video | images | prepared
+  source_path: ../zhan/1/2026-03-27-14-15-51.avi
+  recursive_images: false    # mode=images 时是否递归扫描子目录
+
+# -------------------------
+# 预处理输出目录
+# -------------------------
+io:
+  scene_name: terrains
+  camera_id: "00"
+  image_ext: png             # png | jpg | jpeg
+  overwrite: true
+  normalized_root: prepared_inputs/preprocess/raw
+  final_root: prepared_inputs/preprocess/final
+
+# -------------------------
+# 视频抽帧参数
+# 仅在 input.mode=video 时生效
+# -------------------------
+video:
+  enabled: true             # 仅作为实验开关提示；实际是否执行由 input.mode 控制
+  target_fps: 1.0           # <= 0 表示保留全部帧
+
+# -------------------------
+# 动态区域过滤（预留）
+# 当前主预处理脚本未自动消费这一节，但参数集中保留在这里，
+# 方便后续接入/对比实验时直接开关和调参。
+# -------------------------
+dynamic_filter:
+  enabled: false
+  backend: depth_pnp_lk
+  model_path: ./model/yolo11n-seg.pt
+  dynamic_class_ids: [0, 1, 2, 3, 5, 7]
+  conf: 0.25
+  iou: 0.5
+  max_corners: 1000
+  lk_win_size: [31, 31]
+  lk_max_level: 4
+  pixel_error_threshold: 4.0
+  dynamic_ratio_threshold: 0.6
+  min_motion_magnitude: 2.0
+  min_mask_area: 80
+  max_mask_points: 60
+  pnp_reprojection_error: 4.0
+  pnp_iterations_count: 100
+  pnp_confidence: 0.999
+  depth_error_threshold: 0.2
+  depth_error_min: 0.1
+  virtual_focal_scale: 1.2
+  depth_eps: 0.001
+  depth_floor_percentile: 1.0
+  mask_core_kernel_size: 0
+  mask_core_iterations: 1
+  dilation_kernel_size: 5
+  dilation_iterations: 2
+  temporal_consistency_enabled: true
+  temporal_window_size: 7
+  temporal_vote_ratio_threshold: 0.6
+  temporal_min_track_length: 3
+  temporal_match_iou_threshold: 0.2
+  temporal_max_center_distance_ratio: 0.75
+  sort_max_age: 15
+  sort_min_hits: 3
+  sort_iou_threshold: 0.3
+  non_rigid_flow_variance_threshold: 5.0
+  fallback_keep_semantic_if_geometry_fails: true
+  save_preview_video: true
+  preview_fps: 10.0
+  random_seed: 0
+
+# -------------------------
+# Depth Anything V2 预计算
+# run_depth_anything_v2_preprocess.py 会读取这一节
+# -------------------------
+depth_anything_v2:
+  enabled: true
+  repo_path: Depth-Anything-V2
+  checkpoint_path: model/depth_anything_v2_vits.pth
+  encoder: vits             # vits | vitb | vitl | vitg
+  input_size: 518
+  device: auto              # auto | cuda | cpu | mps
+
+  # 导出开关：方便做 ablation / 省磁盘
+  grayscale: true
+  save_raw_npy: true
+  save_visualization: true
+  save_comparison: true
