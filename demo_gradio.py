@@ -23,6 +23,9 @@ from typing import Optional
 import gradio as gr
 import yaml
 
+# 关闭 Gradio analytics，避免回调异常后触发 pandas/numpy ABI 二次报错
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+
 # ─── Config template paths ────────────────────────────────────────────────
 _CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "configs")
 _TEMPLATE_PATHS = {
@@ -56,6 +59,17 @@ _SRC_TYPE_MAP = {
     "NPZ 文件 (npz)":       "npz",
     "Generalizable 目录":   "generalizable",
 }
+# 反向映射：format 字符串 → Dropdown 标签
+_FORMAT_TO_SRC_LABEL = {v: k for k, v in _SRC_TYPE_MAP.items()}
+
+
+def _seq_list_to_text(value) -> str:
+    """将 YAML seq_list 转换为逗号分隔字符串（允许字符串或列表两种输入）。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return ", ".join(str(x) for x in value)
 
 # ─── Global runner state ──────────────────────────────────────────────────
 _runner_lock   = threading.Lock()
@@ -201,16 +215,19 @@ _ADVANCED_YAML_PLACEHOLDER = (
 def update_ui_from_yaml(template_name: str) -> tuple:
     """
     Load template YAML and refresh bound UI components.
-    Returns 14 values:
+    Returns 22 values:
       window_size, refresh, keyframe_stride, confidence_threshold,
-      max_frame_points, enable_tto, enable_filter, enable_conf_filter,
+      max_frame_points, max_full_points,
+      enable_tto, enable_filter, enable_conf_filter,
       save_outputs, target_fps, simulate_streaming, enable_rerun,
-      cfg_state (new base dict), config_preview (formatted YAML text)
+      cfg_state (new base dict), config_preview,
+      output_root, source_path, data_roots_file, seq_list, camera,
+      source_type (dropdown label), generalizable_row (visibility update)
     advanced_yaml is NOT updated here — it remains the user's override box.
     """
     if template_name == "Custom":
         # No-op: keep all current values unchanged
-        return tuple(gr.update() for _ in range(14))
+        return tuple(gr.update() for _ in range(22))
 
     cfg   = _load_template(template_name)
     infer = cfg.get("inference", {})
@@ -227,6 +244,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
     out = cfg.get("output", {})
     data_fmt = data.get("format", "image_dir")
     is_gen = (data_fmt == "generalizable")
+    source_label = _FORMAT_TO_SRC_LABEL.get(data_fmt, "图片目录 (image_dir)")
 
     preview_text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
 
@@ -246,11 +264,13 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         gr.update(value=rerun_val),                          # 13 enable_rerun
         cfg,                                                 # 14 cfg_state (new base)
         gr.update(value=preview_text),                       # 15 config_preview
-        gr.update(value=out.get("root", "outputs")),        # 16 output_root
-        gr.update(value=data.get("img_path", "")),          # 17 source_path
+        gr.update(value=out.get("root", "outputs")),         # 16 output_root
+        gr.update(value=data.get("img_path", "")),           # 17 source_path
         gr.update(value=data.get("data_roots_file", "data_roots.txt")),  # 18 data_roots_file
-        gr.update(value=", ".join(data.get("seq_list", ["Scene01/clone"]))),  # 19 seq_list
-        gr.update(value=str(data.get("camera", "00"))),     # 20 camera
+        gr.update(value=_seq_list_to_text(data.get("seq_list"))),         # 19 seq_list
+        gr.update(value=str(data.get("camera", "00"))),      # 20 camera
+        gr.update(value=source_label),                       # 21 source_type dropdown
+        gr.update(visible=is_gen),                           # 22 generalizable_row
     )
 
 
@@ -281,9 +301,17 @@ def _build_cfg_from_ui(
     seq_list: str = "",
     camera: str = "00",
 ) -> dict:
-    """Build complete cfg from UI values using base_cfg (from cfg_state) as the foundation."""
+    """Build complete cfg from UI values using base_cfg (from cfg_state) as the foundation.
+
+    覆盖顺序（后者优先级更高）：
+      base_cfg → advanced_yaml → UI slider/checkbox → UI 路径字段
+    """
+    # 1. 以模板为基础，先应用高级覆盖（advanced_yaml 覆盖 base）
+    cfg = copy.deepcopy(base_cfg)
+    cfg = _apply_advanced_overrides(cfg, advanced_yaml)
+    # 2. UI slider/checkbox 字段覆盖 advanced
     cfg = _merge_basic_into_cfg(
-        base_cfg,
+        cfg,
         window_size=window_size, refresh=refresh,
         keyframe_stride=keyframe_stride,
         confidence_threshold=confidence_threshold,
@@ -295,7 +323,7 @@ def _build_cfg_from_ui(
         save_outputs=save_outputs, enable_rerun=enable_rerun,
         output_root=output_root,
     )
-    cfg = _apply_advanced_overrides(cfg, advanced_yaml)
+    # 3. UI 可见路径字段最终优先（覆盖 advanced 里可能有的 data.*）
     cfg.setdefault("data", {})
     fmt = _SRC_TYPE_MAP.get(source_type, "image_dir")
     cfg["data"]["format"] = fmt
@@ -533,6 +561,13 @@ def main():
         # Only template_name.change() updates it (via update_ui_from_yaml).
         cfg_state = gr.State(value=_initial_cfg)
 
+        # ─── 从初始模板提取 UI 初始属性 ────────────────────────────────
+        _initial_data   = _initial_cfg.get("data", {})
+        _initial_out    = _initial_cfg.get("output", {})
+        _initial_format = _initial_data.get("format", "image_dir")
+        _initial_src_label = _FORMAT_TO_SRC_LABEL.get(_initial_format, "图片目录 (image_dir)")
+        _initial_is_gen = (_initial_format == "generalizable")
+
         # ─── Input source ──────────────────────────────────────────────
         with gr.Group():
             gr.Markdown("### 输入来源")
@@ -540,7 +575,7 @@ def main():
                 source_type = gr.Dropdown(
                     label="输入流类型",
                     choices=list(_SRC_TYPE_MAP.keys()),
-                    value="图片目录 (image_dir)",
+                    value=_initial_src_label,
                 )
                 template_name = gr.Dropdown(
                     label="配置模板",
@@ -550,27 +585,28 @@ def main():
             source_path = gr.Textbox(
                 label="输入路径 (data.img_path)",
                 placeholder="/path/to/images_or_video_or_npz",
+                value=_initial_data.get("img_path", ""),
             )
-            # Generalizable 专用字段（初始隐藏）
-            with gr.Row(visible=False) as generalizable_row:
+            # Generalizable 专用字段（取决于初始模板）
+            with gr.Row(visible=_initial_is_gen) as generalizable_row:
                 data_roots_file = gr.Textbox(
                     label="数据根列表 (data.data_roots_file)",
-                    value="data_roots.txt",
+                    value=_initial_data.get("data_roots_file", "data_roots.txt"),
                     placeholder="data_roots.txt",
                 )
                 seq_list = gr.Textbox(
                     label="序列列表 (data.seq_list，逗号分隔)",
-                    value="Scene01/clone",
+                    value=_seq_list_to_text(_initial_data.get("seq_list")),
                     placeholder="Scene01/clone",
                 )
                 camera = gr.Textbox(
                     label="相机编号 (data.camera)",
-                    value="00",
+                    value=str(_initial_data.get("camera", "00")),
                     placeholder="00",
                 )
             output_root = gr.Textbox(
                 label="输出目录 (output.root)",
-                value=_initial_cfg.get("output", {}).get("root", "outputs"),
+                value=_initial_out.get("root", "outputs"),
                 placeholder="outputs/vkitti2_scene01_clone/optimized",
             )
 
@@ -701,6 +737,8 @@ def main():
             data_roots_file,                             # 18
             seq_list,                                    # 19
             camera,                                      # 20
+            source_type,                                 # 21
+            generalizable_row,                           # 22
         ]
         template_name.change(
             fn=update_ui_from_yaml,
@@ -769,7 +807,7 @@ def main():
             outputs=[custom_config_path, template_name, cfg_state],
         )
 
-    demo.launch()
+    demo.launch(analytics_enabled=False)
 
 
 if __name__ == "__main__":

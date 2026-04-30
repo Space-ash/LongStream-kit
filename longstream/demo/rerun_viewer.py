@@ -107,10 +107,17 @@ class RerunViewer:
         if not self._initialized:
             self.init()
 
-        if hasattr(rr, "set_time_sequence"):
-            rr.set_time_sequence("frame", frame_idx)
-        else:
-            rr.set_time("frame", sequence=frame_idx)
+        # Rerun API 三段兼容（不同版本 API 不同）
+        try:
+            if hasattr(rr, "set_time_sequence"):
+                rr.set_time_sequence("frame", frame_idx)
+            elif hasattr(rr, "set_time"):
+                rr.set_time("frame", sequence=frame_idx)
+            elif hasattr(rr, "set_time_seconds"):
+                rr.set_time_seconds("time", float(frame_idx))
+            # 如果三者都没有，跳过时间轴设置，不让 Rerun 回调整帧失败
+        except Exception:
+            pass
 
         # ── RGB ───────────────────────────────────────────────────────────
         rgb_np: Optional[np.ndarray] = outputs_cpu.get("rgb_np")

@@ -147,10 +147,12 @@ def _worker_inference_loop(
     if _out_cfg_merged.get("mask_sky", False):
         print("[LiveInferenceRunner/worker] 警告：mask_sky 在流式推理模式下暂未集成，跳过。", flush=True)
 
-    # save_points: 在 CPU 侧累积世界坐标点，循环结束后写全局点云 PLY
-    _all_world_points: list = []  # list of np.ndarray [N, 3]
-    _all_point_colors: list = []  # list of np.ndarray [N, 3] uint8 or None sentinel
-    _has_any_colors: bool = False
+    # save_points: 使用有界 Reservoir 采样累计全局点云，防止 CPU RAM 无限增长
+    # 策略：将每帧点加入 reservoir；当 reservoir 超过 2×max_full_pts 时随机下采样至 max_full_pts
+    _reservoir_pts:    Optional[np.ndarray] = None   # [R, 3] float32
+    _reservoir_colors: Optional[np.ndarray] = None   # [R, 3] uint8 或 None
+    _reservoir_has_colors: bool = False
+    _reservoir_rng = np.random.default_rng(seed=0)
     _max_full_pts: int = int(_out_cfg_merged.get("max_full_pointcloud_points",
                               _out_cfg_merged.get("max_frame_pointcloud_points", 8000) * 100))
 
@@ -246,24 +248,48 @@ def _worker_inference_loop(
             # ── 增量保存到磁盘（仅使用 outputs_cpu，严禁 GPU Tensor）──────
             _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g)
 
-            # ── save_points：累积 CPU 世界坐标点 ─────────────────────────
+            # ── save_points：Reservoir 采样累积 CPU 世界坐标点 ─────────────
             if _out_cfg_merged.get("save_points", False):
                 pts = outputs_cpu.get("world_points_np")
                 if pts is not None:
-                    _all_world_points.append(pts.reshape(-1, 3).astype(np.float32))
-                    colors_acc = outputs_cpu.get("point_colors_np")
-                    if colors_acc is not None:
-                        _all_point_colors.append(colors_acc.reshape(-1, 3).astype(np.uint8))
-                        _has_any_colors = True
+                    new_pts = pts.reshape(-1, 3).astype(np.float32)
+                    new_colors = outputs_cpu.get("point_colors_np")
+                    if new_colors is not None:
+                        new_colors = new_colors.reshape(-1, 3).astype(np.uint8)
+                        _reservoir_has_colors = True
+                    # 并入 reservoir
+                    if _reservoir_pts is None:
+                        _reservoir_pts = new_pts
+                        _reservoir_colors = new_colors
                     else:
-                        _all_point_colors.append(None)
+                        _reservoir_pts = np.concatenate([_reservoir_pts, new_pts], axis=0)
+                        if _reservoir_has_colors:
+                            _c_prev = _reservoir_colors if _reservoir_colors is not None else np.zeros((len(_reservoir_pts) - len(new_pts), 3), dtype=np.uint8)
+                            _c_new  = new_colors if new_colors is not None else np.zeros((len(new_pts), 3), dtype=np.uint8)
+                            _reservoir_colors = np.concatenate([_c_prev, _c_new], axis=0)
+                    # 超过 2x 上限时随机下采样，保持内存有界
+                    if len(_reservoir_pts) > 2 * _max_full_pts:
+                        idx = _reservoir_rng.choice(len(_reservoir_pts), _max_full_pts, replace=False)
+                        _reservoir_pts = _reservoir_pts[idx]
+                        if _reservoir_colors is not None:
+                            _reservoir_colors = _reservoir_colors[idx]
 
     # ── 循环结束后处理（纯 CPU / 磁盘，不持有 GPU 引用）─────────────────
     # 全局点云 PLY
-    if _out_cfg_merged.get("save_points", False) and _all_world_points:
-        _colors_for_global = _all_point_colors if _has_any_colors else None
-        _save_global_points(_all_world_points, _out_cfg_merged, _out_dir, _max_full_pts,
-                            colors_list=_colors_for_global)
+    if _out_cfg_merged.get("save_points", False) and _reservoir_pts is not None and len(_reservoir_pts) > 0:
+        # 最终下采样（如果还超过上限）
+        _final_pts = _reservoir_pts
+        _final_colors = _reservoir_colors if _reservoir_has_colors else None
+        if len(_final_pts) > _max_full_pts:
+            idx = _reservoir_rng.choice(len(_final_pts), _max_full_pts, replace=False)
+            _final_pts = _final_pts[idx]
+            if _final_colors is not None:
+                _final_colors = _final_colors[idx]
+        pts_dir = _os.path.join(_out_dir, "global_points")
+        _os.makedirs(pts_dir, exist_ok=True)
+        ply_path = _os.path.join(pts_dir, "global_pointcloud.ply")
+        _write_ply(_final_pts, ply_path, colors=_final_colors)
+        print(f"[LiveInferenceRunner] 全局点云已保存: {ply_path}  ({len(_final_pts)} 点)", flush=True)
 
     # 视频合成（从已落盘 RGB 序列）
     if _out_cfg_merged.get("save_videos", False):
