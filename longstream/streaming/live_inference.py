@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
+import os
 
 from longstream.core.model import LongStreamModel
 from longstream.core.tto import TTOContext, prepare_tto, reset_tto, run_tto_scale_optimization
@@ -148,6 +149,8 @@ def _worker_inference_loop(
 
     # save_points: 在 CPU 侧累积世界坐标点，循环结束后写全局点云 PLY
     _all_world_points: list = []  # list of np.ndarray [N, 3]
+    _all_point_colors: list = []  # list of np.ndarray [N, 3] uint8 or None sentinel
+    _has_any_colors: bool = False
     _max_full_pts: int = int(_out_cfg_merged.get("max_full_pointcloud_points",
                               _out_cfg_merged.get("max_frame_pointcloud_points", 8000) * 100))
 
@@ -248,11 +251,19 @@ def _worker_inference_loop(
                 pts = outputs_cpu.get("world_points_np")
                 if pts is not None:
                     _all_world_points.append(pts.reshape(-1, 3).astype(np.float32))
+                    colors_acc = outputs_cpu.get("point_colors_np")
+                    if colors_acc is not None:
+                        _all_point_colors.append(colors_acc.reshape(-1, 3).astype(np.uint8))
+                        _has_any_colors = True
+                    else:
+                        _all_point_colors.append(None)
 
     # ── 循环结束后处理（纯 CPU / 磁盘，不持有 GPU 引用）─────────────────
     # 全局点云 PLY
     if _out_cfg_merged.get("save_points", False) and _all_world_points:
-        _save_global_points(_all_world_points, _out_cfg_merged, _out_dir, _max_full_pts)
+        _colors_for_global = _all_point_colors if _has_any_colors else None
+        _save_global_points(_all_world_points, _out_cfg_merged, _out_dir, _max_full_pts,
+                            colors_list=_colors_for_global)
 
     # 视频合成（从已落盘 RGB 序列）
     if _out_cfg_merged.get("save_videos", False):
@@ -412,16 +423,10 @@ class LiveInferenceRunner:
 import os as _os  # noqa: E402 — 避免顶部 import 顺序约束
 
 
-def _write_ply(pts: np.ndarray, path: str) -> None:
-    """将 [N, 3] float32 数组写出为 ASCII PLY 文件。"""
-    N = len(pts)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {N}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("end_header\n")
-        for p in pts:
-            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+def _write_ply(pts: np.ndarray, path: str, colors: np.ndarray = None) -> None:
+    """将 [N, 3] float32 数组写出为二进制 PLY 文件（支持可选颜色）。"""
+    from longstream.io.save_points import save_pointcloud
+    save_pointcloud(path, pts, colors=colors)
 
 
 def _save_frame_outputs(
@@ -472,6 +477,7 @@ def _save_frame_outputs(
         pts = outputs_cpu.get("world_points_np")
         if pts is not None:
             conf = outputs_cpu.get("conf_np")
+            colors = outputs_cpu.get("point_colors_np")
             thr = float(out_cfg.get(
                 "confidence_threshold",
                 out_cfg.get("max_conf_filter_threshold", 0.5),
@@ -479,11 +485,14 @@ def _save_frame_outputs(
             if conf is not None:
                 mask = conf.reshape(-1) >= thr
                 pts_filtered = pts.reshape(-1, 3)[mask]
+                colors_filtered = colors.reshape(-1, 3)[mask] if colors is not None else None
             else:
                 pts_filtered = pts.reshape(-1, 3)
+                colors_filtered = colors.reshape(-1, 3) if colors is not None else None
             pts_dir = _os.path.join(out_dir, "frame_points")
             _os.makedirs(pts_dir, exist_ok=True)
-            _write_ply(pts_filtered, _os.path.join(pts_dir, f"{frame_idx:06d}.ply"))
+            _write_ply(pts_filtered, _os.path.join(pts_dir, f"{frame_idx:06d}.ply"),
+                       colors=colors_filtered)
 
     # ── 轨迹（追加写）───────────────────────────────────────────────────
     center = outputs_cpu.get("center_np")
@@ -500,11 +509,13 @@ def _save_global_points(
     out_cfg: dict,
     out_dir: str,
     max_pts: int = 800000,
+    colors_list: list = None,
 ) -> None:
     """
     将循环期间累积的世界坐标点 [N, 3] 合并、按置信度均匀下采样，
     写出全局点云 PLY。
     pts_list: list of np.ndarray [N_i, 3] float32
+    colors_list: list of (np.ndarray [N_i, 3] uint8 or None), optional
     """
     if not pts_list:
         return
@@ -514,22 +525,36 @@ def _save_global_points(
         print(f"[LiveInferenceRunner] 全局点云合并失败: {exc}", flush=True)
         return
 
+    # 合并颜色（如果存在且与点数对应）
+    all_colors = None
+    if colors_list is not None and len(colors_list) == len(pts_list):
+        valid = [c for c in colors_list if c is not None]
+        if len(valid) == len(pts_list):
+            try:
+                all_colors = np.concatenate(colors_list, axis=0).astype(np.uint8)
+            except Exception:
+                all_colors = None
+
     N = len(all_pts)
     if N > max_pts:
-        idx = np.random.choice(N, max_pts, replace=False)
+        rng = np.random.default_rng(seed=0)
+        idx = rng.choice(N, max_pts, replace=False)
         all_pts = all_pts[idx]
+        if all_colors is not None:
+            all_colors = all_colors[idx]
 
     pts_dir = _os.path.join(out_dir, "global_points")
     _os.makedirs(pts_dir, exist_ok=True)
     ply_path = _os.path.join(pts_dir, "global_pointcloud.ply")
-    _write_ply(all_pts, ply_path)
+    _write_ply(all_pts, ply_path, colors=all_colors)
     print(f"[LiveInferenceRunner] 全局点云已保存: {ply_path}  ({len(all_pts)} 点)", flush=True)
 
 
 def _assemble_video(out_dir: str, fps: int = 24) -> None:
     """
     将 out_dir/images/*.png 序列合成为 out_dir/output.mp4。
-    依赖 imageio[ffmpeg]；未安装时跳过并打印提示。
+    优先使用 longstream.io.save_images.save_video（ffmpeg glob 模式）；
+    回退到 imageio v2 FFMPEG writer。
     纯 CPU/磁盘操作，不使用任何 GPU 张量。
     """
     import glob
@@ -544,30 +569,32 @@ def _assemble_video(out_dir: str, fps: int = 24) -> None:
         print("[LiveInferenceRunner] save_videos 跳过：images/ 目录为空。", flush=True)
         return
 
-    try:
-        import imageio
-    except ImportError:
-        print(
-            "[LiveInferenceRunner] save_videos 跳过：imageio 未安装。"
-            "请运行: pip install imageio[ffmpeg]",
-            flush=True,
-        )
-        return
-
-    import PIL.Image
-
     out_video = _os.path.join(out_dir, "output.mp4")
     fps_actual = max(1, int(fps))
+
+    # 优先方案：复用 save_video（调用 ffmpeg subprocess，走 glob 模式）
     try:
-        writer = imageio.get_writer(out_video, fps=fps_actual, codec="libx264",
-                                    quality=None, pixelformat="yuv420p")
+        from longstream.io.save_images import save_video
+        pattern = _os.path.join(img_dir, "*.png")
+        save_video(out_video, pattern, fps=fps_actual)
+        print(f"[LiveInferenceRunner] 视频已保存: {out_video}", flush=True)
+        return
+    except Exception as exc:
+        print(f"[LiveInferenceRunner] save_video 失败: {exc}，尝试 imageio...", flush=True)
+
+    # 回退方案：imageio v2 FFMPEG
+    try:
+        import imageio.v2 as imageio_v2
+        import PIL.Image
+        writer = imageio_v2.get_writer(out_video, format="FFMPEG", fps=fps_actual,
+                                       codec="libx264", pixelformat="yuv420p")
         for fp in frames:
             frame = np.array(PIL.Image.open(fp))
             writer.append_data(frame)
         writer.close()
         print(f"[LiveInferenceRunner] 视频已保存: {out_video}", flush=True)
-    except Exception as exc:
-        print(f"[LiveInferenceRunner] 视频合成失败: {exc}", flush=True)
+    except Exception as exc2:
+        print(f"[LiveInferenceRunner] 视频合成失败: {exc2}", flush=True)
 
 
 def _export_glb_from_plys(out_dir: str) -> None:
@@ -673,6 +700,7 @@ def _decode_outputs_to_cpu(
     world_t = outputs.get("world_points")
     if isinstance(world_t, torch.Tensor):
         pts_cam = world_t[0, -1].detach().cpu().numpy()  # [H, W, 3] or [N, 3]
+        H_pts, W_pts = pts_cam.shape[:2] if pts_cam.ndim == 3 else (pts_cam.shape[0], 1)
         pts_cam_flat = pts_cam.reshape(-1, 3)
         if R_abs_dec is not None and t_abs_dec is not None:
             pts_world = _camera_points_to_world_np(pts_cam_flat, R_abs_dec, t_abs_dec)
@@ -680,6 +708,22 @@ def _decode_outputs_to_cpu(
             # 位姿解码失败时直接使用相机坐标（降级处理）
             pts_world = pts_cam_flat
         result["world_points_np"] = pts_world
+
+        # ── 点云颜色（与点云像素一一对应）────────────────────────────
+        # 将原图 RGB resize 到与 world_points 同分辨率，保证像素对应
+        rgb_full = packet.rgb
+        if rgb_full is not None and pts_cam.ndim == 3:
+            try:
+                from PIL import Image as _PILImage
+                import numpy as _np2
+                _h, _w = pts_cam.shape[:2]
+                rgb_resized = _np2.array(
+                    _PILImage.fromarray(rgb_full).resize((_w, _h), _PILImage.BILINEAR),
+                    dtype=_np2.uint8,
+                )
+                result["point_colors_np"] = rgb_resized.reshape(-1, 3)
+            except Exception:
+                pass
 
     # ── 置信度 ───────────────────────────────────────────────────────────
     conf_t = outputs.get("world_points_conf")

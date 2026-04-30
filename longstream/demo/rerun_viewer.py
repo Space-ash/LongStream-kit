@@ -107,7 +107,10 @@ class RerunViewer:
         if not self._initialized:
             self.init()
 
-        rr.set_time_sequence("frame", frame_idx)
+        if hasattr(rr, "set_time_sequence"):
+            rr.set_time_sequence("frame", frame_idx)
+        else:
+            rr.set_time("frame", sequence=frame_idx)
 
         # ── RGB ───────────────────────────────────────────────────────────
         rgb_np: Optional[np.ndarray] = outputs_cpu.get("rgb_np")
@@ -145,11 +148,20 @@ class RerunViewer:
                 if mask.shape[0] == points_np.shape[0]:
                     points_np = points_np[mask]
 
-            # 点云颜色
-            colors_np: Optional[np.ndarray] = _extract_point_colors(
-                rgb_np, points_np.shape[0],
-                mask if conf_np is not None else None,
-            )
+            # 点云颜色：优先使用与点云对齐的 point_colors_np；回退到原图展开
+            colors_np: Optional[np.ndarray] = None
+            pre_colors = outputs_cpu.get("point_colors_np")
+            if pre_colors is not None and isinstance(pre_colors, np.ndarray):
+                # point_colors_np 已经是按像素对应的，mask 之前长度需与原始点数一致
+                if mask is not None and len(pre_colors) == len(mask):
+                    colors_np = pre_colors[mask].astype(np.uint8)
+                elif mask is None:
+                    colors_np = pre_colors.astype(np.uint8)
+            else:
+                colors_np = _extract_point_colors(
+                    rgb_np, points_np.shape[0],
+                    mask if conf_np is not None else None,
+                )
 
             # 数量限制
             if self.max_frame_points is not None and len(points_np) > self.max_frame_points:

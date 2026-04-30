@@ -92,6 +92,7 @@ def _merge_basic_into_cfg(
     keyframe_stride: int,
     confidence_threshold: float,
     max_frame_points: int,
+    max_full_points: int,
     simulate_streaming: bool,
     target_fps: int,
     enable_tto: bool,
@@ -99,6 +100,7 @@ def _merge_basic_into_cfg(
     enable_conf_filter: bool,
     save_outputs: list,
     enable_rerun: bool,
+    output_root: str = "",
 ) -> dict:
     """Apply UI leaf-values onto base cfg. Never modifies model/checkpoint keys."""
     cfg = copy.deepcopy(cfg)
@@ -137,8 +139,11 @@ def _merge_basic_into_cfg(
     for std_key in ["save_images", "save_videos", "save_depth",
                     "save_points", "save_frame_points", "mask_sky"]:
         cfg["output"][std_key] = std_key in selected_keys
-    cfg["output"]["export_glb"]                  = "export_glb" in selected_keys
-    cfg["output"]["max_frame_pointcloud_points"] = int(max_frame_points)
+    cfg["output"]["export_glb"]                   = "export_glb" in selected_keys
+    cfg["output"]["max_frame_pointcloud_points"]  = int(max_frame_points)
+    cfg["output"]["max_full_pointcloud_points"]   = int(max_full_points)
+    if output_root and output_root.strip():
+        cfg["output"]["root"] = output_root.strip()
 
     cfg["runtime"]["simulate_streaming"] = bool(simulate_streaming)
     cfg["data"]["fps"] = int(target_fps) if simulate_streaming else 0
@@ -219,6 +224,10 @@ def update_ui_from_yaml(template_name: str) -> tuple:
     sim_val = bool(rt.get("simulate_streaming", True))
     rerun_val = bool(cfg.get("_enable_rerun", True))
 
+    out = cfg.get("output", {})
+    data_fmt = data.get("format", "image_dir")
+    is_gen = (data_fmt == "generalizable")
+
     preview_text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
 
     return (
@@ -226,16 +235,22 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         gr.update(value=int(infer.get("refresh",          4))),   # 2
         gr.update(value=int(infer.get("keyframe_stride",  8))),   # 3
         gr.update(value=float(filt.get("confidence_threshold", 0.5))),  # 4
-        gr.update(value=int(cfg.get("output", {}).get("max_frame_pointcloud_points", 8000))),  # 5
-        gr.update(value=bool(corr.get("tto_enabled",              False))),   # 6
-        gr.update(value=bool(filt.get("frame_filter_enabled",     False))),   # 7
-        gr.update(value=bool(filt.get("confidence_filter_enabled", True))),   # 8
-        gr.update(value=_cfg_to_save_output_labels(cfg)),   # 9
-        gr.update(value=int(fps_val)),                       # 10
-        gr.update(value=sim_val),                            # 11 simulate_streaming
-        gr.update(value=rerun_val),                          # 12 enable_rerun
-        cfg,                                                 # 13 cfg_state (new base)
-        gr.update(value=preview_text),                       # 14 config_preview
+        gr.update(value=int(out.get("max_frame_pointcloud_points", 200000))),  # 5
+        gr.update(value=int(out.get("max_full_pointcloud_points", 2000000))),  # 6
+        gr.update(value=bool(corr.get("tto_enabled",              False))),   # 7
+        gr.update(value=bool(filt.get("frame_filter_enabled",     False))),   # 8
+        gr.update(value=bool(filt.get("confidence_filter_enabled", True))),   # 9
+        gr.update(value=_cfg_to_save_output_labels(cfg)),   # 10
+        gr.update(value=int(fps_val)),                       # 11
+        gr.update(value=sim_val),                            # 12 simulate_streaming
+        gr.update(value=rerun_val),                          # 13 enable_rerun
+        cfg,                                                 # 14 cfg_state (new base)
+        gr.update(value=preview_text),                       # 15 config_preview
+        gr.update(value=out.get("root", "outputs")),        # 16 output_root
+        gr.update(value=data.get("img_path", "")),          # 17 source_path
+        gr.update(value=data.get("data_roots_file", "data_roots.txt")),  # 18 data_roots_file
+        gr.update(value=", ".join(data.get("seq_list", ["Scene01/clone"]))),  # 19 seq_list
+        gr.update(value=str(data.get("camera", "00"))),     # 20 camera
     )
 
 
@@ -252,6 +267,7 @@ def _build_cfg_from_ui(
     keyframe_stride: int,
     confidence_threshold: float,
     max_frame_points: int,
+    max_full_points: int,
     simulate_streaming: bool,
     target_fps: int,
     enable_tto: bool,
@@ -260,6 +276,10 @@ def _build_cfg_from_ui(
     save_outputs: list,
     enable_rerun: bool,
     advanced_yaml: str,
+    output_root: str = "",
+    data_roots_file: str = "data_roots.txt",
+    seq_list: str = "",
+    camera: str = "00",
 ) -> dict:
     """Build complete cfg from UI values using base_cfg (from cfg_state) as the foundation."""
     cfg = _merge_basic_into_cfg(
@@ -268,16 +288,47 @@ def _build_cfg_from_ui(
         keyframe_stride=keyframe_stride,
         confidence_threshold=confidence_threshold,
         max_frame_points=max_frame_points,
+        max_full_points=max_full_points,
         simulate_streaming=simulate_streaming, target_fps=target_fps,
         enable_tto=enable_tto, enable_filter=enable_filter,
         enable_conf_filter=enable_conf_filter,
         save_outputs=save_outputs, enable_rerun=enable_rerun,
+        output_root=output_root,
     )
     cfg = _apply_advanced_overrides(cfg, advanced_yaml)
     cfg.setdefault("data", {})
-    cfg["data"]["format"] = _SRC_TYPE_MAP.get(source_type, "image_dir")
+    fmt = _SRC_TYPE_MAP.get(source_type, "image_dir")
+    cfg["data"]["format"] = fmt
     if source_path and source_path.strip():
         cfg["data"]["img_path"] = source_path.strip()
+
+    if fmt == "generalizable":
+        if not (source_path and source_path.strip()):
+            raise gr.Error("选择 generalizable 时，data.img_path（输入路径）必填。")
+        if not seq_list.strip():
+            raise gr.Error("选择 generalizable 时，data.seq_list 必填。")
+        if not camera.strip():
+            raise gr.Error("选择 generalizable 时，data.camera 必填。")
+        cfg["data"]["data_roots_file"] = (data_roots_file or "data_roots.txt").strip()
+        cfg["data"]["seq_list"] = [s.strip() for s in seq_list.split(",") if s.strip()]
+        cfg["data"]["camera"] = camera.strip()
+    else:
+        cfg["data"].pop("seq_list", None)
+        cfg["data"].pop("data_roots_file", None)
+        cfg["data"].pop("camera", None)
+
+    # 路径保护：output.root 不得与 data.img_path 重叠
+    _out_root = cfg.get("output", {}).get("root", "")
+    _img_path = cfg.get("data", {}).get("img_path", "")
+    if _out_root and _img_path:
+        import os as _os2
+        _out_abs = _os2.path.abspath(_os2.path.expanduser(_out_root))
+        _img_abs = _os2.path.abspath(_os2.path.expanduser(_img_path))
+        if _out_abs == _img_abs or _img_abs.startswith(_out_abs + _os2.sep):
+            raise gr.Error(
+                f"输出目录 ({_out_root}) 与输入路径 ({_img_path}) 重叠，拒绝执行。"
+            )
+
     return cfg
 
 
@@ -290,6 +341,7 @@ def _start_runner(
     keyframe_stride: int,
     confidence_threshold: float,
     max_frame_points: int,
+    max_full_points: int,
     simulate_streaming: bool,
     target_fps: int,
     enable_tto: bool,
@@ -298,6 +350,10 @@ def _start_runner(
     save_outputs: list,
     enable_rerun: bool,
     advanced_yaml: str,
+    output_root: str = "",
+    data_roots_file: str = "data_roots.txt",
+    seq_list: str = "",
+    camera: str = "00",
 ) -> tuple:
     global _active_runner, _rerun_viewer
 
@@ -311,10 +367,14 @@ def _start_runner(
     cfg = _build_cfg_from_ui(
         base_cfg, source_path, source_type,
         window_size, refresh, keyframe_stride,
-        confidence_threshold, max_frame_points,
+        confidence_threshold, max_frame_points, max_full_points,
         simulate_streaming, target_fps,
         enable_tto, enable_filter, enable_conf_filter,
         save_outputs, enable_rerun, advanced_yaml,
+        output_root=output_root,
+        data_roots_file=data_roots_file,
+        seq_list=seq_list,
+        camera=camera,
     )
 
     if simulate_streaming:
@@ -417,6 +477,7 @@ def save_custom_config(
     keyframe_stride: int,
     confidence_threshold: float,
     max_frame_points: int,
+    max_full_points: int,
     simulate_streaming: bool,
     target_fps: int,
     enable_tto: bool,
@@ -425,15 +486,23 @@ def save_custom_config(
     save_outputs: list,
     enable_rerun: bool,
     advanced_yaml: str,
+    output_root: str = "",
+    data_roots_file: str = "data_roots.txt",
+    seq_list: str = "",
+    camera: str = "00",
 ) -> tuple:
     """Save current UI params to custom_infer.yaml. Returns (path, Custom dropdown update, new cfg_state)."""
     cfg = _build_cfg_from_ui(
         base_cfg, source_path, source_type,
         window_size, refresh, keyframe_stride,
-        confidence_threshold, max_frame_points,
+        confidence_threshold, max_frame_points, max_full_points,
         simulate_streaming, target_fps,
         enable_tto, enable_filter, enable_conf_filter,
         save_outputs, enable_rerun, advanced_yaml,
+        output_root=output_root,
+        data_roots_file=data_roots_file,
+        seq_list=seq_list,
+        camera=camera,
     )
     custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
     os.makedirs(_CONFIGS_DIR, exist_ok=True)
@@ -482,6 +551,28 @@ def main():
                 label="输入路径 (data.img_path)",
                 placeholder="/path/to/images_or_video_or_npz",
             )
+            # Generalizable 专用字段（初始隐藏）
+            with gr.Row(visible=False) as generalizable_row:
+                data_roots_file = gr.Textbox(
+                    label="数据根列表 (data.data_roots_file)",
+                    value="data_roots.txt",
+                    placeholder="data_roots.txt",
+                )
+                seq_list = gr.Textbox(
+                    label="序列列表 (data.seq_list，逗号分隔)",
+                    value="Scene01/clone",
+                    placeholder="Scene01/clone",
+                )
+                camera = gr.Textbox(
+                    label="相机编号 (data.camera)",
+                    value="00",
+                    placeholder="00",
+                )
+            output_root = gr.Textbox(
+                label="输出目录 (output.root)",
+                value=_initial_cfg.get("output", {}).get("root", "outputs"),
+                placeholder="outputs/vkitti2_scene01_clone/optimized",
+            )
 
         # ─── Run mode / Data Settings ──────────────────────────────────
         with gr.Group():
@@ -518,7 +609,11 @@ def main():
                 )
                 max_frame_points = gr.Slider(
                     label="每帧最大点数 (output.max_frame_pointcloud_points)",
-                    minimum=1000, maximum=100000, step=1000, value=8000,
+                    minimum=1000, maximum=2000000, step=1000, value=200000,
+                )
+                max_full_points = gr.Slider(
+                    label="全局点云最大点数 (output.max_full_pointcloud_points)",
+                    minimum=10000, maximum=5000000, step=10000, value=2000000,
                 )
             with gr.Row():
                 enable_tto = gr.Checkbox(
@@ -589,22 +684,39 @@ def main():
         status_timer.tick(fn=_check_status, outputs=[status_box])
 
         # ─── Template sync ─────────────────────────────────────────────
-        # update_ui_from_yaml returns 14 values.
+        # update_ui_from_yaml returns 20 values.
         # advanced_yaml is intentionally NOT in this output list.
         _template_sync_outputs = [
             window_size, refresh, keyframe_stride,       # 1-3
             confidence_threshold, max_frame_points,      # 4-5
-            enable_tto, enable_filter, enable_conf_filter,  # 6-8
-            save_outputs,                                # 9
-            target_fps,                                  # 10
-            simulate_streaming, enable_rerun,            # 11-12
-            cfg_state,                                   # 13
-            config_preview,                              # 14
+            max_full_points,                             # 6
+            enable_tto, enable_filter, enable_conf_filter,  # 7-9
+            save_outputs,                                # 10
+            target_fps,                                  # 11
+            simulate_streaming, enable_rerun,            # 12-13
+            cfg_state,                                   # 14
+            config_preview,                              # 15
+            output_root,                                 # 16
+            source_path,                                 # 17
+            data_roots_file,                             # 18
+            seq_list,                                    # 19
+            camera,                                      # 20
         ]
         template_name.change(
             fn=update_ui_from_yaml,
             inputs=[template_name],
             outputs=_template_sync_outputs,
+        )
+
+        # ─── source_type change: show/hide generalizable fields ────────
+        def _update_source_fields(source_type_val):
+            is_gen = _SRC_TYPE_MAP.get(source_type_val) == "generalizable"
+            return gr.update(visible=is_gen)
+
+        source_type.change(
+            fn=_update_source_fields,
+            inputs=[source_type],
+            outputs=[generalizable_row],
         )
 
         # ─── User edits -> switch dropdown to "Custom" ─────────────────
@@ -615,7 +727,7 @@ def main():
 
         # Sliders: use .release() (fires only when user releases mouse)
         for _slider in [window_size, refresh, keyframe_stride,
-                        confidence_threshold, max_frame_points, target_fps]:
+                        confidence_threshold, max_frame_points, max_full_points, target_fps]:
             _slider.release(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # Checkboxes / CheckboxGroup: use .input()
@@ -624,17 +736,19 @@ def main():
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # Textbox / Dropdown / Code: use .input()
-        for _comp in [source_type, source_path, advanced_yaml]:
+        for _comp in [source_type, source_path, advanced_yaml,
+                      output_root, data_roots_file, seq_list, camera]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # ─── Shared input list (cfg_state replaces template_name) ─────
         _all_inputs = [
             cfg_state, source_path, source_type,
             window_size, refresh, keyframe_stride,
-            confidence_threshold, max_frame_points,
+            confidence_threshold, max_frame_points, max_full_points,
             simulate_streaming, target_fps,
             enable_tto, enable_filter, enable_conf_filter,
             save_outputs, enable_rerun, advanced_yaml,
+            output_root, data_roots_file, seq_list, camera,
         ]
 
         # ─── Button events ─────────────────────────────────────────────
