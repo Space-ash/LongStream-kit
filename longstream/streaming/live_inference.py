@@ -1,0 +1,611 @@
+﻿"""
+longstream/streaming/live_inference.py
+---------------------------------------
+实时逐帧推理运行器（LiveInferenceRunner）。
+在后台线程中运行，通过 stop_event 控制停止。
+
+典型用法：
+    runner = LiveInferenceRunner(cfg)
+    runner.start()
+    ...
+    runner.stop()
+"""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import threading
+import time
+from typing import Any, Callable, Dict, Optional
+
+import numpy as np
+import torch
+
+from longstream.core.model import LongStreamModel
+from longstream.core.tto import TTOContext, prepare_tto, reset_tto, run_tto_scale_optimization
+from longstream.data.stream_feeder import FramePacket, StreamFeeder
+from longstream.streaming.keyframe_selector import KeyframeSelector
+from longstream.streaming.stream_session import StreamSession
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  子进程入口（Windows spawn 要求必须为可 pickle 的模块级函数）
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _worker_main(
+    cfg: dict,
+    result_queue: "mp.Queue",
+    stop_flag: "mp.Event",
+) -> None:
+    """
+    子进程入口：在独立进程里运行完整推理循环。
+
+    每帧结果格式：(frame_idx: int, outputs_cpu: dict)
+    错误格式：    ("__error__", traceback_str: str)
+    """
+    import traceback as _tb
+
+    try:
+        _worker_inference_loop(cfg, result_queue, stop_flag)
+    except Exception as exc:
+        try:
+            result_queue.put_nowait(("__error__", str(exc) + "\n" + _tb.format_exc()))
+        except Exception:
+            pass
+        print(f"[LiveInferenceRunner/worker] 推理异常: {exc}", flush=True)
+        _tb.print_exc()
+    finally:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("[LiveInferenceRunner/worker] 子进程退出", flush=True)
+
+
+def _worker_inference_loop(
+    cfg: dict,
+    result_queue: "mp.Queue",
+    stop_flag: "mp.Event",
+) -> None:
+    """完整推理循环（在子进程中运行）。"""
+    device_str: str = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    model_cfg: dict = cfg.get("model", {})
+    data_cfg: dict = cfg.get("data", {})
+    infer_cfg: dict = cfg.get("inference", {})
+    opt_cfg: dict = cfg.get("optimizations", {})
+    corr_cfg: dict = opt_cfg.get("correction", {})
+
+    # ── 模型 ──────────────────────────────────────────────────────────────
+    print("[LiveInferenceRunner/worker] 初始化模型...", flush=True)
+    model = LongStreamModel(model_cfg).to(device_str)
+    model.eval()
+    print("[LiveInferenceRunner/worker] 模型就绪", flush=True)
+
+    # ── TTO 上下文 ────────────────────────────────────────────────────────
+    tto_enabled = bool(corr_cfg.get("tto_enabled", False))
+    tto_ctx: Optional[TTOContext] = None
+    if tto_enabled:
+        tto_ctx = prepare_tto(model, corr_cfg)
+        print("[LiveInferenceRunner/worker] TTO 已启用", flush=True)
+
+    # ── 关键帧选择器 ──────────────────────────────────────────────────────
+    keyframe_stride = int(infer_cfg.get("keyframe_stride", 8))
+    keyframe_mode = infer_cfg.get("keyframe_mode", "fixed")
+    refresh = int(
+        infer_cfg.get("refresh", int(infer_cfg.get("keyframes_per_batch", 3)) + 1)
+    )
+    streaming_mode = infer_cfg.get("streaming_mode", "causal")
+    window_size = int(infer_cfg.get("window_size", 5))
+
+    selector = KeyframeSelector(
+        min_interval=keyframe_stride,
+        max_interval=keyframe_stride,
+        force_first=True,
+        mode="random" if keyframe_mode == "random" else "fixed",
+    )
+
+    # ── Feeder（子进程内总是从 cfg 构建，不接受外部 feeder 对象）────────
+    feeder = _build_feeder_from_cfg(data_cfg)
+
+    # ── StreamSession ─────────────────────────────────────────────────────
+    session = StreamSession(model, mode=streaming_mode, window_size=window_size)
+
+    # ── refresh 参数 ──────────────────────────────────────────────────────
+    refresh_intervals = max(1, refresh - 1)
+    keyframe_count = 0
+
+    # TTO 相关：reset_tto 仅在流开始时执行一次（不在每个 window 执行）
+    if tto_ctx is not None:
+        reset_tto(tto_ctx)
+    pair_stride_tto = int(corr_cfg.get("tto_pair_stride", keyframe_stride))
+    tto_window_size = int(corr_cfg.get("tto_window_size", 40))
+    _tto_frame_buffer: list = []
+    _tto_gps_buffer: list = []
+
+    # ── 分段追踪（对齐 run_streaming_refresh 逻辑）────────────────────────
+    segment_start: int = 0
+    seg_R_abs: dict = {}
+    seg_t_abs: dict = {}
+    seg_R_abs[0] = np.eye(3, dtype=np.float32)
+    seg_t_abs[0] = np.zeros(3, dtype=np.float32)
+
+    print("[LiveInferenceRunner/worker] 开始逐帧推理", flush=True)
+
+    with torch.no_grad():
+        for packet in feeder:
+            if stop_flag.is_set():
+                break
+
+            g: int = packet.frame_index
+            local_pos: int = g - segment_start
+
+            is_kf = (g == 0) or (g % keyframe_stride == 0)
+            is_keyframe_t = torch.tensor(
+                [[is_kf]], dtype=torch.bool, device=device_str
+            )
+
+            if g == 0:
+                kf_idx_global = 0
+            else:
+                kf_idx_global = ((g - 1) // keyframe_stride) * keyframe_stride
+            kf_idx_local = max(0, kf_idx_global - segment_start)
+            keyframe_indices_t = torch.tensor(
+                [[kf_idx_local]], dtype=torch.long, device=device_str
+            )
+
+            # ── TTO 缓冲 ──────────────────────────────────────────────────
+            if tto_ctx is not None and packet.gps_xyz is not None:
+                _tto_frame_buffer.append(packet)
+                _tto_gps_buffer.append(packet.gps_xyz)
+                if len(_tto_frame_buffer) >= tto_window_size and is_kf:
+                    _run_tto_window(
+                        tto_ctx=tto_ctx,
+                        frame_buffer=_tto_frame_buffer[-tto_window_size:],
+                        gps_buffer=_tto_gps_buffer[-tto_window_size:],
+                        selector=selector,
+                        streaming_mode=streaming_mode,
+                        device=device_str,
+                        frame_idx=g,
+                        pair_stride=pair_stride_tto,
+                    )
+                    slide = tto_window_size // 2
+                    _tto_frame_buffer = _tto_frame_buffer[slide:]
+                    _tto_gps_buffer = _tto_gps_buffer[slide:]
+
+            # ── 前向推理 ──────────────────────────────────────────────────
+            frame_tensor: torch.Tensor = packet.image_tensor.to(
+                device_str, non_blocking=True
+            )
+            outputs = session.forward_stream(
+                frame_tensor,
+                is_keyframe=is_keyframe_t,
+                keyframe_indices=keyframe_indices_t,
+                record=False,
+            )
+
+            # ── 解码输出到 CPU numpy ───────────────────────────────────────
+            outputs_cpu = _decode_outputs_to_cpu(
+                outputs, packet, kf_idx_local, local_pos, is_kf,
+                seg_R_abs, seg_t_abs,
+            )
+
+            # ── refresh 逻辑 ──────────────────────────────────────────────
+            if is_kf and g > 0:
+                keyframe_count += 1
+                if keyframe_count % refresh_intervals == 0:
+                    session.clear_cache_only()
+                    segment_start = g
+                    seg_R_abs = {0: np.eye(3, dtype=np.float32)}
+                    seg_t_abs = {0: np.zeros(3, dtype=np.float32)}
+                    anchor_kf_indices = torch.zeros(
+                        1, 1, dtype=torch.long, device=device_str
+                    )
+                    anchor_frame = packet.image_tensor.to(device_str, non_blocking=True)
+                    session.forward_stream(
+                        anchor_frame,
+                        is_keyframe=is_keyframe_t,
+                        keyframe_indices=anchor_kf_indices,
+                        record=False,
+                    )
+                    del anchor_frame
+
+            del outputs
+            del frame_tensor
+
+            # ── 发送结果到主进程（队列满则丢弃，保证推理不被可视化阻塞）──
+            try:
+                result_queue.put_nowait((g, outputs_cpu))
+            except Exception:
+                pass
+
+    # ── 结束清理 ──────────────────────────────────────────────────────────
+    session.clear()
+    torch.cuda.empty_cache()
+    print("[LiveInferenceRunner/worker] 推理循环正常结束", flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LiveInferenceRunner
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LiveInferenceRunner:
+    """
+    实时推理运行器。内部使用独立子进程（multiprocessing.Process）运行模型。
+
+    为什么用进程而非线程？
+      - 模型 forward / TTO 可能耗时数秒，线程无法被强制打断；
+      - 进程可通过 terminate() / kill() 立即释放 GPU，确保停止按钮可靠。
+
+    Parameters
+    ----------
+    cfg : dict
+        完整配置字典（与 YAML 结构一致）。
+    on_frame : callable, optional
+        每帧推理完成后回调，在主进程轮询线程中调用。
+        签名：on_frame(frame_idx: int, outputs_cpu: dict) -> None
+    feeder :
+        保留参数（已废弃）。子进程无法接收不可 pickle 的对象，
+        feeder 始终由子进程从 cfg["data"] 自行构建。
+    """
+
+    _QUEUE_MAXSIZE = 30  # 结果队列上限；超过则丢弃最新帧
+
+    def __init__(
+        self,
+        cfg: dict,
+        on_frame: Optional[Callable[[int, dict], None]] = None,
+        feeder=None,  # 保留签名兼容性，不实际使用
+    ) -> None:
+        self.cfg = cfg
+        self.on_frame = on_frame
+
+        self._process: Optional[mp.Process] = None
+        self._result_queue: mp.Queue = mp.Queue(maxsize=self._QUEUE_MAXSIZE)
+        self._stop_flag: mp.Event = mp.Event()
+        self._poll_thread: Optional[threading.Thread] = None
+        self._error: Optional[Exception] = None
+
+    # ── 公开控制接口 ──────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """启动子进程开始推理，同时在主进程开启轮询线程接收结果。"""
+        if self._process is not None and self._process.is_alive():
+            return
+        self._stop_flag.clear()
+        # 清空旧结果
+        while not self._result_queue.empty():
+            try:
+                self._result_queue.get_nowait()
+            except Exception:
+                break
+        self._error = None
+
+        self._process = mp.Process(
+            target=_worker_main,
+            args=(self.cfg, self._result_queue, self._stop_flag),
+            name="LiveInferenceWorker",
+            daemon=True,
+        )
+        self._process.start()
+
+        self._poll_thread = threading.Thread(
+            target=self._poll_results,
+            name="LiveInferenceRunner-poll",
+            daemon=True,
+        )
+        self._poll_thread.start()
+
+    def stop(self) -> None:
+        """
+        停止推理进程。策略：
+          1. 发送停止信号，等待 3s（让循环正常退出）
+          2. 如仍存活，发送 terminate()，等待 3s
+          3. 如仍存活，发送 kill()，等待 2s
+        """
+        if self._process is None:
+            return
+
+        self._stop_flag.set()
+        self._process.join(timeout=3)
+
+        if self._process.is_alive():
+            print("[LiveInferenceRunner] 子进程未在 3s 内退出，发送 terminate()...", flush=True)
+            self._process.terminate()
+            self._process.join(timeout=3)
+
+        if self._process.is_alive():
+            print("[LiveInferenceRunner] 子进程仍未退出，发送 kill()...", flush=True)
+            self._process.kill()
+            self._process.join(timeout=2)
+
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=2)
+
+        print("[LiveInferenceRunner] 子进程已终止", flush=True)
+
+    @property
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.is_alive()
+
+    @property
+    def last_error(self) -> Optional[Exception]:
+        return self._error
+
+    # ── 内部实现 ──────────────────────────────────────────────────────────
+
+    def _poll_results(self) -> None:
+        """主进程轮询线程：读取子进程结果队列并调用 on_frame 回调。"""
+        while self._process is not None and (
+            self._process.is_alive() or not self._result_queue.empty()
+        ):
+            try:
+                item = self._result_queue.get(timeout=0.2)
+            except Exception:
+                continue
+
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
+                self._error = RuntimeError(item[1])
+                print(f"[LiveInferenceRunner] 子进程错误:\n{item[1]}", flush=True)
+            elif self.on_frame is not None:
+                try:
+                    frame_idx, outputs_cpu = item
+                    self.on_frame(frame_idx, outputs_cpu)
+                except Exception as cb_exc:
+                    print(
+                        f"[LiveInferenceRunner] on_frame 回调异常: {cb_exc}",
+                        flush=True,
+                    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  工具函数（模块私有）
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _camera_points_to_world_np(
+    pts_cam: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+) -> np.ndarray:
+    """
+    将相机坐标系点转到世界坐标系（镜像 infer.py _camera_points_to_world）。
+
+    Args:
+        pts_cam: [N, 3] 相机空间点
+        R:       [3, 3] w2c 旋转矩阵（R_abs）
+        t:       [3,]   w2c 平移向量（t_abs）
+    Returns:
+        pts_world: [N, 3] float32 世界坐标
+
+    公式: pts_world = R^T @ (pts_cam^T - t[:, None])
+    """
+    pts = pts_cam.reshape(-1, 3).astype(np.float64)
+    R64 = R.astype(np.float64)
+    t64 = t.astype(np.float64)
+    world = (R64.T @ (pts.T - t64[:, None])).T
+    return world.astype(np.float32)
+
+
+def _decode_outputs_to_cpu(
+    outputs: dict,
+    packet: FramePacket,
+    kf_idx_local: int,
+    local_pos: int,
+    is_kf: bool,
+    seg_R_abs: dict,
+    seg_t_abs: dict,
+) -> dict:
+    """
+    将 forward_stream 返回的 GPU Tensor dict 全部解码为 CPU numpy，
+    同时进行相机位姿组合以提取相机中心，供 RerunViewer 直接使用。
+
+    所有 GPU Tensor 均在此函数内完成 .detach().cpu().numpy() 转换。
+    绝对禁止把 GPU Tensor 放入返回 dict。
+
+    seg_R_abs / seg_t_abs 为段内绝对位姿历史（可变 dict，本函数会更新）：
+        key = 段内帧位置（local_pos），value = (R_abs [3,3], t_abs [3,])
+    """
+    result: dict = {}
+    result["frame_index"] = packet.frame_index
+    result["rgb_np"] = packet.rgb          # uint8 HWC numpy
+    result["image_path"] = packet.image_path
+    if packet.gps_xyz is not None:
+        result["gps_xyz"] = packet.gps_xyz
+    if packet.gt_pose is not None:
+        result["gt_pose"] = packet.gt_pose
+
+    # ── 深度图 ────────────────────────────────────────────────────────────
+    depth_t = outputs.get("depth")
+    if isinstance(depth_t, torch.Tensor):
+        # [B, S, H, W, 1] → 取最后帧 → [H, W]
+        result["depth_np"] = depth_t[0, -1, :, :, 0].detach().cpu().numpy()
+
+    # ── 位姿 → 相机中心 + w2c 矩阵 ─────────────────────────────────────────
+    # 必须在点云转换之前解码（需要 R_abs/t_abs 来做 cam→world）
+    center_np, R_abs_dec, t_abs_dec = _decode_camera_center(
+        outputs, kf_idx_local, local_pos, is_kf, seg_R_abs, seg_t_abs
+    )
+    if center_np is not None:
+        result["center_np"] = center_np
+
+    # ── 世界点云（必须先将相机坐标系点转到世界坐标系）─────────────
+    # LongStream-kit infer.py L721 进行同样的转换:
+    #   pts_world = _camera_points_to_world(pts_cam, extri)
+    # 此处必须保留 .detach().cpu().numpy()，Rerun 侧绝对不能接 GPU Tensor
+    world_t = outputs.get("world_points")
+    if isinstance(world_t, torch.Tensor):
+        pts_cam = world_t[0, -1].detach().cpu().numpy()  # [H, W, 3] or [N, 3]
+        pts_cam_flat = pts_cam.reshape(-1, 3)
+        if R_abs_dec is not None and t_abs_dec is not None:
+            pts_world = _camera_points_to_world_np(pts_cam_flat, R_abs_dec, t_abs_dec)
+        else:
+            # 位姿解码失败时直接使用相机坐标（降级处理）
+            pts_world = pts_cam_flat
+        result["world_points_np"] = pts_world
+
+    # ── 置信度 ───────────────────────────────────────────────────────────
+    conf_t = outputs.get("world_points_conf")
+    if isinstance(conf_t, torch.Tensor):
+        conf = conf_t[0, -1].detach().cpu().numpy()
+        result["conf_np"] = conf.reshape(-1)
+
+    return result
+
+
+def _decode_camera_center(
+    outputs: dict,
+    kf_idx_local: int,
+    local_pos: int,
+    is_kf: bool,
+    seg_R_abs: dict,
+    seg_t_abs: dict,
+) -> tuple:
+    """
+    从 rel_pose_enc 或 pose_enc 解码当前帧的相机中心（段内坐标系）。
+
+    返回: (center_np, R_abs, t_abs)
+      - center_np: [3,] float32 相机中心（如果解码失败则为 None）
+      - R_abs:     [3, 3] float32 w2c 旋转矩阵（用于点云 cam→world 变换）
+      - t_abs:     [3,] float32 w2c 平移（用于点云 cam→world 变换）
+
+    正确做法：
+      R_abs[s] = R_rel[s] @ R_abs[ref]
+      t_abs[s] = t_rel[s] + R_rel[s] @ t_abs[ref]
+      center    = -R_abs[s]^T @ t_abs[s]
+
+    若为关键帧，还会将 (R_abs, t_abs) 存入 seg_R_abs/seg_t_abs[local_pos]
+    供后续非关键帧组合使用。
+
+    seg_R_abs / seg_t_abs 传入即更新（mutable dict）。
+    """
+    from longstream.utils.vendor.models.components.utils.rotation import quat_to_mat
+
+    rel_pe_t = outputs.get("rel_pose_enc")
+    abs_pe_t = outputs.get("pose_enc")
+
+    try:
+        if rel_pe_t is not None and isinstance(rel_pe_t, torch.Tensor):
+            # rel_pose_enc: [1, 1, D]（batch=1, seq_len=1）
+            pe_cpu = rel_pe_t[0, 0].detach().cpu()  # [D,]
+            q_tensor = pe_cpu[3:7].unsqueeze(0)      # [1, 4]
+            R_rel = quat_to_mat(q_tensor)[0].numpy().astype(np.float32)  # [3, 3]
+            t_rel = pe_cpu[:3].numpy().astype(np.float32)                # [3,]
+
+            # 组合绝对位姿
+            R_ref = seg_R_abs.get(kf_idx_local)
+            t_ref = seg_t_abs.get(kf_idx_local)
+            if R_ref is not None and t_ref is not None:
+                R_abs = R_rel @ R_ref
+                t_abs = t_rel + R_rel @ t_ref
+            else:
+                # 参考不在历史中（段首帧或 refresh 刚发生）：直接使用相对位姿
+                R_abs = R_rel
+                t_abs = t_rel
+
+            # 若为关键帧，存储绝对位姿供后续帧参考
+            if is_kf:
+                seg_R_abs[local_pos] = R_abs.copy()
+                seg_t_abs[local_pos] = t_abs.copy()
+
+            center = -(R_abs.T @ t_abs)
+            return center.astype(np.float32), R_abs, t_abs
+
+        elif abs_pe_t is not None and isinstance(abs_pe_t, torch.Tensor):
+            # 绝对位姿编码：直接解码
+            pe_cpu = abs_pe_t[0, 0].detach().cpu()  # [D,]
+            q_tensor = pe_cpu[3:7].unsqueeze(0)
+            R_abs = quat_to_mat(q_tensor)[0].numpy().astype(np.float32)
+            t_abs = pe_cpu[:3].numpy().astype(np.float32)
+            if is_kf:
+                seg_R_abs[local_pos] = R_abs.copy()
+                seg_t_abs[local_pos] = t_abs.copy()
+            center = -(R_abs.T @ t_abs)
+            return center.astype(np.float32), R_abs, t_abs
+
+    except Exception as e:
+        pass
+    return None, None, None
+
+
+def _run_tto_window(
+    tto_ctx: TTOContext,
+    frame_buffer: list,
+    gps_buffer: list,
+    selector: KeyframeSelector,
+    streaming_mode: str,
+    device: str,
+    frame_idx: int,
+    pair_stride: int = 1,
+) -> None:
+    """
+    在滑动窗口上运行一次 TTO（不影响 session 的 KV cache）。
+    注意：reset_tto 已在流开始时执行，此处不再重置，
+    以保留跨窗口累积优化的 scale_token 状态。
+    """
+    tensors = [p.image_tensor for p in frame_buffer]  # 每个 [1, 1, C, H, W]
+    try:
+        images_win = torch.cat(tensors, dim=1)  # [1, T, C, H, W]
+    except Exception as exc:
+        print(f"[LiveInferenceRunner][TTO] 无法拼接帧 tensor: {exc}", flush=True)
+        return
+
+    gps_np = np.stack(gps_buffer, axis=0).astype(np.float32)  # [T, 3]
+    # 不调用 reset_tto：scale_token 保留跨窗口的优化状态
+    run_tto_scale_optimization(
+        ctx=tto_ctx,
+        images=images_win,
+        gps_xyz=gps_np,
+        selector=selector,
+        streaming_mode=streaming_mode,
+        device=device,
+        seq_name=f"live_frame{frame_idx}",
+        pair_stride=pair_stride,
+    )
+
+
+def _build_feeder_from_cfg(data_cfg: dict) -> StreamFeeder:
+    """从 data 配置块构建 StreamFeeder。"""
+    fmt = data_cfg.get("format", "image_dir")
+    crop = bool(data_cfg.get("crop", False))
+    size = int(data_cfg.get("size", 518))
+    patch_size = int(data_cfg.get("patch_size", 14))
+    max_frames = data_cfg.get("max_frames", None)
+    if max_frames is not None:
+        max_frames = int(max_frames)
+    camera = data_cfg.get("camera", None)
+    fps = float(data_cfg.get("fps", 0.0))
+
+    if fmt == "generalizable":
+        source_type = "generalizable"
+        source = data_cfg.get("img_path", ".")
+        # 传递完整 data_cfg 以复用 LongStreamDataLoader 的路径解析逻辑
+        return StreamFeeder(
+            source=source,
+            source_type=source_type,
+            fps=fps,
+            size=size,
+            patch_size=patch_size,
+            max_frames=max_frames,
+            camera=camera,
+            crop=crop,
+            data_cfg=data_cfg,
+        )
+    elif fmt == "video":
+        source_type = "video"
+        source = data_cfg.get("img_path", data_cfg.get("video_path", "."))
+    elif fmt == "npz":
+        source_type = "npz"
+        source = data_cfg.get("img_path", data_cfg.get("npz_path", "."))
+    else:
+        source_type = "image_dir"
+        source = data_cfg.get("img_path", ".")
+
+    return StreamFeeder(
+        source=source,
+        source_type=source_type,
+        fps=fps,
+        size=size,
+        patch_size=patch_size,
+        max_frames=max_frames,
+        camera=camera,
+        crop=crop,
+    )

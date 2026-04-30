@@ -8,5 +8,7 @@ matplotlib
 scipy
 pandas==2.1.4
 gradio
-plotly
+rerun-sdk
+# plotly: 已从实时推理路径移除；若需旧版批量演示导出 GLB，可手动安装
+# plotly
 trimesh

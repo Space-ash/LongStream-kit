@@ -1,5 +1,6 @@
+import warnings
+
 import numpy as np
-import plotly.graph_objects as go
 
 from longstream.demo.backend import load_frame_previews
 
@@ -7,32 +8,11 @@ from .common import load_metadata
 from .geometry import camera_geometry, collect_points
 
 
-def _empty_figure(message: str):
-    fig = go.Figure()
-    fig.add_annotation(
-        text=message, x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False
-    )
-    fig.update_layout(
-        template="plotly_white",
-        margin=dict(l=0, r=0, t=40, b=0),
-        scene=dict(aspectmode="data"),
-    )
-    return fig
-
-
-def _camera_lines(frustums):
-    xs, ys, zs = [], [], []
-    for center, corners in frustums:
-        order = [(0, 1), (1, 2), (2, 3), (3, 0)]
-        for a, b in order:
-            xs.extend([corners[a, 0], corners[b, 0], None])
-            ys.extend([corners[a, 1], corners[b, 1], None])
-            zs.extend([corners[a, 2], corners[b, 2], None])
-        for corner in corners:
-            xs.extend([center[0], corner[0], None])
-            ys.extend([center[1], corner[1], None])
-            zs.extend([center[2], corner[2], None])
-    return xs, ys, zs
+# ---------------------------------------------------------------------------
+# NOTE: build_interactive_figure() 已废弃。
+#   实时可视化请改用 longstream/demo/rerun_viewer.py 中的 RerunViewer。
+#   此函数保留仅为向后兼容旧批量推理演示路径。
+# ---------------------------------------------------------------------------
 
 
 def build_interactive_figure(
@@ -46,87 +26,36 @@ def build_interactive_figure(
     show_cameras: bool,
     camera_scale: float,
     mask_sky: bool,
-):
-    meta = load_metadata(session_dir)
-    points, colors, _ = collect_points(
-        session_dir=session_dir,
-        branch=branch,
-        display_mode=display_mode,
-        frame_index=frame_index,
-        mask_sky=mask_sky,
-        max_points=preview_max_points,
-        seed=frame_index,
+) -> str:
+    """
+    [已废弃] 原返回 Plotly Figure；现改为返回轻量状态消息。
+    实时 3D 可视化请使用 RerunViewer（longstream/demo/rerun_viewer.py）。
+    """
+    warnings.warn(
+        "build_interactive_figure() 已废弃，不再创建 Plotly 图形。"
+        " 请使用 longstream.demo.rerun_viewer.RerunViewer 代替。",
+        DeprecationWarning,
+        stacklevel=2,
     )
-    if len(points) == 0:
-        return _empty_figure("No valid points for the current selection")
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter3d(
-            x=points[:, 0],
-            y=points[:, 1],
-            z=points[:, 2],
-            mode="markers",
-            marker=dict(
-                size=float(point_size),
-                color=[f"rgb({r},{g},{b})" for r, g, b in colors],
-                opacity=float(opacity),
-            ),
-            hoverinfo="skip",
-            name="points",
-        )
-    )
-
-    if show_cameras:
-        centers, frustums, _ = camera_geometry(
+    try:
+        meta = load_metadata(session_dir)
+        num_frames = meta.get("num_frames", 0)
+        points, _, _ = collect_points(
             session_dir=session_dir,
+            branch=branch,
             display_mode=display_mode,
             frame_index=frame_index,
-            camera_scale_ratio=camera_scale,
-            points_hint=points,
+            mask_sky=mask_sky,
+            max_points=preview_max_points,
+            seed=frame_index,
         )
-        if len(centers) > 0:
-            fig.add_trace(
-                go.Scatter3d(
-                    x=centers[:, 0],
-                    y=centers[:, 1],
-                    z=centers[:, 2],
-                    mode="lines",
-                    line=dict(color="#16a34a", width=2),
-                    name="trajectory",
-                    hoverinfo="skip",
-                )
-            )
-            xs, ys, zs = _camera_lines(frustums)
-            fig.add_trace(
-                go.Scatter3d(
-                    x=xs,
-                    y=ys,
-                    z=zs,
-                    mode="lines",
-                    line=dict(color="#22c55e", width=1.5),
-                    name="cameras",
-                    hoverinfo="skip",
-                )
-            )
-
-    fig.update_layout(
-        template="plotly_white",
-        margin=dict(l=0, r=0, t=40, b=0),
-        scene=dict(
-            aspectmode="data",
-            xaxis_title="x_right",
-            yaxis_title="z_forward",
-            zaxis_title="y_up",
-            bgcolor="#f8fafc",
-            camera=dict(
-                up=dict(x=0.0, y=0.0, z=1.0),
-                eye=dict(x=-1.0, y=-1.8, z=0.9),
-            ),
-        ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
-    )
-    return fig
+        n_pts = len(points) if points is not None else 0
+        return (
+            f"[兼容模式] session={session_dir} frames={num_frames} points={n_pts}"
+            f" branch={branch} — 3D 渲染已迁移至 Rerun Viewer"
+        )
+    except Exception as exc:
+        return f"[兼容模式] 无法加载 session: {exc}"
 
 
 def build_frame_outputs(session_dir: str, frame_index: int):
