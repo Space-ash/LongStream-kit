@@ -20,11 +20,11 @@ import os
 import threading
 from typing import Optional
 
+# 必须在 import gradio 前设置，否则环境变量无效
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+
 import gradio as gr
 import yaml
-
-# 关闭 Gradio analytics，避免回调异常后触发 pandas/numpy ABI 二次报错
-os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
 # ─── Config template paths ────────────────────────────────────────────────
 _CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "configs")
@@ -720,7 +720,7 @@ def main():
         status_timer.tick(fn=_check_status, outputs=[status_box])
 
         # ─── Template sync ─────────────────────────────────────────────
-        # update_ui_from_yaml returns 20 values.
+        # update_ui_from_yaml returns 22 values.
         # advanced_yaml is intentionally NOT in this output list.
         _template_sync_outputs = [
             window_size, refresh, keyframe_stride,       # 1-3
@@ -807,7 +807,7 @@ def main():
             outputs=[custom_config_path, template_name, cfg_state],
         )
 
-    demo.launch(analytics_enabled=False)
+    demo.launch()
 
 
 if __name__ == "__main__":
