@@ -1,4 +1,4 @@
-﻿"""
+"""
 longstream/streaming/live_inference.py
 ---------------------------------------
 实时逐帧推理运行器（LiveInferenceRunner）。
@@ -129,6 +129,28 @@ def _worker_inference_loop(
     seg_R_abs[0] = np.eye(3, dtype=np.float32)
     seg_t_abs[0] = np.zeros(3, dtype=np.float32)
 
+    # ── 输出目录 / 输出配置（循环前构建，避免每帧重复）──────────────────
+    _out_cfg_merged = {
+        **cfg.get("output", {}),
+        **cfg.get("optimizations", {}).get("filter", {}),
+    }
+    _out_dir = cfg.get("output", {}).get(
+        "root", os.path.join("output", "live_inference")
+    )
+    # 如果启用 GLB 导出但未启用逐帧点云，自动临时开启逐帧点云（GLB 依赖它）
+    if _out_cfg_merged.get("export_glb", False) and not _out_cfg_merged.get("save_frame_points", False):
+        _out_cfg_merged = dict(_out_cfg_merged)
+        _out_cfg_merged["save_frame_points"] = True
+        print("[LiveInferenceRunner/worker] 已自动启用 save_frame_points（GLB 导出需要）", flush=True)
+    # mask_sky 在 streaming 模式下暂不支持，检测到后警告一次
+    if _out_cfg_merged.get("mask_sky", False):
+        print("[LiveInferenceRunner/worker] 警告：mask_sky 在流式推理模式下暂未集成，跳过。", flush=True)
+
+    # save_points: 在 CPU 侧累积世界坐标点，循环结束后写全局点云 PLY
+    _all_world_points: list = []  # list of np.ndarray [N, 3]
+    _max_full_pts: int = int(_out_cfg_merged.get("max_full_pointcloud_points",
+                              _out_cfg_merged.get("max_frame_pointcloud_points", 8000) * 100))
+
     print("[LiveInferenceRunner/worker] 开始逐帧推理", flush=True)
 
     with torch.no_grad():
@@ -218,7 +240,29 @@ def _worker_inference_loop(
             except Exception:
                 pass
 
-    # ── 结束清理 ──────────────────────────────────────────────────────────
+            # ── 增量保存到磁盘（仅使用 outputs_cpu，严禁 GPU Tensor）──────
+            _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g)
+
+            # ── save_points：累积 CPU 世界坐标点 ─────────────────────────
+            if _out_cfg_merged.get("save_points", False):
+                pts = outputs_cpu.get("world_points_np")
+                if pts is not None:
+                    _all_world_points.append(pts.reshape(-1, 3).astype(np.float32))
+
+    # ── 循环结束后处理（纯 CPU / 磁盘，不持有 GPU 引用）─────────────────
+    # 全局点云 PLY
+    if _out_cfg_merged.get("save_points", False) and _all_world_points:
+        _save_global_points(_all_world_points, _out_cfg_merged, _out_dir, _max_full_pts)
+
+    # 视频合成（从已落盘 RGB 序列）
+    if _out_cfg_merged.get("save_videos", False):
+        _fps_out = int(cfg.get("data", {}).get("fps", 0) or 24)
+        _assemble_video(_out_dir, fps=_fps_out)
+
+    # GLB 导出（基于已落盘逐帧 PLY）
+    if _out_cfg_merged.get("export_glb", False):
+        _export_glb_from_plys(_out_dir)
+
     session.clear()
     torch.cuda.empty_cache()
     print("[LiveInferenceRunner/worker] 推理循环正常结束", flush=True)
@@ -360,6 +404,201 @@ class LiveInferenceRunner:
 # ═══════════════════════════════════════════════════════════════════════════
 #  工具函数（模块私有）
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  增量磁盘保存工具函数
+# ═══════════════════════════════════════════════════════════════════════════
+
+import os as _os  # noqa: E402 — 避免顶部 import 顺序约束
+
+
+def _write_ply(pts: np.ndarray, path: str) -> None:
+    """将 [N, 3] float32 数组写出为 ASCII PLY 文件。"""
+    N = len(pts)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {N}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("end_header\n")
+        for p in pts:
+            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+
+
+def _save_frame_outputs(
+    outputs_cpu: dict,
+    out_cfg: dict,
+    out_dir: str,
+    frame_idx: int,
+) -> None:
+    """
+    增量保存单帧输出到磁盘。
+
+    所有输入均为纯 numpy（已完成 .detach().cpu().numpy()）。
+    本函数绝对不导入 torch，也不持有任何 GPU 对象引用。
+    """
+    import PIL.Image  # 仅在子进程中需要，延迟导入
+
+    _os.makedirs(out_dir, exist_ok=True)
+
+    # ── RGB PNG ──────────────────────────────────────────────────────────
+    if out_cfg.get("save_images", False):
+        rgb_np = outputs_cpu.get("rgb_np")
+        if rgb_np is not None:
+            rgb_dir = _os.path.join(out_dir, "images")
+            _os.makedirs(rgb_dir, exist_ok=True)
+            PIL.Image.fromarray(rgb_np).save(
+                _os.path.join(rgb_dir, f"{frame_idx:06d}.png")
+            )
+
+    # ── 深度图 .npy + 可视化 PNG ─────────────────────────────────────────
+    if out_cfg.get("save_depth", False):
+        depth_np = outputs_cpu.get("depth_np")
+        if depth_np is not None:
+            depth_dir = _os.path.join(out_dir, "depth")
+            _os.makedirs(depth_dir, exist_ok=True)
+            np.save(_os.path.join(depth_dir, f"{frame_idx:06d}.npy"), depth_np)
+            # 归一化可视化
+            d_min, d_max = depth_np.min(), depth_np.max()
+            if d_max > d_min:
+                d_vis = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+            else:
+                d_vis = np.zeros_like(depth_np, dtype=np.uint8)
+            PIL.Image.fromarray(d_vis).save(
+                _os.path.join(depth_dir, f"{frame_idx:06d}_vis.png")
+            )
+
+    # ── 逐帧点云 PLY（按置信度过滤）─────────────────────────────────────
+    if out_cfg.get("save_frame_points", False):
+        pts = outputs_cpu.get("world_points_np")
+        if pts is not None:
+            conf = outputs_cpu.get("conf_np")
+            thr = float(out_cfg.get(
+                "confidence_threshold",
+                out_cfg.get("max_conf_filter_threshold", 0.5),
+            ))
+            if conf is not None:
+                mask = conf.reshape(-1) >= thr
+                pts_filtered = pts.reshape(-1, 3)[mask]
+            else:
+                pts_filtered = pts.reshape(-1, 3)
+            pts_dir = _os.path.join(out_dir, "frame_points")
+            _os.makedirs(pts_dir, exist_ok=True)
+            _write_ply(pts_filtered, _os.path.join(pts_dir, f"{frame_idx:06d}.ply"))
+
+    # ── 轨迹（追加写）───────────────────────────────────────────────────
+    center = outputs_cpu.get("center_np")
+    if center is not None:
+        traj_path = _os.path.join(out_dir, "trajectory.txt")
+        with open(traj_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{frame_idx} {center[0]:.6f} {center[1]:.6f} {center[2]:.6f}\n"
+            )
+
+
+def _save_global_points(
+    pts_list: list,
+    out_cfg: dict,
+    out_dir: str,
+    max_pts: int = 800000,
+) -> None:
+    """
+    将循环期间累积的世界坐标点 [N, 3] 合并、按置信度均匀下采样，
+    写出全局点云 PLY。
+    pts_list: list of np.ndarray [N_i, 3] float32
+    """
+    if not pts_list:
+        return
+    try:
+        all_pts = np.concatenate(pts_list, axis=0)   # [Total, 3]
+    except Exception as exc:
+        print(f"[LiveInferenceRunner] 全局点云合并失败: {exc}", flush=True)
+        return
+
+    N = len(all_pts)
+    if N > max_pts:
+        idx = np.random.choice(N, max_pts, replace=False)
+        all_pts = all_pts[idx]
+
+    pts_dir = _os.path.join(out_dir, "global_points")
+    _os.makedirs(pts_dir, exist_ok=True)
+    ply_path = _os.path.join(pts_dir, "global_pointcloud.ply")
+    _write_ply(all_pts, ply_path)
+    print(f"[LiveInferenceRunner] 全局点云已保存: {ply_path}  ({len(all_pts)} 点)", flush=True)
+
+
+def _assemble_video(out_dir: str, fps: int = 24) -> None:
+    """
+    将 out_dir/images/*.png 序列合成为 out_dir/output.mp4。
+    依赖 imageio[ffmpeg]；未安装时跳过并打印提示。
+    纯 CPU/磁盘操作，不使用任何 GPU 张量。
+    """
+    import glob
+
+    img_dir = _os.path.join(out_dir, "images")
+    if not _os.path.isdir(img_dir):
+        print("[LiveInferenceRunner] save_videos 跳过：images/ 目录不存在。", flush=True)
+        return
+
+    frames = sorted(glob.glob(_os.path.join(img_dir, "*.png")))
+    if not frames:
+        print("[LiveInferenceRunner] save_videos 跳过：images/ 目录为空。", flush=True)
+        return
+
+    try:
+        import imageio
+    except ImportError:
+        print(
+            "[LiveInferenceRunner] save_videos 跳过：imageio 未安装。"
+            "请运行: pip install imageio[ffmpeg]",
+            flush=True,
+        )
+        return
+
+    import PIL.Image
+
+    out_video = _os.path.join(out_dir, "output.mp4")
+    fps_actual = max(1, int(fps))
+    try:
+        writer = imageio.get_writer(out_video, fps=fps_actual, codec="libx264",
+                                    quality=None, pixelformat="yuv420p")
+        for fp in frames:
+            frame = np.array(PIL.Image.open(fp))
+            writer.append_data(frame)
+        writer.close()
+        print(f"[LiveInferenceRunner] 视频已保存: {out_video}", flush=True)
+    except Exception as exc:
+        print(f"[LiveInferenceRunner] 视频合成失败: {exc}", flush=True)
+
+
+def _export_glb_from_plys(out_dir: str) -> None:
+    """将已落盘的逐帧 PLY 合并导出为 GLB（使用 trimesh；不可用则跳过）。"""
+    import glob
+
+    pts_dir = _os.path.join(out_dir, "frame_points")
+    if not _os.path.isdir(pts_dir):
+        return
+    try:
+        import trimesh
+    except ImportError:
+        print("[LiveInferenceRunner] GLB 导出跳过：trimesh 未安装", flush=True)
+        return
+
+    ply_files = sorted(glob.glob(_os.path.join(pts_dir, "*.ply")))
+    if not ply_files:
+        return
+    meshes = []
+    for fp in ply_files:
+        try:
+            meshes.append(trimesh.load(fp))
+        except Exception:
+            pass
+    if not meshes:
+        return
+    combined = trimesh.util.concatenate(meshes)
+    glb_path = _os.path.join(out_dir, "scene.glb")
+    combined.export(glb_path)
+    print(f"[LiveInferenceRunner] GLB 已导出: {glb_path}", flush=True)
+
 
 def _camera_points_to_world_np(
     pts_cam: np.ndarray,
@@ -609,3 +848,117 @@ def _build_feeder_from_cfg(data_cfg: dict) -> StreamFeeder:
         camera=camera,
         crop=crop,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  批处理子进程入口
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _batch_worker_main(
+    cfg: dict,
+    result_queue: "mp.Queue",
+    stop_flag: "mp.Event",
+) -> None:
+    """
+    批处理模式子进程：复用 _worker_inference_loop，fps=0（无限速）。
+    不推送 Rerun Viewer（result_queue 仅接收错误/完成信号，无 on_frame 回调）。
+    支持 video/NPZ/image_dir/generalizable，全走 StreamFeeder 路径。
+    输出增量落盘逻辑与流式模式完全一致。
+    """
+    import traceback as _tb
+    import copy
+
+    # 强制关闭帧率限速
+    batch_cfg = copy.deepcopy(cfg)
+    batch_cfg.setdefault("data", {})
+    batch_cfg["data"]["fps"] = 0
+
+    try:
+        _worker_inference_loop(batch_cfg, result_queue, stop_flag)
+        result_queue.put_nowait(("__done__", "批处理推理完成"))
+    except Exception as exc:
+        try:
+            result_queue.put_nowait(("__error__", str(exc) + "\n" + _tb.format_exc()))
+        except Exception:
+            pass
+        _tb.print_exc()
+    finally:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+class BatchInferenceRunner:
+    """
+    批处理推理运行器。
+
+    在独立子进程中调用 run_inference_cfg(cfg)，
+    不进行帧率限速，不推送 Rerun Viewer。
+    输出由 run_inference_cfg 自行按 cfg["output"] 落盘。
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self._process: Optional[mp.Process] = None
+        self._result_queue: mp.Queue = mp.Queue(maxsize=5)
+        self._stop_flag: mp.Event = mp.Event()
+        self._poll_thread: Optional[threading.Thread] = None
+        self._error: Optional[Exception] = None
+
+    def start(self) -> None:
+        if self._process is not None and self._process.is_alive():
+            return
+        self._stop_flag.clear()
+        self._error = None
+        self._process = mp.Process(
+            target=_batch_worker_main,
+            args=(self.cfg, self._result_queue, self._stop_flag),
+            name="BatchInferenceWorker",
+            daemon=True,
+        )
+        self._process.start()
+        self._poll_thread = threading.Thread(
+            target=self._poll_results,
+            name="BatchInferenceRunner-poll",
+            daemon=True,
+        )
+        self._poll_thread.start()
+
+    def stop(self) -> None:
+        if self._process is None:
+            return
+        self._stop_flag.set()
+        self._process.join(timeout=3)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=5)
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=2)
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=2)
+
+    @property
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.is_alive()
+
+    @property
+    def last_error(self) -> Optional[Exception]:
+        return self._error
+
+    def _poll_results(self) -> None:
+        while self._process is not None and (
+            self._process.is_alive() or not self._result_queue.empty()
+        ):
+            try:
+                item = self._result_queue.get(timeout=0.5)
+            except Exception:
+                continue
+            if isinstance(item, tuple) and len(item) == 2:
+                tag, msg = item
+                if tag == "__error__":
+                    self._error = RuntimeError(msg)
+                    print(f"[BatchInferenceRunner] 批处理错误:\n{msg}", flush=True)
+                elif tag == "__done__":
+                    print(f"[BatchInferenceRunner] {msg}", flush=True)
