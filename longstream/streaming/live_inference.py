@@ -220,10 +220,18 @@ def _worker_inference_loop(
             if is_kf and g > 0:
                 keyframe_count += 1
                 if keyframe_count % refresh_intervals == 0:
+                    # 保留当前关键帧全局位姿作为新段 anchor，防止轨迹回原点
+                    anchor_R = outputs_cpu.get("R_abs_np")
+                    anchor_t = outputs_cpu.get("t_abs_np")
                     session.clear_cache_only()
                     segment_start = g
-                    seg_R_abs = {0: np.eye(3, dtype=np.float32)}
-                    seg_t_abs = {0: np.zeros(3, dtype=np.float32)}
+                    if anchor_R is not None and anchor_t is not None:
+                        seg_R_abs = {0: anchor_R.copy()}
+                        seg_t_abs = {0: anchor_t.copy()}
+                    else:
+                        # 兜底，正常情况不应触发
+                        seg_R_abs = {0: np.eye(3, dtype=np.float32)}
+                        seg_t_abs = {0: np.zeros(3, dtype=np.float32)}
                     anchor_kf_indices = torch.zeros(
                         1, 1, dtype=torch.long, device=device_str
                     )
@@ -248,14 +256,11 @@ def _worker_inference_loop(
             # ── 增量保存到磁盘（仅使用 outputs_cpu，严禁 GPU Tensor）──────
             _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g)
 
-            # ── save_points：Reservoir 采样累积 CPU 世界坐标点 ─────────────
+            # ── save_points：Reservoir 采样累积（先过滤再累计，与非流式保存一致）──
             if _out_cfg_merged.get("save_points", False):
-                pts = outputs_cpu.get("world_points_np")
-                if pts is not None:
-                    new_pts = pts.reshape(-1, 3).astype(np.float32)
-                    new_colors = outputs_cpu.get("point_colors_np")
+                new_pts, new_colors = _filter_points_colors(outputs_cpu, _out_cfg_merged)
+                if new_pts is not None and len(new_pts) > 0:
                     if new_colors is not None:
-                        new_colors = new_colors.reshape(-1, 3).astype(np.uint8)
                         _reservoir_has_colors = True
                     # 并入 reservoir
                     if _reservoir_pts is None:
@@ -455,6 +460,47 @@ def _write_ply(pts: np.ndarray, path: str, colors: np.ndarray = None) -> None:
     save_pointcloud(path, pts, colors=colors)
 
 
+def _filter_points_colors(
+    outputs_cpu: dict,
+    out_cfg: dict,
+) -> tuple:
+    """
+    从 outputs_cpu 提取世界点云和颜色，按置信度阈值过滤后返回。
+
+    所有路径（逐帧 PLY、全局 reservoir、Rerun 当前帧/全局帧）统一调用此函数，
+    确保过滤逻辑与非流式推理（infer.py）保持一致。
+
+    Returns
+    -------
+    (pts_filtered, colors_filtered)
+        pts_filtered   : [N, 3] float32，或 None（无有效点云）
+        colors_filtered: [N, 3] uint8，或 None（无颜色数据）
+    """
+    pts = outputs_cpu.get("world_points_np")
+    if pts is None:
+        return None, None
+
+    conf = outputs_cpu.get("conf_np")
+    colors = outputs_cpu.get("point_colors_np")
+    thr = float(out_cfg.get(
+        "confidence_threshold",
+        out_cfg.get("max_conf_filter_threshold", 0.5),
+    ))
+
+    pts_flat = pts.reshape(-1, 3).astype(np.float32)
+    colors_flat = colors.reshape(-1, 3).astype(np.uint8) if colors is not None else None
+
+    if conf is not None:
+        conf_flat = conf.reshape(-1)
+        if len(conf_flat) == len(pts_flat):
+            mask = conf_flat >= thr
+            pts_flat = pts_flat[mask]
+            if colors_flat is not None:
+                colors_flat = colors_flat[mask]
+
+    return pts_flat, colors_flat
+
+
 def _save_frame_outputs(
     outputs_cpu: dict,
     out_cfg: dict,
@@ -498,23 +544,10 @@ def _save_frame_outputs(
                 _os.path.join(depth_dir, f"{frame_idx:06d}_vis.png")
             )
 
-    # ── 逐帧点云 PLY（按置信度过滤）─────────────────────────────────────
+    # ── 逐帧点云 PLY（按置信度过滤，使用共享过滤函数）────────────────────
     if out_cfg.get("save_frame_points", False):
-        pts = outputs_cpu.get("world_points_np")
-        if pts is not None:
-            conf = outputs_cpu.get("conf_np")
-            colors = outputs_cpu.get("point_colors_np")
-            thr = float(out_cfg.get(
-                "confidence_threshold",
-                out_cfg.get("max_conf_filter_threshold", 0.5),
-            ))
-            if conf is not None:
-                mask = conf.reshape(-1) >= thr
-                pts_filtered = pts.reshape(-1, 3)[mask]
-                colors_filtered = colors.reshape(-1, 3)[mask] if colors is not None else None
-            else:
-                pts_filtered = pts.reshape(-1, 3)
-                colors_filtered = colors.reshape(-1, 3) if colors is not None else None
+        pts_filtered, colors_filtered = _filter_points_colors(outputs_cpu, out_cfg)
+        if pts_filtered is not None and len(pts_filtered) > 0:
             pts_dir = _os.path.join(out_dir, "frame_points")
             _os.makedirs(pts_dir, exist_ok=True)
             _write_ply(pts_filtered, _os.path.join(pts_dir, f"{frame_idx:06d}.ply"),
@@ -718,6 +751,11 @@ def _decode_outputs_to_cpu(
     )
     if center_np is not None:
         result["center_np"] = center_np
+    # 暴露全局 w2c 位姿，供 refresh 段 anchor 使用
+    if R_abs_dec is not None:
+        result["R_abs_np"] = R_abs_dec
+    if t_abs_dec is not None:
+        result["t_abs_np"] = t_abs_dec
 
     # ── 世界点云（必须先将相机坐标系点转到世界坐标系）─────────────
     # LongStream-kit infer.py L721 进行同样的转换:
@@ -735,21 +773,23 @@ def _decode_outputs_to_cpu(
             pts_world = pts_cam_flat
         result["world_points_np"] = pts_world
 
-        # ── 点云颜色（与点云像素一一对应）────────────────────────────
-        # 将原图 RGB resize 到与 world_points 同分辨率，保证像素对应
-        rgb_full = packet.rgb
-        if rgb_full is not None and pts_cam.ndim == 3:
-            try:
-                from PIL import Image as _PILImage
-                import numpy as _np2
-                _h, _w = pts_cam.shape[:2]
-                rgb_resized = _np2.array(
-                    _PILImage.fromarray(rgb_full).resize((_w, _h), _PILImage.BILINEAR),
-                    dtype=_np2.uint8,
-                )
-                result["point_colors_np"] = rgb_resized.reshape(-1, 3)
-            except Exception:
-                pass
+        # ── 点云颜色（直接从 image_tensor 提取，与模型输入像素精确对应）──
+        # packet.image_tensor[0, 0]: [C, H, W] float [0,1]，与模型实际看到的帧一致
+        try:
+            img_t = packet.image_tensor[0, 0]  # [C, H, W]
+            rgb_model = img_t.permute(1, 2, 0).detach().cpu().numpy()  # [H, W, 3]
+            rgb_model = np.clip(rgb_model * 255.0, 0, 255).astype(np.uint8)
+            if pts_cam.ndim == 3:
+                h, w = pts_cam.shape[:2]
+                if rgb_model.shape[:2] != (h, w):
+                    from PIL import Image as _PILImage
+                    rgb_model = np.array(
+                        _PILImage.fromarray(rgb_model).resize((w, h), _PILImage.BILINEAR),
+                        dtype=np.uint8,
+                    )
+                result["point_colors_np"] = rgb_model.reshape(-1, 3)
+        except Exception:
+            pass
 
     # ── 置信度 ───────────────────────────────────────────────────────────
     conf_t = outputs.get("world_points_conf")
