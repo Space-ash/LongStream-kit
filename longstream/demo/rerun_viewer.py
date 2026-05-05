@@ -40,7 +40,16 @@ except ImportError:
     rr = None  # type: ignore[assignment]
 
 # 论文截图友好的浅灰背景色
-PAPER_BG = [245, 245, 245]
+
+
+def _make_spatial3d_view(name: str, origin: str):
+    """Create Spatial3DView without background kwarg to avoid numpy-ABI BackgroundKindBatch warning.
+
+    Users can configure the theme (light / white) in the Rerun Viewer GUI:
+      Settings → Appearance → Theme → Light
+    """
+    import rerun.blueprint as rrb
+    return rrb.Spatial3DView(name=name, origin=origin)
 
 
 def _make_blueprint():
@@ -55,18 +64,10 @@ def _make_blueprint():
         import rerun.blueprint as rrb
         blueprint = rrb.Blueprint(
             rrb.Grid(
-                rrb.Spatial3DView(
-                    name="当前帧点云",
-                    origin="live/current",
-                    background=PAPER_BG,
-                ),
-                rrb.Spatial3DView(
-                    name="全局点云",
-                    origin="live/global",
-                    background=PAPER_BG,
-                ),
-                rrb.Spatial2DView(name="RGB",  origin="live/rgb"),
-                rrb.Spatial2DView(name="深度", origin="live/depth"),
+                _make_spatial3d_view("Current Frame",        "live/current"),
+                _make_spatial3d_view("Global Reconstruction", "live/global"),
+                rrb.Spatial2DView(name="RGB",   origin="live/rgb"),
+                rrb.Spatial2DView(name="Depth", origin="live/depth"),
                 grid_columns=2,
             ),
             collapse_panels=True,
@@ -144,6 +145,11 @@ class RerunViewer:
         self._initialized = True
         self._centers = []
         print(f"[RerunViewer] 已初始化: app_name={self.app_name!r}, recording_id={recording_id}", flush=True)
+        print(
+            "[RerunViewer] 注意：如需展示白色背景（论文截图风格），"
+            "请在 Rerun Viewer 界面选择 Settings → Appearance → Theme → Light。",
+            flush=True,
+        )
 
     def log_frame(self, frame_idx: int, outputs_cpu: dict) -> None:
         """
@@ -241,7 +247,7 @@ class RerunViewer:
                     flush=True,
                 )
             else:
-                # ── 左上：当前帧点云（每帧覆盖同一路径）────────────────────
+                # ── 左上：当前帧点云（每帧覆盖同一路径），使用 point_head ──
                 cur_pts = points_np
                 cur_cols = colors_np
                 if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
@@ -258,9 +264,14 @@ class RerunViewer:
                     ),
                 )
 
-                # ── 右上：全局视图，每帧独立实体，Rerun 自然累积，无随机裁剪 ──
-                glb_pts = points_np
-                glb_cols = colors_np
+                # ── 右上：全局视图，优先 dpt_unproj，fallback 到 point_head ──
+                _glb_raw_pts = outputs_cpu.get("filtered_dpu_pts_np")
+                _glb_raw_cols = outputs_cpu.get("filtered_dpu_cols_np")
+                if _glb_raw_pts is None or len(_glb_raw_pts) == 0 or _glb_raw_cols is None:
+                    _glb_raw_pts = points_np
+                    _glb_raw_cols = colors_np
+                glb_pts = _glb_raw_pts
+                glb_cols = _glb_raw_cols
                 if self.max_global_frame_points is not None and len(glb_pts) > self.max_global_frame_points:
                     rng_g = np.random.default_rng(seed=frame_idx + 100000)
                     keep_g = rng_g.choice(len(glb_pts), size=self.max_global_frame_points, replace=False)

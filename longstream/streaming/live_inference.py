@@ -154,10 +154,18 @@ def _worker_inference_loop(
     _max_frame_pts: int = int(_out_cfg_merged.get("max_frame_pointcloud_points", 8000))
     _max_full_pts: int = int(_out_cfg_merged.get("max_full_pointcloud_points", _max_frame_pts * 100))
     # reservoir：累积完整过滤后的点（从 filtered_points_np 注入，纯 CPU numpy）
-    # 策略：超过 2× 上限时随机下采样至 _max_full_pts，保持 RAM 有界
     _res_pts: Optional[np.ndarray] = None   # [R, 3] float32
-    _res_cols: Optional[np.ndarray] = None  # [R, 3] uint8 or None
+    _res_cols: Optional[np.ndarray] = None  # [R, 3] uint8
     _res_rng = np.random.default_rng(seed=0)
+    # dpt_unproj reservoir（与 point_head reservoir 并行）
+    _res_dpu_pts: Optional[np.ndarray] = None   # [R, 3] float32
+    _res_dpu_cols: Optional[np.ndarray] = None  # [R, 3] uint8
+    _res_dpu_rng = np.random.default_rng(seed=1)
+    # live/ 保存参数（与 Rerun 下采样一致）
+    _max_live_global_pts: int = int(_out_cfg_merged.get("max_live_global_frame_points", 2000))
+    # dpt_unproj 警告限频计数器（防止长序列日志刷爆）
+    _dpu_warn_count: int = 0
+    _dpu_warn_max: int = 3  # 前 3 次打印警告，此后仅累计
 
     # ── sky segmentation session（真实初始化）────────────────────────────
     _sky_session = None
@@ -297,7 +305,6 @@ def _worker_inference_loop(
             del frame_tensor
 
             # ── 统一过滤（一次计算，供磁盘保存 + Rerun 共用）────────────────
-            # 结果存入 outputs_cpu，避免下游多次重复过滤导致不一致
             _fpts, _fcols = _filter_points_colors(outputs_cpu, _out_cfg_merged)
             if _fpts is not None and len(_fpts) > 0:
                 outputs_cpu["filtered_points_np"] = _fpts.astype(np.float32)
@@ -307,6 +314,22 @@ def _worker_inference_loop(
             else:
                 outputs_cpu["filtered_points_np"] = None
                 outputs_cpu["filtered_colors_np"] = None
+
+            # ── dpt_unproj 统一过滤（使用 depth_conf 而非 world_points_conf）──
+            if outputs_cpu.get("dpt_unproj_points_np") is not None:
+                _dpu_fake = dict(outputs_cpu)
+                _dpu_fake["world_points_np"] = outputs_cpu["dpt_unproj_points_np"]
+                # dpt_unproj 分支使用 depth_conf（与 core/infer.py 对齐）
+                _dpu_fake["conf_np"] = outputs_cpu.get("depth_conf_np")
+                _dpu_fpts, _dpu_fcols = _filter_points_colors(_dpu_fake, _out_cfg_merged)
+                if _dpu_fpts is not None and len(_dpu_fpts) > 0:
+                    outputs_cpu["filtered_dpu_pts_np"] = _dpu_fpts.astype(np.float32)
+                    outputs_cpu["filtered_dpu_cols_np"] = (
+                        _dpu_fcols.astype(np.uint8) if _dpu_fcols is not None else None
+                    )
+                else:
+                    outputs_cpu["filtered_dpu_pts_np"] = None
+                    outputs_cpu["filtered_dpu_cols_np"] = None
 
             # ── 累积位姿（用于结束后写 abs_pose.txt）────────────────────────
             R_abs_np = outputs_cpu.get("R_abs_np")
@@ -327,6 +350,29 @@ def _worker_inference_loop(
             # ── 增量保存到磁盘（使用预计算的 filtered_points_np，严禁 GPU Tensor）──
             _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g,
                                 max_frame_pts=_max_frame_pts)
+
+            # ── dpt_unproj 逐帧 PLY 保存 ──────────────────────────────────
+            if _out_cfg_merged.get("save_frame_points", False):
+                _dpu_pts_f = outputs_cpu.get("filtered_dpu_pts_np")
+                _dpu_cols_f = outputs_cpu.get("filtered_dpu_cols_np")
+                if _dpu_pts_f is not None and len(_dpu_pts_f) > 0:
+                    _dpu_save = _dpu_pts_f
+                    _dpu_csave = _dpu_cols_f
+                    if _max_frame_pts > 0 and len(_dpu_save) > _max_frame_pts:
+                        _rng_dpu_f = np.random.default_rng(seed=g)
+                        _ki_dpu = _rng_dpu_f.choice(len(_dpu_save), _max_frame_pts, replace=False)
+                        _dpu_save = _dpu_save[_ki_dpu]
+                        if _dpu_csave is not None:
+                            _dpu_csave = _dpu_csave[_ki_dpu]
+                    _dpu_dir = _os.path.join(_out_dir, "points", "dpt_unproj")
+                    _os.makedirs(_dpu_dir, exist_ok=True)
+                    _write_ply(_dpu_save, _os.path.join(_dpu_dir, f"frame_{g:06d}.ply"),
+                               colors=_dpu_csave)
+
+            # ── live/ 保存（与 Rerun 同源数据落盘）────────────────────────
+            _save_live_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g,
+                               max_frame_pts=_max_frame_pts,
+                               max_global_pts=_max_live_global_pts)
 
             # ── 全局 reservoir 更新（不受逐帧下采样预算限制，直接用完整过滤结果）──
             if _out_cfg_merged.get("save_points", False):
@@ -382,6 +428,25 @@ def _worker_inference_loop(
                             if _res_cols is not None:
                                 _res_cols = _res_cols[_keep_r]
 
+            # ── dpt_unproj reservoir 更新 ─────────────────────────────────
+            _dpu_new = outputs_cpu.get("filtered_dpu_pts_np")
+            _dpu_new_cols = outputs_cpu.get("filtered_dpu_cols_np")
+            if _dpu_new is not None and len(_dpu_new) > 0 and _dpu_new_cols is not None:
+                _dpu_new = _dpu_new.astype(np.float32)
+                _dpu_new_cols = _dpu_new_cols.astype(np.uint8)
+                if _res_dpu_pts is None:
+                    _res_dpu_pts = _dpu_new
+                    _res_dpu_cols = _dpu_new_cols
+                else:
+                    _res_dpu_pts = np.concatenate([_res_dpu_pts, _dpu_new], axis=0)
+                    if _res_dpu_cols is not None:
+                        _res_dpu_cols = np.concatenate([_res_dpu_cols, _dpu_new_cols], axis=0)
+                if len(_res_dpu_pts) > _max_full_pts * 2:
+                    _keep_dpu = _res_dpu_rng.choice(len(_res_dpu_pts), _max_full_pts, replace=False)
+                    _res_dpu_pts = _res_dpu_pts[_keep_dpu]
+                    if _res_dpu_cols is not None:
+                        _res_dpu_cols = _res_dpu_cols[_keep_dpu]
+
     # 全局点云 PLY：从 in-memory reservoir 保存（完整过滤质量，不受逐帧预算影响）
     if _out_cfg_merged.get("save_points", False) and _res_pts is not None and len(_res_pts) > 0:
         try:
@@ -405,6 +470,47 @@ def _worker_inference_loop(
             print(f"[LiveInferenceRunner] 全局点云保存失败: {_ply_exc}", flush=True)
     elif _out_cfg_merged.get("save_points", False):
         print("[LiveInferenceRunner] 全局点云：无有效过滤点，跳过。", flush=True)
+
+    # dpt_unproj 全局点云 PLY
+    if _out_cfg_merged.get("save_points", False) and _res_dpu_pts is not None and len(_res_dpu_pts) > 0:
+        try:
+            _f_dpu = _res_dpu_pts.astype(np.float32)
+            _f_dpu_cols = _res_dpu_cols.astype(np.uint8) if _res_dpu_cols is not None else None
+            if len(_f_dpu) > _max_full_pts:
+                _ki_dpu_f = np.random.default_rng(seed=2).choice(len(_f_dpu), _max_full_pts, replace=False)
+                _f_dpu = _f_dpu[_ki_dpu_f]
+                if _f_dpu_cols is not None:
+                    _f_dpu_cols = _f_dpu_cols[_ki_dpu_f]
+            _pts_dir_dpu = _os.path.join(_out_dir, "points", "dpt_unproj")
+            _os.makedirs(_pts_dir_dpu, exist_ok=True)
+            _full_dpu_ply = _os.path.join(_out_dir, "points", "dpt_unproj_full.ply")
+            _write_ply(_f_dpu, _full_dpu_ply, colors=_f_dpu_cols)
+            np.save(_os.path.join(_out_dir, "points", "dpt_unproj_full.npy"), _f_dpu)
+            # 同步保存到 live/global/
+            _live_glb_dpu = _os.path.join(_out_dir, "live", "global", "dpt_unproj_full.ply")
+            _os.makedirs(_os.path.dirname(_live_glb_dpu), exist_ok=True)
+            _write_ply(_f_dpu, _live_glb_dpu, colors=_f_dpu_cols)
+            print(f"[LiveInferenceRunner] dpt_unproj 全局点云已保存: {_full_dpu_ply}  ({len(_f_dpu)} 点)", flush=True)
+        except Exception as _dpu_exc:
+            print(f"[LiveInferenceRunner] dpt_unproj 全局点云保存失败: {_dpu_exc}", flush=True)
+    elif _out_cfg_merged.get("save_points", False):
+        print(
+            "[LiveInferenceRunner] dpt_unproj 全局点云：无有效点，未生成 dpt_unproj_full.ply。"
+            "请检查以下日志确认原因："
+            "① pose_enc/rel_pose_enc 不可用（无法计算 intri）"
+            "② depth_conf 过滤将所有点过滤掉了（调高 confidence_threshold）"
+            "③ dpt_unproj 计算异常（查看上方 警告 日志）",
+            flush=True,
+        )
+
+    # dpt_unproj 警告总展示（如果有超过限频部分的失败帧）
+    if _dpu_warn_count > _dpu_warn_max:
+        print(
+            f"[LiveInferenceRunner] dpt_unproj: 警告总计 {_dpu_warn_count} 帧失败，"
+            f"已抑制输出前 {_dpu_warn_max} 条。"
+            "请检查 rel_pose_enc/pose_enc 输出或 depth_conf 配置。",
+            flush=True,
+        )
 
     # 位姿文件
     if _extri_list:
@@ -1005,6 +1111,80 @@ def _assemble_depth_video(out_dir: str, fps: int = 24) -> None:
         print(f"[LiveInferenceRunner] 深度视频合成失败: {exc2}", flush=True)
 
 
+def _save_live_outputs(
+    outputs_cpu: dict,
+    out_cfg: dict,
+    out_dir: str,
+    frame_idx: int,
+    max_frame_pts: int = 8000,
+    max_global_pts: int = 2000,
+) -> None:
+    """将与 Rerun 同源的数据落盘到 live/ 子目录，方便后处理或对比。"""
+    import PIL.Image as _PILImage
+
+    # live/rgb/frame_N.png
+    rgb_np = outputs_cpu.get("rgb_np")
+    if rgb_np is not None and out_cfg.get("save_images", False):
+        _lrgb = _os.path.join(out_dir, "live", "rgb")
+        _os.makedirs(_lrgb, exist_ok=True)
+        _PILImage.fromarray(rgb_np).save(_os.path.join(_lrgb, f"frame_{frame_idx:06d}.png"))
+
+    # live/depth/frame_N.npy
+    depth_np = outputs_cpu.get("depth_np")
+    if depth_np is not None and out_cfg.get("save_depth", False):
+        _ldep = _os.path.join(out_dir, "live", "depth")
+        _os.makedirs(_ldep, exist_ok=True)
+        np.save(_os.path.join(_ldep, f"frame_{frame_idx:06d}.npy"), depth_np)
+
+    # live/current/points/frame_N.ply + live/global/points/frame_N.ply
+    pts = outputs_cpu.get("filtered_points_np")
+    cols = outputs_cpu.get("filtered_colors_np")
+    if pts is not None and len(pts) > 0 and cols is not None and out_cfg.get("save_points", False):
+        # current（最多 max_frame_pts）
+        cur_p, cur_c = pts, cols
+        if max_frame_pts > 0 and len(cur_p) > max_frame_pts:
+            rng_c = np.random.default_rng(seed=frame_idx)
+            ki_c = rng_c.choice(len(cur_p), max_frame_pts, replace=False)
+            cur_p, cur_c = cur_p[ki_c], cur_c[ki_c]
+        _lcur = _os.path.join(out_dir, "live", "current", "points")
+        _os.makedirs(_lcur, exist_ok=True)
+        _write_ply(cur_p, _os.path.join(_lcur, f"frame_{frame_idx:06d}.ply"), colors=cur_c)
+
+        # global（最多 max_global_pts，模拟 Rerun 下采样）
+        glb_p, glb_c = pts, cols
+        if max_global_pts > 0 and len(glb_p) > max_global_pts:
+            rng_g = np.random.default_rng(seed=frame_idx + 100000)
+            ki_g = rng_g.choice(len(glb_p), max_global_pts, replace=False)
+            glb_p, glb_c = glb_p[ki_g], glb_c[ki_g]
+        _lglb = _os.path.join(out_dir, "live", "global", "points")
+        _os.makedirs(_lglb, exist_ok=True)
+        _write_ply(glb_p, _os.path.join(_lglb, f"frame_{frame_idx:06d}.ply"), colors=glb_c)
+
+    # live/current/dpt_unproj/frame_N.ply + live/global/dpt_unproj/frame_N.ply
+    dpu_pts = outputs_cpu.get("filtered_dpu_pts_np")
+    dpu_cols = outputs_cpu.get("filtered_dpu_cols_np")
+    if dpu_pts is not None and len(dpu_pts) > 0 and dpu_cols is not None and out_cfg.get("save_points", False):
+        # current dpt_unproj
+        dpu_cur, dpu_cur_c = dpu_pts, dpu_cols
+        if max_frame_pts > 0 and len(dpu_cur) > max_frame_pts:
+            rng_dc = np.random.default_rng(seed=frame_idx + 200000)
+            ki_dc = rng_dc.choice(len(dpu_cur), max_frame_pts, replace=False)
+            dpu_cur, dpu_cur_c = dpu_cur[ki_dc], dpu_cur_c[ki_dc]
+        _ldpu_cur = _os.path.join(out_dir, "live", "current", "dpt_unproj")
+        _os.makedirs(_ldpu_cur, exist_ok=True)
+        _write_ply(dpu_cur, _os.path.join(_ldpu_cur, f"frame_{frame_idx:06d}.ply"), colors=dpu_cur_c)
+
+        # global dpt_unproj（最多 max_global_pts，与 Rerun 全局右上角对应）
+        dpu_glb, dpu_glb_c = dpu_pts, dpu_cols
+        if max_global_pts > 0 and len(dpu_glb) > max_global_pts:
+            rng_dg = np.random.default_rng(seed=frame_idx + 300000)
+            ki_dg = rng_dg.choice(len(dpu_glb), max_global_pts, replace=False)
+            dpu_glb, dpu_glb_c = dpu_glb[ki_dg], dpu_glb_c[ki_dg]
+        _ldpu_glb = _os.path.join(out_dir, "live", "global", "dpt_unproj")
+        _os.makedirs(_ldpu_glb, exist_ok=True)
+        _write_ply(dpu_glb, _os.path.join(_ldpu_glb, f"frame_{frame_idx:06d}.ply"), colors=dpu_glb_c)
+
+
 def _export_glb_from_plys(out_dir: str) -> None:
     """将已落盘的逐帧 PLY 合并导出为 GLB（使用 trimesh；不可用则跳过）。"""
     import glob
@@ -1107,38 +1287,116 @@ def _decode_outputs_to_cpu(
         result["t_abs_np"] = t_abs_dec
 
     # ── 世界点云（必须先将相机坐标系点转到世界坐标系）─────────────
-    # LongStream-kit infer.py L721 进行同样的转换:
-    #   pts_world = _camera_points_to_world(pts_cam, extri)
-    # 此处必须保留 .detach().cpu().numpy()，Rerun 侧绝对不能接 GPU Tensor
+    # 先提取 depth_t（后续 dpt_unproj 也需要，必须在 GPU 上完成反投影）
+    depth_t = outputs.get("depth")
+
     world_t = outputs.get("world_points")
     if isinstance(world_t, torch.Tensor):
         pts_cam = world_t[0, -1].detach().cpu().numpy()  # [H, W, 3] or [N, 3]
-        H_pts, W_pts = pts_cam.shape[:2] if pts_cam.ndim == 3 else (pts_cam.shape[0], 1)
         pts_cam_flat = pts_cam.reshape(-1, 3)
         if R_abs_dec is not None and t_abs_dec is not None:
             pts_world = _camera_points_to_world_np(pts_cam_flat, R_abs_dec, t_abs_dec)
         else:
-            # 位姿解码失败时直接使用相机坐标（降级处理）
             pts_world = pts_cam_flat
         result["world_points_np"] = pts_world
 
-        # ── 点云颜色（直接从 image_tensor 提取，与模型输入像素精确对应）──
-        # packet.image_tensor[0, 0]: [C, H, W] float [0,1]，与模型实际看到的帧一致
+        # ── 点云颜色：使用 packet.rgb_model（resize/crop 后、归一化前的真实 RGB）──
+        # rgb_model 与模型输出点云 H/W 精确对齐，不含 ImageNet 归一化偏差
         try:
-            img_t = packet.image_tensor[0, 0]  # [C, H, W]
-            rgb_model = img_t.permute(1, 2, 0).detach().cpu().numpy()  # [H, W, 3]
-            rgb_model = np.clip(rgb_model * 255.0, 0, 255).astype(np.uint8)
-            if pts_cam.ndim == 3:
-                h, w = pts_cam.shape[:2]
-                if rgb_model.shape[:2] != (h, w):
-                    from PIL import Image as _PILImage
-                    rgb_model = np.array(
-                        _PILImage.fromarray(rgb_model).resize((w, h), _PILImage.BILINEAR),
-                        dtype=np.uint8,
-                    )
-                result["point_colors_np"] = rgb_model.reshape(-1, 3)
+            if packet.rgb_model is not None:
+                rgb_model_np = packet.rgb_model.astype(np.uint8)  # [H', W', 3]
+                if pts_cam.ndim == 3:
+                    h_pts, w_pts = pts_cam.shape[:2]
+                    if rgb_model_np.shape[:2] != (h_pts, w_pts):
+                        from PIL import Image as _PILImage
+                        rgb_model_np = np.array(
+                            _PILImage.fromarray(rgb_model_np).resize((w_pts, h_pts), _PILImage.BILINEAR),
+                            dtype=np.uint8,
+                        )
+                result["point_colors_np"] = rgb_model_np.reshape(-1, 3)
+            else:
+                # 旧版兼容 fallback：从 image_tensor 反推（颜色不精确）
+                img_t = packet.image_tensor[0, 0]  # [C, H, W], [0,1]
+                rgb_fb = np.clip(
+                    img_t.permute(1, 2, 0).detach().cpu().numpy() * 255.0, 0, 255
+                ).astype(np.uint8)
+                if pts_cam.ndim == 3:
+                    h_pts, w_pts = pts_cam.shape[:2]
+                    if rgb_fb.shape[:2] != (h_pts, w_pts):
+                        from PIL import Image as _PILImage
+                        rgb_fb = np.array(
+                            _PILImage.fromarray(rgb_fb).resize((w_pts, h_pts), _PILImage.BILINEAR),
+                            dtype=np.uint8,
+                        )
+                result["point_colors_np"] = rgb_fb.reshape(-1, 3)
         except Exception:
             pass
+
+    # ── depth_conf（供 dpt_unproj 过滤使用，与 core/infer.py 对齐）────────
+    depth_conf_t = outputs.get("depth_conf")
+    if isinstance(depth_conf_t, torch.Tensor):
+        _dc = depth_conf_t[0, -1].detach().cpu().numpy()
+        if _dc.ndim == 3:
+            _dc = _dc[..., 0]
+        result["depth_conf_np"] = _dc.reshape(-1)
+
+    # ── dpt_unproj：深度反投影点云（与 core/infer.py dpt_unproj 分支对齐）──
+    # 在 GPU 上完成反投影后立即转 CPU numpy，保证不把 GPU tensor 放入 result
+    if isinstance(depth_t, torch.Tensor) and R_abs_dec is not None and t_abs_dec is not None:
+        try:
+            from longstream.utils.vendor.models.components.utils.pose_enc import (
+                pose_encoding_to_extri_intri as _peti,
+            )
+            from longstream.utils.camera import compose_abs_from_rel as _cafr
+
+            # 显式 isinstance 检查，避免多元素 Tensor 触发 bool() 歧义异常
+            _rel_pe = outputs.get("rel_pose_enc")
+            _abs_pe = outputs.get("pose_enc")
+
+            intri_t = None
+            H_d = int(depth_t.shape[2])
+            W_d = int(depth_t.shape[3])
+
+            if isinstance(_rel_pe, torch.Tensor):
+                # compose_abs_from_rel 将 rel 转 abs。
+                # 对于 dpt_unproj 只需要 intri（focal length），而 focal 在
+                # compose_abs_from_rel 里是直接保留 rel_f，不依赖参考帧位姿。
+                # keyframe_indices 全用 0：避免 S_win==1 时 kf_idx_local>0 越界。
+                S_win = _rel_pe.shape[1]
+                _kf_idx_arr = torch.zeros(S_win, dtype=torch.long, device=_rel_pe.device)
+                _abs_pe_composed = _cafr(_rel_pe[0], _kf_idx_arr)  # [S, 9]
+                _, intri_t = _peti(_abs_pe_composed[None], image_size_hw=(H_d, W_d))  # [1,S,3,3]
+            elif isinstance(_abs_pe, torch.Tensor):
+                _, intri_t = _peti(_abs_pe, image_size_hw=(H_d, W_d))
+
+            if intri_t is not None:
+                intri_np_frame = intri_t[0, -1].detach().cpu().numpy()  # [3, 3]
+                result["intri_np"] = intri_np_frame
+                # 反投影：depth [H, W] → 相机空间点 [H, W, 3]
+                from longstream.utils.depth import unproject_depth_to_points as _udtp
+                d_last = depth_t[0, -1, :, :, 0]  # [H, W]
+                intri_gpu = torch.from_numpy(intri_np_frame).unsqueeze(0).to(d_last.device)
+                pts_cam_dpu = _udtp(d_last.unsqueeze(0), intri_gpu)[0]  # [H, W, 3]
+                pts_cam_dpu_np = pts_cam_dpu.detach().cpu().numpy().reshape(-1, 3)
+                # cam → world（同 world_points 的变换公式）
+                result["dpt_unproj_points_np"] = _camera_points_to_world_np(
+                    pts_cam_dpu_np, R_abs_dec, t_abs_dec
+                )
+            else:
+                _dpu_warn_count += 1
+                if _dpu_warn_count <= _dpu_warn_max:
+                    print(
+                        f"[LiveInferenceRunner/_decode] 警告 ({_dpu_warn_count})：dpt_unproj 跳过——"
+                        "pose_enc/rel_pose_enc 均不可用，无法提取 intri。",
+                        flush=True,
+                    )
+        except Exception as _dpu_err:
+            _dpu_warn_count += 1
+            if _dpu_warn_count <= _dpu_warn_max:
+                print(
+                    f"[LiveInferenceRunner/_decode] 警告 ({_dpu_warn_count})：dpt_unproj 计算异常: {_dpu_err}",
+                    flush=True,
+                )
 
     # ── 置信度 ───────────────────────────────────────────────────────────
     conf_t = outputs.get("world_points_conf")

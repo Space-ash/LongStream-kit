@@ -422,7 +422,7 @@ def _start_runner(
                 viewer = RerunViewer(
                     confidence_threshold=float(confidence_threshold),
                     max_frame_points=int(max_frame_points),
-                    max_global_frame_points=min(10000, int(max_frame_points)),
+                    max_global_frame_points=2000,
                     spawn=True,
                 )
                 viewer.init()

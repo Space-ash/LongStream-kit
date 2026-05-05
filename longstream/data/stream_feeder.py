@@ -33,11 +33,12 @@ class FramePacket:
     """单帧数据包：携带 CPU 数组和 CPU 张量，禁止含 GPU Tensor。"""
 
     frame_index: int
-    rgb: np.ndarray               # uint8, HWC, CPU
-    image_tensor: torch.Tensor    # [1, 1, C, H, W], CPU float（归一化）
+    rgb: np.ndarray               # uint8, HWC, CPU（原始分辨率）
+    image_tensor: torch.Tensor    # [1, 1, C, H, W], CPU float（归一化，值域 [0,1]）
     image_path: Optional[str]     # 原始文件路径，视频/npz 时可为 None
     gps_xyz: Optional[np.ndarray] # [3,] float32，GPS 位置（世界坐标或 ECEF），无则 None
     gt_pose: Optional[np.ndarray] # [4, 4] float32 w2c，无则 None
+    rgb_model: Optional[np.ndarray] = None  # uint8, HWC, 与模型输出点云 H/W 对齐（resize+crop 后，归一化前）
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -64,16 +65,20 @@ def _preprocess_single_image(
     size: int = 518,
     patch_size: int = 14,
     crop: bool = False,
-) -> torch.Tensor:
+):
     """
     与 LongStreamDataLoader._load_images + load_images_for_eval 完全一致的预处理。
-    返回 [1, 1, C, H, W] CPU float Tensor，值域 [0, 1]。
+    返回 (tensor, rgb_model_np)：
+      tensor       : [1, 1, C, H, W] CPU float Tensor，值域 [0, 1]
+      rgb_model_np : [H, W, 3] uint8 numpy，resize+crop 后、归一化前的真实 RGB，
+                     与模型输出点云 H/W 精确对齐，可直接用作点云颜色
 
     流程：
       1. 长边缩放到 size
       2. 中心 crop/resize 对齐 patch_size 倍数
-      3. ImgNorm → [-1, 1]
-      4. (x+1)/2 → [0, 1]  （与 _load_images 中的 (images+1)/2 一致）
+      3. 保存 rgb_model_np（步骤 2 结束后，归一化前）
+      4. ImgNorm → [-1, 1]
+      5. (x+1)/2 → [0, 1]  （与 _load_images 中的 (images+1)/2 一致）
     """
     img = pil_img.convert("RGB")
     # Step 1: resize long edge to size
@@ -96,10 +101,12 @@ def _preprocess_single_image(
         img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
     else:
         img = img.resize((2 * halfw, 2 * halfh), PIL.Image.LANCZOS)
-    # Step 3+4: ImgNorm then rescale to [0,1]
+    # Step 3: save pre-normalization RGB（与模型输出点云 H/W 对齐）
+    rgb_model_np = np.array(img, dtype=np.uint8)  # [H, W, 3] uint8
+    # Step 4+5: ImgNorm then rescale to [0,1]
     tensor = _ImgNorm(img)          # [C, H, W], [-1, 1]
     tensor = (tensor + 1.0) / 2.0  # [C, H, W], [0, 1]
-    return tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, C, H, W]
+    return tensor.unsqueeze(0).unsqueeze(0), rgb_model_np  # [1,1,C,H,W], [H,W,3]
 
 
 def _read_npz_compatible(path: str) -> Tuple[
@@ -270,7 +277,7 @@ class StreamFeeder:
         for idx, path in enumerate(paths):
             pil_img = exif_transpose(PIL.Image.open(path)).convert("RGB")
             rgb = np.array(pil_img, dtype=np.uint8)  # HWC uint8
-            tensor = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
+            tensor, rgb_model = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
             yield FramePacket(
                 frame_index=idx,
                 rgb=rgb,
@@ -278,6 +285,7 @@ class StreamFeeder:
                 image_path=path,
                 gps_xyz=None,
                 gt_pose=None,
+                rgb_model=rgb_model,
             )
 
     def _iter_video(self) -> Generator[FramePacket, None, None]:
@@ -293,7 +301,7 @@ class StreamFeeder:
                     break
                 rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 pil_img = PIL.Image.fromarray(rgb)
-                tensor = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
+                tensor, rgb_model = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
                 yield FramePacket(
                     frame_index=idx,
                     rgb=rgb,
@@ -301,6 +309,7 @@ class StreamFeeder:
                     image_path=None,
                     gps_xyz=None,
                     gt_pose=None,
+                    rgb_model=rgb_model,
                 )
                 idx += 1
         finally:
@@ -318,7 +327,7 @@ class StreamFeeder:
         for idx in range(N):
             rgb = images_np[idx]  # [H, W, 3] uint8
             pil_img = PIL.Image.fromarray(rgb)
-            tensor = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
+            tensor, rgb_model = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
             gps = gps_np[idx] if (gps_np is not None and idx < len(gps_np)) else None
             pose = poses_np[idx] if (poses_np is not None and idx < len(poses_np)) else None
             # TTO 需要 gps_xyz；若 NPZ 无 GPS 但有 GT 位姿，就从位姿提取相机中心作为虚拟 GPS
@@ -331,6 +340,7 @@ class StreamFeeder:
                 image_path=None,
                 gps_xyz=gps,
                 gt_pose=pose,
+                rgb_model=rgb_model,
             )
 
     def _iter_generalizable(self) -> Generator[FramePacket, None, None]:
@@ -398,7 +408,7 @@ class StreamFeeder:
         for idx, path in enumerate(paths):
             pil_img = exif_transpose(PIL.Image.open(path)).convert("RGB")
             rgb = np.array(pil_img, dtype=np.uint8)
-            tensor = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
+            tensor, rgb_model = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
             gps = gps_all[idx] if (gps_all is not None and idx < len(gps_all)) else None
             pose = poses_all[idx] if (poses_all is not None and idx < len(poses_all)) else None
             # TTO 需要 gps_xyz；若目录无 GPS 但有 GT 位姿，就从位姿提取相机中心作为虚拟 GPS
@@ -411,6 +421,7 @@ class StreamFeeder:
                 image_path=path,
                 gps_xyz=gps,
                 gt_pose=pose,
+                rgb_model=rgb_model,
             )
 
     def _iter_generalizable_via_loader(self) -> Generator[FramePacket, None, None]:
@@ -449,7 +460,7 @@ class StreamFeeder:
             for path in seq_info.image_paths:
                 pil_img = exif_transpose(PIL.Image.open(path)).convert("RGB")
                 rgb = np.array(pil_img, dtype=np.uint8)
-                tensor = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
+                tensor, rgb_model = _preprocess_single_image(pil_img, self.size, self.patch_size, self.crop)
                 gps = gps_all[local_idx] if (gps_all is not None and local_idx < len(gps_all)) else None
                 pose = poses_all[local_idx] if (poses_all is not None and local_idx < len(poses_all)) else None
                 # TTO 需要 gps_xyz；若无 GPS 但有 GT 位姿，就从位姿提取相机中心作为虚拟 GPS
@@ -462,6 +473,7 @@ class StreamFeeder:
                     image_path=path,
                     gps_xyz=gps,
                     gt_pose=pose,
+                    rgb_model=rgb_model,
                 )
                 local_idx += 1
                 global_idx += 1
