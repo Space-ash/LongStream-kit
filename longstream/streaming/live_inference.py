@@ -135,26 +135,65 @@ def _worker_inference_loop(
         **cfg.get("output", {}),
         **cfg.get("optimizations", {}).get("filter", {}),
     }
-    _out_dir = cfg.get("output", {}).get(
-        "root", os.path.join("output", "live_inference")
-    )
-    # 如果启用 GLB 导出但未启用逐帧点云，自动临时开启逐帧点云（GLB 依赖它）
+    _out_root: str = cfg.get("output", {}).get("root", os.path.join("output", "live_inference"))
+    _seq_name: str = _get_stream_seq_name(cfg)
+    _out_dir: str = os.path.join(_out_root, _seq_name)
+    print(f"[LiveInferenceRunner/worker] 输出目录: {_out_dir}", flush=True)
+
+    # 如果启用 GLB 导出，自动启用逐帧点云
     if _out_cfg_merged.get("export_glb", False) and not _out_cfg_merged.get("save_frame_points", False):
         _out_cfg_merged = dict(_out_cfg_merged)
         _out_cfg_merged["save_frame_points"] = True
-        print("[LiveInferenceRunner/worker] 已自动启用 save_frame_points（GLB 导出需要）", flush=True)
-    # mask_sky 在 streaming 模式下暂不支持，检测到后警告一次
-    if _out_cfg_merged.get("mask_sky", False):
-        print("[LiveInferenceRunner/worker] 警告：mask_sky 在流式推理模式下暂未集成，跳过。", flush=True)
+        print("[LiveInferenceRunner/worker] 已自动启用 save_frame_points（GLB 需要）", flush=True)
 
-    # save_points: 使用有界 Reservoir 采样累计全局点云，防止 CPU RAM 无限增长
-    # 策略：将每帧点加入 reservoir；当 reservoir 超过 2×max_full_pts 时随机下采样至 max_full_pts
-    _reservoir_pts:    Optional[np.ndarray] = None   # [R, 3] float32
-    _reservoir_colors: Optional[np.ndarray] = None   # [R, 3] uint8 或 None
-    _reservoir_has_colors: bool = False
-    _reservoir_rng = np.random.default_rng(seed=0)
-    _max_full_pts: int = int(_out_cfg_merged.get("max_full_pointcloud_points",
-                              _out_cfg_merged.get("max_frame_pointcloud_points", 8000) * 100))
+    # ── 位姿累积 ─────────────────────────────────────────────────────────
+    _extri_list: list = []
+    _pose_frame_ids: list = []
+
+    # ── 全局点云参数 + in-memory reservoir ───────────────────────────────
+    _max_frame_pts: int = int(_out_cfg_merged.get("max_frame_pointcloud_points", 8000))
+    _max_full_pts: int = int(_out_cfg_merged.get("max_full_pointcloud_points", _max_frame_pts * 100))
+    # reservoir：累积完整过滤后的点（从 filtered_points_np 注入，纯 CPU numpy）
+    # 策略：超过 2× 上限时随机下采样至 _max_full_pts，保持 RAM 有界
+    _res_pts: Optional[np.ndarray] = None   # [R, 3] float32
+    _res_cols: Optional[np.ndarray] = None  # [R, 3] uint8 or None
+    _res_rng = np.random.default_rng(seed=0)
+
+    # ── sky segmentation session（真实初始化）────────────────────────────
+    _sky_session = None
+    _sky_mask_dir: Optional[str] = None
+    _mask_sky = bool(_out_cfg_merged.get("mask_sky", False))
+    if _mask_sky:
+        try:
+            import onnxruntime as _ort
+            # 优先读取 cfg["output"]["skyseg_path"]，再回退到项目根默认路径
+            # 不自动联网下载：离线/服务器环境下自动下载会卡住
+            _sky_cfg_path = _out_cfg_merged.get("skyseg_path") or ""
+            if _sky_cfg_path:
+                _sky_model_path = os.path.abspath(_sky_cfg_path)
+            else:
+                _sky_model_path = os.path.abspath(
+                    os.path.join(os.path.dirname(__file__), "..", "..", "skyseg.onnx")
+                )
+            if not os.path.exists(_sky_model_path):
+                print(
+                    f"[LiveInferenceRunner/worker] 警告：skyseg 模型文件不存在: {_sky_model_path}，"
+                    "跳过天空过滤。请在 YAML output.skyseg_path 指定正确路径，"
+                    "或将 skyseg.onnx 放到项目根目录。",
+                    flush=True,
+                )
+                raise FileNotFoundError(_sky_model_path)
+            _sky_session = _ort.InferenceSession(_sky_model_path)
+            _sky_mask_dir = os.path.join(_out_dir, "sky_masks")
+            print("[LiveInferenceRunner/worker] sky segmentation session 初始化成功", flush=True)
+        except Exception as _sky_init_err:
+            print(
+                f"[LiveInferenceRunner/worker] 警告：sky segmentation 初始化失败，本次跳过天空过滤。"
+                f"原因: {_sky_init_err}",
+                flush=True,
+            )
+            _sky_session = None
+            _sky_mask_dir = None
 
     print("[LiveInferenceRunner/worker] 开始逐帧推理", flush=True)
 
@@ -216,6 +255,16 @@ def _worker_inference_loop(
                 seg_R_abs, seg_t_abs,
             )
 
+            # ── sky mask（decode 完成后、filter 之前追加）────────────────
+            if _sky_session is not None and packet.image_path:
+                outputs_cpu["sky_valid_mask_np"] = _compute_sky_valid_mask(
+                    packet.image_path, _sky_session, _sky_mask_dir,
+                    int(data_cfg.get("size", 518)),
+                    bool(data_cfg.get("crop", False)),
+                    int(data_cfg.get("patch_size", 14)),
+                    outputs_cpu,
+                )
+
             # ── refresh 逻辑 ──────────────────────────────────────────────
             if is_kf and g > 0:
                 keyframe_count += 1
@@ -247,59 +296,143 @@ def _worker_inference_loop(
             del outputs
             del frame_tensor
 
+            # ── 统一过滤（一次计算，供磁盘保存 + Rerun 共用）────────────────
+            # 结果存入 outputs_cpu，避免下游多次重复过滤导致不一致
+            _fpts, _fcols = _filter_points_colors(outputs_cpu, _out_cfg_merged)
+            if _fpts is not None and len(_fpts) > 0:
+                outputs_cpu["filtered_points_np"] = _fpts.astype(np.float32)
+                outputs_cpu["filtered_colors_np"] = (
+                    _fcols.astype(np.uint8) if _fcols is not None else None
+                )
+            else:
+                outputs_cpu["filtered_points_np"] = None
+                outputs_cpu["filtered_colors_np"] = None
+
+            # ── 累积位姿（用于结束后写 abs_pose.txt）────────────────────────
+            R_abs_np = outputs_cpu.get("R_abs_np")
+            t_abs_np = outputs_cpu.get("t_abs_np")
+            if R_abs_np is not None and t_abs_np is not None:
+                extri = np.eye(4, dtype=np.float32)
+                extri[:3, :3] = R_abs_np
+                extri[:3, 3] = t_abs_np
+                _extri_list.append(extri)
+                _pose_frame_ids.append(g)
+
             # ── 发送结果到主进程（队列满则丢弃，保证推理不被可视化阻塞）──
             try:
                 result_queue.put_nowait((g, outputs_cpu))
             except Exception:
                 pass
 
-            # ── 增量保存到磁盘（仅使用 outputs_cpu，严禁 GPU Tensor）──────
-            _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g)
+            # ── 增量保存到磁盘（使用预计算的 filtered_points_np，严禁 GPU Tensor）──
+            _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g,
+                                max_frame_pts=_max_frame_pts)
 
-            # ── save_points：Reservoir 采样累积（先过滤再累计，与非流式保存一致）──
+            # ── 全局 reservoir 更新（不受逐帧下采样预算限制，直接用完整过滤结果）──
             if _out_cfg_merged.get("save_points", False):
-                new_pts, new_colors = _filter_points_colors(outputs_cpu, _out_cfg_merged)
-                if new_pts is not None and len(new_pts) > 0:
-                    if new_colors is not None:
-                        _reservoir_has_colors = True
-                    # 并入 reservoir
-                    if _reservoir_pts is None:
-                        _reservoir_pts = new_pts
-                        _reservoir_colors = new_colors
+                _new_pts = outputs_cpu.get("filtered_points_np")
+                _new_cols = outputs_cpu.get("filtered_colors_np")
+                if _new_pts is not None and len(_new_pts) > 0:
+                    _new_pts = _new_pts.astype(np.float32)
+
+                    # 若颜色缺失，尝试从 point_colors_np 用同一 sky+conf mask 恢复
+                    if _new_cols is None:
+                        _raw_colors = outputs_cpu.get("point_colors_np")
+                        if _raw_colors is not None:
+                            _rcols_flat = _raw_colors.reshape(-1, 3).astype(np.uint8)
+                            _rmask = np.ones(len(_rcols_flat), dtype=bool)
+                            _r_conf = outputs_cpu.get("conf_np")
+                            if _r_conf is not None and _out_cfg_merged.get(
+                                "confidence_filter_enabled", True
+                            ):
+                                _r_thr = float(_out_cfg_merged.get("confidence_threshold", 0.5))
+                                _rcf = _r_conf.reshape(-1)
+                                if len(_rcf) == len(_rcols_flat):
+                                    _rmask &= _rcf >= _r_thr
+                            _r_sky = outputs_cpu.get("sky_valid_mask_np")
+                            if _r_sky is not None:
+                                _rsv = _r_sky.reshape(-1) > 0
+                                if len(_rsv) == len(_rcols_flat):
+                                    _rmask &= _rsv
+                            _rcols_filtered = _rcols_flat[_rmask]
+                            if len(_rcols_filtered) == len(_new_pts):
+                                _new_cols = _rcols_filtered
+
+                    # 颜色仍不可用则跳过该帧，避免污染全局点云 RGB
+                    if _new_cols is None:
+                        print(
+                            f"[LiveInferenceRunner/worker] 警告：帧 {g} 颜色不可用，"
+                            "跳过该帧点云以保持全局点云 RGB 一致性。",
+                            flush=True,
+                        )
                     else:
-                        _reservoir_pts = np.concatenate([_reservoir_pts, new_pts], axis=0)
-                        if _reservoir_has_colors:
-                            _c_prev = _reservoir_colors if _reservoir_colors is not None else np.zeros((len(_reservoir_pts) - len(new_pts), 3), dtype=np.uint8)
-                            _c_new  = new_colors if new_colors is not None else np.zeros((len(new_pts), 3), dtype=np.uint8)
-                            _reservoir_colors = np.concatenate([_c_prev, _c_new], axis=0)
-                    # 超过 2x 上限时随机下采样，保持内存有界
-                    if len(_reservoir_pts) > 2 * _max_full_pts:
-                        idx = _reservoir_rng.choice(len(_reservoir_pts), _max_full_pts, replace=False)
-                        _reservoir_pts = _reservoir_pts[idx]
-                        if _reservoir_colors is not None:
-                            _reservoir_colors = _reservoir_colors[idx]
+                        _new_cols = _new_cols.astype(np.uint8)
+                        if _res_pts is None:
+                            _res_pts = _new_pts
+                            _res_cols = _new_cols
+                        else:
+                            _res_pts = np.concatenate([_res_pts, _new_pts], axis=0)
+                            if _res_cols is not None:
+                                _res_cols = np.concatenate([_res_cols, _new_cols], axis=0)
+                            # 注意：不因新帧颜色缺失而将已有 _res_cols 置为 None
+                        # 超过 2× 上限时随机下采样，防止 RAM 无限增长
+                        if len(_res_pts) > _max_full_pts * 2:
+                            _keep_r = _res_rng.choice(len(_res_pts), _max_full_pts, replace=False)
+                            _res_pts = _res_pts[_keep_r]
+                            if _res_cols is not None:
+                                _res_cols = _res_cols[_keep_r]
 
-    # ── 循环结束后处理（纯 CPU / 磁盘，不持有 GPU 引用）─────────────────
-    # 全局点云 PLY
-    if _out_cfg_merged.get("save_points", False) and _reservoir_pts is not None and len(_reservoir_pts) > 0:
-        # 最终下采样（如果还超过上限）
-        _final_pts = _reservoir_pts
-        _final_colors = _reservoir_colors if _reservoir_has_colors else None
-        if len(_final_pts) > _max_full_pts:
-            idx = _reservoir_rng.choice(len(_final_pts), _max_full_pts, replace=False)
-            _final_pts = _final_pts[idx]
-            if _final_colors is not None:
-                _final_colors = _final_colors[idx]
-        pts_dir = _os.path.join(_out_dir, "global_points")
-        _os.makedirs(pts_dir, exist_ok=True)
-        ply_path = _os.path.join(pts_dir, "global_pointcloud.ply")
-        _write_ply(_final_pts, ply_path, colors=_final_colors)
-        print(f"[LiveInferenceRunner] 全局点云已保存: {ply_path}  ({len(_final_pts)} 点)", flush=True)
+    # 全局点云 PLY：从 in-memory reservoir 保存（完整过滤质量，不受逐帧预算影响）
+    if _out_cfg_merged.get("save_points", False) and _res_pts is not None and len(_res_pts) > 0:
+        try:
+            _final_pts = _res_pts.astype(np.float32)
+            _final_cols: Optional[np.ndarray] = (
+                _res_cols.astype(np.uint8) if _res_cols is not None else None
+            )
+            if len(_final_pts) > _max_full_pts:
+                _rng_final = np.random.default_rng(seed=0)
+                _keep_idx = _rng_final.choice(len(_final_pts), _max_full_pts, replace=False)
+                _final_pts = _final_pts[_keep_idx]
+                if _final_cols is not None:
+                    _final_cols = _final_cols[_keep_idx]
+            _pts_dir_g = _os.path.join(_out_dir, "points", "point_head")
+            _os.makedirs(_pts_dir_g, exist_ok=True)
+            full_ply = _os.path.join(_out_dir, "points", "point_head_full.ply")
+            _write_ply(_final_pts, full_ply, colors=_final_cols)
+            np.save(_os.path.join(_out_dir, "points", "point_head_full.npy"), _final_pts)
+            print(f"[LiveInferenceRunner] 全局点云已保存: {full_ply}  ({len(_final_pts)} 点)", flush=True)
+        except Exception as _ply_exc:
+            print(f"[LiveInferenceRunner] 全局点云保存失败: {_ply_exc}", flush=True)
+    elif _out_cfg_merged.get("save_points", False):
+        print("[LiveInferenceRunner] 全局点云：无有效过滤点，跳过。", flush=True)
 
-    # 视频合成（从已落盘 RGB 序列）
+    # 位姿文件
+    if _extri_list:
+        try:
+            from longstream.io.save_poses_txt import save_w2c_txt as _save_w2c_txt
+            _poses_dir = _os.path.join(_out_dir, "poses")
+            _os.makedirs(_poses_dir, exist_ok=True)
+            _save_w2c_txt(
+                _os.path.join(_poses_dir, "abs_pose.txt"),
+                np.stack(_extri_list, axis=0),
+                _pose_frame_ids,
+            )
+            print(f"[LiveInferenceRunner] 位姿已保存: {_os.path.join(_poses_dir, 'abs_pose.txt')}  ({len(_extri_list)} 帧)", flush=True)
+        except Exception as _pose_exc:
+            print(f"[LiveInferenceRunner] abs_pose.txt 保存失败: {_pose_exc}", flush=True)
+
+    # 视频合成（从已落盘 RGB / dpt_plasma 序列）
     if _out_cfg_merged.get("save_videos", False):
         _fps_out = int(cfg.get("data", {}).get("fps", 0) or 24)
         _assemble_video(_out_dir, fps=_fps_out)
+        _assemble_depth_video(_out_dir, fps=_fps_out)
+
+    # 说明暂不导出的非流式对齐项
+    print(
+        "[LiveInferenceRunner] 注意: 流式模式暂不导出 poses/intri.txt、poses/rel_pose.txt。"
+        "内镜标定/相对位姿需要非流式推理链路（BatchInferenceRunner）才可靠。",
+        flush=True,
+    )
 
     # GLB 导出（基于已落盘逐帧 PLY）
     if _out_cfg_merged.get("export_glb", False):
@@ -460,14 +593,135 @@ def _write_ply(pts: np.ndarray, path: str, colors: np.ndarray = None) -> None:
     save_pointcloud(path, pts, colors=colors)
 
 
+def _get_stream_seq_name(cfg: dict) -> str:
+    """
+    从 cfg 中解析序列名称（与 LongStreamDataLoader 命名规则一致）。
+    generalizable 格式取 seq_list[0]，其他格式返回 'live_stream'。
+    """
+    data = cfg.get("data", {})
+    seq_list = data.get("seq_list")
+    if data.get("format") == "generalizable" and seq_list:
+        seq = str(seq_list[0])
+        return seq.replace(_os.path.sep, "_").replace("/", "_")
+    # 视频 / image_dir：取文件/目录名
+    src = data.get("img_path", data.get("video_path", ""))
+    if src:
+        base = _os.path.splitext(_os.path.basename(src.rstrip("/\\")))[0]
+        if base:
+            return base
+    return "live_stream"
+
+
+def _compute_sky_valid_mask(
+    image_path: str,
+    sky_session,
+    mask_dir: Optional[str],
+    size: int,
+    crop: bool,
+    patch_size: int,
+    outputs_cpu: dict,
+) -> Optional[np.ndarray]:
+    """
+    对单帧图像计算 sky valid mask（True = 非天空 = 保留），
+    并调整到与 world_points 相同的分辨率。
+
+    返回 [H_pts * W_pts] bool ndarray 或 None（失败时降级）。
+    所有操作均为纯 CPU，无 GPU 张量。
+    """
+    try:
+        import cv2 as _cv2
+        import copy as _copy
+        from longstream.utils.sky_mask import (
+            run_skyseg, _normalize_skyseg_output, sky_mask_filename, SKYSEG_THRESHOLD
+        )
+
+        # ── 运行 skyseg ────────────────────────────────────────────────
+        img_bgr = _cv2.imread(image_path)
+        if img_bgr is None:
+            return None
+        result_map = run_skyseg(sky_session, [320, 320], img_bgr)
+        result_map_full = _cv2.resize(
+            result_map, (img_bgr.shape[1], img_bgr.shape[0])
+        )
+        result_map_full = _normalize_skyseg_output(result_map_full)
+        # 0=天空（遮挡），255=保留；valid = 非天空
+        sky_raw = np.zeros(result_map_full.shape, dtype=np.uint8)
+        sky_raw[result_map_full < SKYSEG_THRESHOLD] = 255  # 非天空像素=255
+
+        # 保存 sky mask 到磁盘（可选）
+        if mask_dir is not None:
+            _os.makedirs(mask_dir, exist_ok=True)
+            fname = sky_mask_filename(image_path)
+            _cv2.imwrite(_os.path.join(mask_dir, fname), sky_raw)
+
+        # ── 调整到 world_points 分辨率（复用与非流式 core/infer.py 相同的处理逻辑）──
+        pts = outputs_cpu.get("world_points_np")
+        if pts is None:
+            return None
+        # 从 depth_np 的 shape 推断点云分辨率
+        depth = outputs_cpu.get("depth_np")
+        if depth is not None:
+            H_pts, W_pts = depth.shape[:2]
+        else:
+            n = len(pts)
+            side = int(n ** 0.5)
+            H_pts, W_pts = side, side
+
+        # _prepare_mask_for_model 处理 long-edge resize + crop/resize + 最终 resize 到 target_shape
+        # 与非流式 infer.py L642-L648 使用相同参数，避免 crop=True 时 sky mask 错位
+        try:
+            from longstream.core.infer import _prepare_mask_for_model as _pmfm
+            sky_resized = _pmfm(
+                sky_raw,
+                size=size,
+                crop=crop,
+                patch_size=patch_size,
+                target_shape=(H_pts, W_pts),
+            )
+        except Exception:
+            # 降级：简单 resize
+            sky_resized = _cv2.resize(sky_raw, (W_pts, H_pts), interpolation=_cv2.INTER_NEAREST)
+
+        if sky_resized is None:
+            return None
+        valid_mask = sky_resized.reshape(-1) > 0  # True = 保留（非天空）
+        return valid_mask
+    except Exception as _sky_err:
+        return None
+
+
+def _downsample_points(
+    pts: np.ndarray,
+    colors: Optional[np.ndarray],
+    max_pts: int,
+    rng_seed: int = 0,
+) -> tuple:
+    """
+    随机下采样点云到 max_pts 个点（用于每帧全局 preview chunk）。
+    返回 (pts_down, colors_down)，均为 numpy，不持有 GPU 引用。
+    """
+    n = len(pts)
+    if n <= max_pts:
+        return pts, colors
+    rng = np.random.default_rng(seed=rng_seed)
+    keep = rng.choice(n, max_pts, replace=False)
+    pts_d = pts[keep]
+    cols_d = colors[keep] if colors is not None else None
+    return pts_d, cols_d
+
+
 def _filter_points_colors(
     outputs_cpu: dict,
     out_cfg: dict,
 ) -> tuple:
     """
-    从 outputs_cpu 提取世界点云和颜色，按置信度阈值过滤后返回。
+    从 outputs_cpu 提取世界点云和颜色，按置信度 + sky mask 过滤后返回。
 
-    所有路径（逐帧 PLY、全局 reservoir、Rerun 当前帧/全局帧）统一调用此函数，
+    支持的过滤：
+      1. 置信度（out_cfg["confidence_filter_enabled"] != False 时启用）
+      2. sky valid mask（outputs_cpu["sky_valid_mask_np"] 存在时合并）
+
+    所有路径（逐帧 PLY、全局 chunk、Rerun 当前帧/全局帧）统一调用此函数，
     确保过滤逻辑与非流式推理（infer.py）保持一致。
 
     Returns
@@ -490,13 +744,34 @@ def _filter_points_colors(
     pts_flat = pts.reshape(-1, 3).astype(np.float32)
     colors_flat = colors.reshape(-1, 3).astype(np.uint8) if colors is not None else None
 
-    if conf is not None:
+    # 置信度过滤（默认启用；显式 False 时跳过）
+    conf_mask: Optional[np.ndarray] = None
+    if out_cfg.get("confidence_filter_enabled", True) and conf is not None:
         conf_flat = conf.reshape(-1)
         if len(conf_flat) == len(pts_flat):
-            mask = conf_flat >= thr
-            pts_flat = pts_flat[mask]
-            if colors_flat is not None:
-                colors_flat = colors_flat[mask]
+            conf_mask = conf_flat >= thr
+
+    # sky mask 过滤
+    sky_mask: Optional[np.ndarray] = None
+    sky_raw = outputs_cpu.get("sky_valid_mask_np")
+    if sky_raw is not None:
+        sky_mask_flat = sky_raw.reshape(-1) > 0
+        if len(sky_mask_flat) == len(pts_flat):
+            sky_mask = sky_mask_flat
+
+    # 合并两个 mask（AND）
+    valid: Optional[np.ndarray] = None
+    if conf_mask is not None and sky_mask is not None:
+        valid = conf_mask & sky_mask
+    elif conf_mask is not None:
+        valid = conf_mask
+    elif sky_mask is not None:
+        valid = sky_mask
+
+    if valid is not None:
+        pts_flat = pts_flat[valid]
+        if colors_flat is not None:
+            colors_flat = colors_flat[valid]
 
     return pts_flat, colors_flat
 
@@ -506,9 +781,16 @@ def _save_frame_outputs(
     out_cfg: dict,
     out_dir: str,
     frame_idx: int,
+    max_frame_pts: int = 8000,
 ) -> None:
     """
     增量保存单帧输出到磁盘。
+
+    目录结构与非流式输出对齐：
+      out_dir/images/rgb/frame_XXXXXX.png
+      out_dir/depth/dpt/frame_XXXXXX.npy
+      out_dir/depth/dpt_plasma/frame_XXXXXX.png
+      out_dir/points/point_head/frame_XXXXXX.ply（按 max_frame_pts 下采样）
 
     所有输入均为纯 numpy（已完成 .detach().cpu().numpy()）。
     本函数绝对不导入 torch，也不持有任何 GPU 对象引用。
@@ -517,46 +799,67 @@ def _save_frame_outputs(
 
     _os.makedirs(out_dir, exist_ok=True)
 
-    # ── RGB PNG ──────────────────────────────────────────────────────────
+    # ── RGB PNG ───────────────────────────────────────────────────────────
+    # 目录：images/rgb/  文件：frame_XXXXXX.png
     if out_cfg.get("save_images", False):
         rgb_np = outputs_cpu.get("rgb_np")
         if rgb_np is not None:
-            rgb_dir = _os.path.join(out_dir, "images")
+            rgb_dir = _os.path.join(out_dir, "images", "rgb")
             _os.makedirs(rgb_dir, exist_ok=True)
             PIL.Image.fromarray(rgb_np).save(
-                _os.path.join(rgb_dir, f"{frame_idx:06d}.png")
+                _os.path.join(rgb_dir, f"frame_{frame_idx:06d}.png")
             )
 
-    # ── 深度图 .npy + 可视化 PNG ─────────────────────────────────────────
+    # ── 深度图：dpt (.npy) + dpt_plasma (可视化 PNG) ─────────────────────
     if out_cfg.get("save_depth", False):
         depth_np = outputs_cpu.get("depth_np")
         if depth_np is not None:
-            depth_dir = _os.path.join(out_dir, "depth")
-            _os.makedirs(depth_dir, exist_ok=True)
-            np.save(_os.path.join(depth_dir, f"{frame_idx:06d}.npy"), depth_np)
-            # 归一化可视化
-            d_min, d_max = depth_np.min(), depth_np.max()
-            if d_max > d_min:
-                d_vis = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-            else:
-                d_vis = np.zeros_like(depth_np, dtype=np.uint8)
+            dpt_dir = _os.path.join(out_dir, "depth", "dpt")
+            plasma_dir = _os.path.join(out_dir, "depth", "dpt_plasma")
+            _os.makedirs(dpt_dir, exist_ok=True)
+            _os.makedirs(plasma_dir, exist_ok=True)
+            np.save(_os.path.join(dpt_dir, f"frame_{frame_idx:06d}.npy"), depth_np)
+            # plasma 伪彩色可视化：复用 longstream.utils.depth.colorize_depth
+            try:
+                from longstream.utils.depth import colorize_depth as _colorize_depth
+                d_vis = _colorize_depth(depth_np, cmap="plasma")  # uint8 [H,W,3]
+            except Exception:
+                # 降级：灰度归一化（应急）
+                d_min, d_max = depth_np.min(), depth_np.max()
+                if d_max > d_min:
+                    d_vis = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+                else:
+                    d_vis = np.zeros_like(depth_np, dtype=np.uint8)
+                d_vis = np.stack([d_vis, d_vis, d_vis], axis=-1)
             PIL.Image.fromarray(d_vis).save(
-                _os.path.join(depth_dir, f"{frame_idx:06d}_vis.png")
+                _os.path.join(plasma_dir, f"frame_{frame_idx:06d}.png")
             )
 
-    # ── 逐帧点云 PLY（按置信度过滤，使用共享过滤函数）────────────────────
+    # ── 逐帧点云 PLY（使用预计算的 filtered_points_np，与 Rerun 保持完全一致）──
+    # 按 max_frame_pts 下采样，与非流式 core/infer.py 相同语义
+    # 目录：points/point_head/  文件：frame_XXXXXX.ply
     if out_cfg.get("save_frame_points", False):
-        pts_filtered, colors_filtered = _filter_points_colors(outputs_cpu, out_cfg)
+        pts_filtered = outputs_cpu.get("filtered_points_np")
+        colors_filtered = outputs_cpu.get("filtered_colors_np")
+        if pts_filtered is None:
+            pts_filtered, colors_filtered = _filter_points_colors(outputs_cpu, out_cfg)
         if pts_filtered is not None and len(pts_filtered) > 0:
-            pts_dir = _os.path.join(out_dir, "frame_points")
+            if max_frame_pts > 0 and len(pts_filtered) > max_frame_pts:
+                _rng_frame = np.random.default_rng(seed=frame_idx)
+                _ki = _rng_frame.choice(len(pts_filtered), max_frame_pts, replace=False)
+                pts_filtered = pts_filtered[_ki]
+                if colors_filtered is not None:
+                    colors_filtered = colors_filtered[_ki]
+            pts_dir = _os.path.join(out_dir, "points", "point_head")
             _os.makedirs(pts_dir, exist_ok=True)
-            _write_ply(pts_filtered, _os.path.join(pts_dir, f"{frame_idx:06d}.ply"),
+            _write_ply(pts_filtered, _os.path.join(pts_dir, f"frame_{frame_idx:06d}.ply"),
                        colors=colors_filtered)
-
-    # ── 轨迹（追加写）───────────────────────────────────────────────────
+    # ── 轨迹（追加写，路径与非流式 poses/ 对齐）──────────────────────────
     center = outputs_cpu.get("center_np")
     if center is not None:
-        traj_path = _os.path.join(out_dir, "trajectory.txt")
+        poses_dir = _os.path.join(out_dir, "poses")
+        _os.makedirs(poses_dir, exist_ok=True)
+        traj_path = _os.path.join(poses_dir, "trajectory.txt")
         with open(traj_path, "a", encoding="utf-8") as f:
             f.write(
                 f"{frame_idx} {center[0]:.6f} {center[1]:.6f} {center[2]:.6f}\n"
@@ -611,24 +914,24 @@ def _save_global_points(
 
 def _assemble_video(out_dir: str, fps: int = 24) -> None:
     """
-    将 out_dir/images/*.png 序列合成为 out_dir/output.mp4。
+    将 out_dir/images/rgb/*.png 序列合成为 out_dir/images/rgb.mp4。
     优先使用 longstream.io.save_images.save_video（ffmpeg glob 模式）；
     回退到 imageio v2 FFMPEG writer。
     纯 CPU/磁盘操作，不使用任何 GPU 张量。
     """
     import glob
 
-    img_dir = _os.path.join(out_dir, "images")
+    img_dir = _os.path.join(out_dir, "images", "rgb")
     if not _os.path.isdir(img_dir):
-        print("[LiveInferenceRunner] save_videos 跳过：images/ 目录不存在。", flush=True)
+        print("[LiveInferenceRunner] save_videos 跳过：images/rgb/ 目录不存在。", flush=True)
         return
 
     frames = sorted(glob.glob(_os.path.join(img_dir, "*.png")))
     if not frames:
-        print("[LiveInferenceRunner] save_videos 跳过：images/ 目录为空。", flush=True)
+        print("[LiveInferenceRunner] save_videos 跳过：images/rgb/ 目录为空。", flush=True)
         return
 
-    out_video = _os.path.join(out_dir, "output.mp4")
+    out_video = _os.path.join(out_dir, "images", "rgb.mp4")
     fps_actual = max(1, int(fps))
 
     # 优先方案：复用 save_video（调用 ffmpeg subprocess，走 glob 模式）
@@ -656,11 +959,57 @@ def _assemble_video(out_dir: str, fps: int = 24) -> None:
         print(f"[LiveInferenceRunner] 视频合成失败: {exc2}", flush=True)
 
 
+def _assemble_depth_video(out_dir: str, fps: int = 24) -> None:
+    """
+    将 out_dir/depth/dpt_plasma/*.png 序列合成为 out_dir/depth/dpt_plasma.mp4。
+    与非流式 core/infer.py 对齐。
+    纯 CPU/磁盘操作，不使用任何 GPU 张量。
+    """
+    import glob
+
+    plasma_dir = _os.path.join(out_dir, "depth", "dpt_plasma")
+    if not _os.path.isdir(plasma_dir):
+        print("[LiveInferenceRunner] depth video 跳过：depth/dpt_plasma/ 目录不存在。", flush=True)
+        return
+
+    frames = sorted(glob.glob(_os.path.join(plasma_dir, "*.png")))
+    if not frames:
+        print("[LiveInferenceRunner] depth video 跳过：depth/dpt_plasma/ 目录为空。", flush=True)
+        return
+
+    out_video = _os.path.join(out_dir, "depth", "dpt_plasma.mp4")
+    fps_actual = max(1, int(fps))
+
+    try:
+        from longstream.io.save_images import save_video
+        pattern = _os.path.join(plasma_dir, "*.png")
+        save_video(out_video, pattern, fps=fps_actual)
+        print(f"[LiveInferenceRunner] 深度视频已保存: {out_video}", flush=True)
+        return
+    except Exception as exc:
+        print(f"[LiveInferenceRunner] save_video (depth) 失败: {exc}，尝试 imageio...", flush=True)
+
+    try:
+        import imageio.v2 as imageio_v2
+        import PIL.Image
+        writer = imageio_v2.get_writer(out_video, format="FFMPEG", fps=fps_actual,
+                                       codec="libx264", pixelformat="yuv420p")
+        for fp in frames:
+            frame = np.array(PIL.Image.open(fp))
+            if frame.ndim == 2:  # 灰度应急兜底
+                frame = np.stack([frame, frame, frame], axis=-1)
+            writer.append_data(frame)
+        writer.close()
+        print(f"[LiveInferenceRunner] 深度视频已保存: {out_video}", flush=True)
+    except Exception as exc2:
+        print(f"[LiveInferenceRunner] 深度视频合成失败: {exc2}", flush=True)
+
+
 def _export_glb_from_plys(out_dir: str) -> None:
     """将已落盘的逐帧 PLY 合并导出为 GLB（使用 trimesh；不可用则跳过）。"""
     import glob
 
-    pts_dir = _os.path.join(out_dir, "frame_points")
+    pts_dir = _os.path.join(out_dir, "points", "point_head")
     if not _os.path.isdir(pts_dir):
         return
     try:
@@ -970,21 +1319,15 @@ def _batch_worker_main(
     stop_flag: "mp.Event",
 ) -> None:
     """
-    批处理模式子进程：复用 _worker_inference_loop，fps=0（无限速）。
-    不推送 Rerun Viewer（result_queue 仅接收错误/完成信号，无 on_frame 回调）。
-    支持 video/NPZ/image_dir/generalizable，全走 StreamFeeder 路径。
-    输出增量落盘逻辑与流式模式完全一致。
+    批处理模式子进程：调用 run_inference_cfg(cfg) 走完整非流式推理链路。
+    输出由 run_inference_cfg 自行按 cfg["output"] 落盘，与 python run.py 完全一致。
+    result_queue 仅接收错误/完成信号，无逐帧 on_frame 回调。
     """
     import traceback as _tb
-    import copy
-
-    # 强制关闭帧率限速
-    batch_cfg = copy.deepcopy(cfg)
-    batch_cfg.setdefault("data", {})
-    batch_cfg["data"]["fps"] = 0
 
     try:
-        _worker_inference_loop(batch_cfg, result_queue, stop_flag)
+        from longstream.core.infer import run_inference_cfg
+        run_inference_cfg(cfg)
         result_queue.put_nowait(("__done__", "批处理推理完成"))
     except Exception as exc:
         try:

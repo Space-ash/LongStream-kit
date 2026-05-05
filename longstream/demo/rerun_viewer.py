@@ -27,6 +27,7 @@ longstream/demo/rerun_viewer.py
 
 from __future__ import annotations
 
+import uuid
 from typing import List, Optional
 
 import numpy as np
@@ -56,16 +57,16 @@ def _make_blueprint():
             rrb.Grid(
                 rrb.Spatial3DView(
                     name="当前帧点云",
-                    origin="/live/current",
+                    origin="live/current",
                     background=PAPER_BG,
                 ),
                 rrb.Spatial3DView(
                     name="全局点云",
-                    origin="/live/global",
+                    origin="live/global",
                     background=PAPER_BG,
                 ),
-                rrb.Spatial2DView(name="RGB",  origin="/live/rgb"),
-                rrb.Spatial2DView(name="深度", origin="/live/depth"),
+                rrb.Spatial2DView(name="RGB",  origin="live/rgb"),
+                rrb.Spatial2DView(name="深度", origin="live/depth"),
                 grid_columns=2,
             ),
             collapse_panels=True,
@@ -102,7 +103,7 @@ class RerunViewer:
         app_name: str = "LongStream Live Reconstruction",
         confidence_threshold: float = 0.5,
         max_frame_points: Optional[int] = 8000,
-        max_global_points: int = 500000,
+        max_global_frame_points: Optional[int] = 2000,
         spawn: bool = True,
     ) -> None:
         if not _RERUN_AVAILABLE:
@@ -112,30 +113,37 @@ class RerunViewer:
         self.app_name = app_name
         self.confidence_threshold = float(confidence_threshold)
         self.max_frame_points = max_frame_points
-        self.max_global_points = int(max_global_points)
+        self.max_global_frame_points = max_global_frame_points
         self.spawn = spawn
         self._initialized = False
         # 轨迹缓冲（相机中心序列）
         self._centers: List[np.ndarray] = []
-        # 全局点云 reservoir（纯 CPU numpy，有界）
-        self._global_pts: Optional[np.ndarray] = None   # [R, 3] float32
-        self._global_cols: Optional[np.ndarray] = None  # [R, 3] uint8
-        self._global_rng = np.random.default_rng(seed=0)
 
     # ── 公开接口 ──────────────────────────────────────────────────────────
 
     def init(self) -> None:
         """初始化 Rerun recording，可选 spawn Viewer 窗口。仅调用一次。"""
         blueprint = _make_blueprint()
-        if blueprint is not None:
-            rr.init(self.app_name, spawn=self.spawn, default_blueprint=blueprint)
+        recording_id = str(uuid.uuid4())
+        # 优先使用 send_blueprint(make_active=True)，确保新 recording 不继承旧视图
+        if blueprint is not None and hasattr(rr, "send_blueprint"):
+            rr.init(self.app_name, recording_id=recording_id, spawn=self.spawn)
+            try:
+                rr.send_blueprint(blueprint, make_active=True)
+            except Exception:
+                pass
+        elif blueprint is not None:
+            # 旧版 SDK fallback：通过 default_blueprint 传入
+            try:
+                rr.init(self.app_name, recording_id=recording_id,
+                        spawn=self.spawn, default_blueprint=blueprint)
+            except TypeError:
+                rr.init(self.app_name, recording_id=recording_id, spawn=self.spawn)
         else:
-            rr.init(self.app_name, spawn=self.spawn)
+            rr.init(self.app_name, recording_id=recording_id, spawn=self.spawn)
         self._initialized = True
         self._centers = []
-        self._global_pts = None
-        self._global_cols = None
-        print(f"[RerunViewer] 已初始化: app_name={self.app_name!r}", flush=True)
+        print(f"[RerunViewer] 已初始化: app_name={self.app_name!r}, recording_id={recording_id}", flush=True)
 
     def log_frame(self, frame_idx: int, outputs_cpu: dict) -> None:
         """
@@ -172,19 +180,19 @@ class RerunViewer:
         # ── RGB（左下面板）───────────────────────────────────────────────
         rgb_np: Optional[np.ndarray] = outputs_cpu.get("rgb_np")
         if rgb_np is not None and isinstance(rgb_np, np.ndarray):
-            rr.log("/live/rgb", rr.Image(rgb_np))
+            rr.log("live/rgb", rr.Image(rgb_np))
 
         # ── 深度图（右下面板）────────────────────────────────────────────
         depth_np: Optional[np.ndarray] = outputs_cpu.get("depth_np")
         if depth_np is not None and isinstance(depth_np, np.ndarray):
-            rr.log("/live/depth", rr.DepthImage(depth_np))
+            rr.log("live/depth", rr.DepthImage(depth_np))
 
         # ── 相机位姿轨迹（全局面板）──────────────────────────────────────
         center_np: Optional[np.ndarray] = outputs_cpu.get("center_np")
         if center_np is not None and isinstance(center_np, np.ndarray):
             self._centers.append(center_np)
             rr.log(
-                "/live/global/camera_center",
+                "live/global/camera_center",
                 rr.Points3D(
                     center_np[np.newaxis],
                     colors=np.array([[0, 180, 80]], dtype=np.uint8),
@@ -192,7 +200,7 @@ class RerunViewer:
             )
             if len(self._centers) >= 2:
                 rr.log(
-                    "/live/global/trajectory",
+                    "live/global/trajectory",
                     rr.LineStrips3D(
                         [np.stack(self._centers, axis=0)],
                         colors=np.array([[0, 180, 80]], dtype=np.uint8),
@@ -200,46 +208,49 @@ class RerunViewer:
                 )
 
         # ── 当前帧 / 全局世界点云 ─────────────────────────────────────────
-        points_np: Optional[np.ndarray] = outputs_cpu.get("world_points_np")
-        conf_np: Optional[np.ndarray] = outputs_cpu.get("conf_np")
+        # 优先使用 worker 侧已统一过滤的 filtered_points_np / filtered_colors_np
+        # 与磁盘落盘保持完全一致（同一 _filter_points_colors 调用结果）
+        points_np: Optional[np.ndarray] = outputs_cpu.get("filtered_points_np")
+        colors_np: Optional[np.ndarray] = outputs_cpu.get("filtered_colors_np")
 
-        if points_np is not None and isinstance(points_np, np.ndarray):
-            orig_n = points_np.shape[0]
-
-            # 置信度过滤：只有 conf_np 长度与 points_np 严格一致时才启用 mask
-            mask: Optional[np.ndarray] = None
-            if conf_np is not None and isinstance(conf_np, np.ndarray):
-                if conf_np.shape[0] == orig_n:
-                    mask = conf_np >= self.confidence_threshold
-                    points_np = points_np[mask]
-                # 若长度不匹配，mask 保持 None，不过滤点云，颜色也不受影响
-
-            # 点云颜色：仅当 pre_colors 与过滤前原始点数对应时才使用
-            colors_np: Optional[np.ndarray] = None
+        if points_np is None:
+            # fallback：worker 未注入预过滤结果时（旧版兼容），在 viewer 侧过滤
+            raw_pts = outputs_cpu.get("world_points_np")
+            conf_np = outputs_cpu.get("conf_np")
             pre_colors = outputs_cpu.get("point_colors_np")
-            if pre_colors is not None and isinstance(pre_colors, np.ndarray):
-                if mask is not None and len(pre_colors) == orig_n:
-                    # 颜色与过滤前对齐 → 应用同一 mask
-                    colors_np = pre_colors[mask].astype(np.uint8)
-                elif mask is None and len(pre_colors) == len(points_np):
-                    # 无 mask（或 conf 长度不匹配），颜色与当前点数已对齐
-                    colors_np = pre_colors.astype(np.uint8)
-                # 其余情况（长度不匹配）放弃颜色，避免 crash
+            if raw_pts is not None and isinstance(raw_pts, np.ndarray):
+                orig_n = raw_pts.shape[0]
+                mask: Optional[np.ndarray] = None
+                if conf_np is not None and isinstance(conf_np, np.ndarray):
+                    if conf_np.shape[0] == orig_n:
+                        mask = conf_np >= self.confidence_threshold
+                        raw_pts = raw_pts[mask]
+                if pre_colors is not None and isinstance(pre_colors, np.ndarray):
+                    if mask is not None and len(pre_colors) == orig_n:
+                        colors_np = pre_colors[mask].astype(np.uint8)
+                    elif mask is None and len(pre_colors) == len(raw_pts):
+                        colors_np = pre_colors.astype(np.uint8)
+                points_np = raw_pts
 
-            # 数量限制（当前帧）
-            cur_pts = points_np
-            cur_cols = colors_np
-            if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
-                rng = np.random.default_rng(seed=frame_idx)
-                keep = rng.choice(len(cur_pts), size=self.max_frame_points, replace=False)
-                cur_pts = cur_pts[keep]
-                if cur_cols is not None:
+        if points_np is not None and isinstance(points_np, np.ndarray) and len(points_np) > 0:
+            # 颜色缺失时跳过全部点云日志（当前帧 + 全局拼接），避免白点污染
+            if colors_np is None:
+                print(
+                    f"[RerunViewer] 帧 {frame_idx}: 点云颜色缺失，"
+                    "跳过点云显示（当前帧 + 全局拼接均跳过）。",
+                    flush=True,
+                )
+            else:
+                # ── 左上：当前帧点云（每帧覆盖同一路径）────────────────────
+                cur_pts = points_np
+                cur_cols = colors_np
+                if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
+                    rng = np.random.default_rng(seed=frame_idx)
+                    keep = rng.choice(len(cur_pts), size=self.max_frame_points, replace=False)
+                    cur_pts = cur_pts[keep]
                     cur_cols = cur_cols[keep]
-
-            # ── 左上：当前帧点云 ─────────────────────────────────────────
-            if len(cur_pts) > 0:
                 rr.log(
-                    "/live/current/points",
+                    "live/current/points",
                     rr.Points3D(
                         cur_pts,
                         colors=cur_cols,
@@ -247,53 +258,26 @@ class RerunViewer:
                     ),
                 )
 
-            # ── 全局 reservoir 累积（过滤后的点） ────────────────────────
-            # 直接使用已过滤的 points_np / colors_np（无需再次过滤）
-            if len(points_np) > 0:
-                if self._global_pts is None:
-                    self._global_pts = points_np.astype(np.float32)
-                    self._global_cols = colors_np.astype(np.uint8) if colors_np is not None else None
-                else:
-                    self._global_pts = np.concatenate(
-                        [self._global_pts, points_np.astype(np.float32)], axis=0
-                    )
-                    if colors_np is not None and self._global_cols is not None:
-                        self._global_cols = np.concatenate(
-                            [self._global_cols, colors_np.astype(np.uint8)], axis=0
-                        )
-                    elif colors_np is not None:
-                        # 补零填充之前无颜色的历史点
-                        prev_n = len(self._global_pts) - len(points_np)
-                        self._global_cols = np.concatenate([
-                            np.zeros((prev_n, 3), dtype=np.uint8),
-                            colors_np.astype(np.uint8),
-                        ], axis=0)
-
-                # 超过上限时随机下采样，保持内存有界
-                if len(self._global_pts) > self.max_global_points:
-                    keep_g = self._global_rng.choice(
-                        len(self._global_pts), self.max_global_points, replace=False
-                    )
-                    self._global_pts = self._global_pts[keep_g]
-                    if self._global_cols is not None:
-                        self._global_cols = self._global_cols[keep_g]
-
-            # ── 右上：全局累积点云 ────────────────────────────────────────
-            if self._global_pts is not None and len(self._global_pts) > 0:
+                # ── 右上：全局视图，每帧独立实体，Rerun 自然累积，无随机裁剪 ──
+                glb_pts = points_np
+                glb_cols = colors_np
+                if self.max_global_frame_points is not None and len(glb_pts) > self.max_global_frame_points:
+                    rng_g = np.random.default_rng(seed=frame_idx + 100000)
+                    keep_g = rng_g.choice(len(glb_pts), size=self.max_global_frame_points, replace=False)
+                    glb_pts = glb_pts[keep_g]
+                    glb_cols = glb_cols[keep_g]
                 rr.log(
-                    "/live/global/points",
+                    f"live/global/points/frame_{frame_idx:06d}",
                     rr.Points3D(
-                        self._global_pts,
-                        colors=self._global_cols,
-                        radii=np.full(len(self._global_pts), 0.008, dtype=np.float32),
+                        glb_pts,
+                        colors=glb_cols,
+                        radii=np.full(len(glb_pts), 0.008, dtype=np.float32),
                     ),
                 )
 
     def reset(self) -> None:
         """清除所有缓冲（新序列开始时调用）。"""
         self._centers = []
-        self._global_pts = None
-        self._global_cols = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

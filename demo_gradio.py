@@ -40,7 +40,7 @@ SAVE_OUTPUT_CHOICES = [
     ("深度图 (save_depth)",               "save_depth"),
     ("全局点云 (save_points)",            "save_points"),
     ("逐帧点云 (save_frame_points)",      "save_frame_points"),
-    ("天空遮罩 [暂未支持] (mask_sky)",    "mask_sky"),
+    ("天空遮罩 (mask_sky)",               "mask_sky"),
     ("GLB 导出 (export_glb)",             "export_glb"),
 ]
 _SAVE_LABEL_TO_KEY = {label: key for label, key in SAVE_OUTPUT_CHOICES}
@@ -226,8 +226,12 @@ def update_ui_from_yaml(template_name: str) -> tuple:
     advanced_yaml is NOT updated here — it remains the user's override box.
     """
     if template_name == "Custom":
-        # No-op: keep all current values unchanged
-        return tuple(gr.update() for _ in range(22))
+        # 文件存在时加载并刷新 UI（用户手动选择 Custom）
+        # 文件不存在时 no-op（用户手动改参数后自动切到 Custom，保持当前值）
+        custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
+        if not os.path.isfile(custom_path):
+            return tuple(gr.update() for _ in range(22))
+        # fall through: load custom_infer.yaml like any other template
 
     cfg   = _load_template(template_name)
     infer = cfg.get("inference", {})
@@ -418,6 +422,7 @@ def _start_runner(
                 viewer = RerunViewer(
                     confidence_threshold=float(confidence_threshold),
                     max_frame_points=int(max_frame_points),
+                    max_global_frame_points=min(10000, int(max_frame_points)),
                     spawn=True,
                 )
                 viewer.init()
@@ -558,7 +563,7 @@ def main():
         # ─── State ────────────────────────────────────────────────────
         # Holds the BASE config from the selected template.
         # User slider/checkbox edits do NOT change this state.
-        # Only template_name.change() updates it (via update_ui_from_yaml).
+        # Only template_name.input() updates it (via update_ui_from_yaml).
         cfg_state = gr.State(value=_initial_cfg)
 
         # ─── 从初始模板提取 UI 初始属性 ────────────────────────────────
@@ -740,7 +745,11 @@ def main():
             source_type,                                 # 21
             generalizable_row,                           # 22
         ]
-        template_name.change(
+        # 使用 .input() 而非 .change()：
+        # .input() 仅在用户直接点击 Dropdown 时触发；
+        # _mark_custom() 通过 gr.update() 程序化修改 template_name 时只触发 .change()，
+        # 不触发 .input()，从而保留用户刚编辑的 UI 值，不被 custom_infer.yaml 覆盖。
+        template_name.input(
             fn=update_ui_from_yaml,
             inputs=[template_name],
             outputs=_template_sync_outputs,
