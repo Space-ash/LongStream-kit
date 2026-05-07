@@ -1,7 +1,14 @@
-# LongStream 重建模板：Baseline
-# 用途：
-# - 关闭筛帧和 GT 周期校正
-# - 保留基础重建与评估
+﻿# LongStream 推理配置：KITTI Odometry Seq 08 (Optimized)
+#
+# 数据来源：KITTI Odometry sequence 08（城市场景，4071 帧）
+# 预处理：bash prepare_kitti_odometry.sh
+#
+# 注意：
+#   - 当前数据无 GT depth，depth/pointcloud GT 相关指标不可用
+#   - 可用指标：ATE、位姿轨迹误差（pose/ATE 系列）
+#
+# Smoke test（前 100 帧快速验证）：
+#   将 data.max_frames 设为 100，运行后查看 outputs/kitti_odometry_08/optimized/
 
 device: cuda
 
@@ -60,11 +67,11 @@ inference:
 data:
   format: generalizable
   data_roots_file: data_roots.txt
-  img_path: prepared_inputs/vkitti2
-  seq_list: [Scene01/clone]
-  camera: "00"
+  img_path: prepared_inputs/kitti_odometry
+  seq_list: ["08"]
+  camera: "02"
   stride: 1
-  max_frames: null
+  max_frames: null        # 改为 100 可进行 smoke test
   size: 518
   crop: false
   patch_size: 14
@@ -74,16 +81,23 @@ data:
 optimizations:
   filter:
     frame_filter_enabled: false
-    confidence_filter_enabled: false
+    confidence_filter_enabled: true
     blur_threshold: 100.0
     motion_threshold: 0.02
     confidence_threshold: 0.5
     save_frame_index_map: false
   correction:
-    tto_enabled: false
+    tto_enabled: true
+    tto_steps: 20
+    tto_lr: 1.0e-3
+    tto_weight_decay: 0.0
+    tto_window_size: 40
+    tto_min_gps_disp: 1.0
+    tto_max_grad_norm: 1.0
+    tto_pair_stride: 8
 
 output:
-  root: outputs/vkitti2_scene01_clone/baseline
+  root: outputs/kitti_odometry_08/optimized
   save_videos: true
   save_images: true
   save_depth: true

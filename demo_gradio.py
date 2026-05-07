@@ -40,6 +40,8 @@ SAVE_OUTPUT_CHOICES = [
     ("深度图 (save_depth)",               "save_depth"),
     ("全局点云 (save_points)",            "save_points"),
     ("逐帧点云 (save_frame_points)",      "save_frame_points"),
+    ("保存 point_head 点云 (save_point_head)", "save_point_head"),
+    ("保存 dpt_unproj 点云 (save_dpt_unproj)", "save_dpt_unproj"),
     ("天空遮罩 (mask_sky)",               "mask_sky"),
     ("GLB 导出 (export_glb)",             "export_glb"),
 ]
@@ -50,6 +52,7 @@ _SAVE_DEFAULT_LABELS = [
     "深度图 (save_depth)",
     "全局点云 (save_points)",
     "逐帧点云 (save_frame_points)",
+    "保存 dpt_unproj 点云 (save_dpt_unproj)",
 ]
 
 # ─── Input type mapping ───────────────────────────────────────────────────
@@ -96,7 +99,16 @@ def _load_template(template_name: str) -> dict:
 
 def _cfg_to_save_output_labels(cfg: dict) -> list:
     out = cfg.get("output", {})
-    return [label for label, key in SAVE_OUTPUT_CHOICES if bool(out.get(key, False))]
+    labels = []
+    for label, key in SAVE_OUTPUT_CHOICES:
+        if key in ("save_point_head", "save_dpt_unproj"):
+            # 若模板中未显式设置，以 save_points 总开关为默认值，避免切换后全关
+            enabled = bool(out.get(key, out.get("save_points", False)))
+        else:
+            enabled = bool(out.get(key, False))
+        if enabled:
+            labels.append(label)
+    return labels
 
 
 def _merge_basic_into_cfg(
@@ -116,6 +128,7 @@ def _merge_basic_into_cfg(
     enable_rerun: bool,
     output_root: str = "",
     streaming_mode: str = "causal",
+    max_frames: int = 0,
 ) -> dict:
     """Apply UI leaf-values onto base cfg. Never modifies model/checkpoint keys."""
     cfg = copy.deepcopy(cfg)
@@ -153,7 +166,8 @@ def _merge_basic_into_cfg(
         if label in _SAVE_LABEL_TO_KEY
     }
     for std_key in ["save_images", "save_videos", "save_depth",
-                    "save_points", "save_frame_points", "mask_sky"]:
+                    "save_points", "save_frame_points",
+                    "save_point_head", "save_dpt_unproj", "mask_sky"]:
         cfg["output"][std_key] = std_key in selected_keys
     cfg["output"]["export_glb"]                   = "export_glb" in selected_keys
     cfg["output"]["max_frame_pointcloud_points"]  = int(max_frame_points)
@@ -163,6 +177,10 @@ def _merge_basic_into_cfg(
 
     cfg["runtime"]["simulate_streaming"] = bool(simulate_streaming)
     cfg["data"]["fps"] = int(target_fps) if simulate_streaming else 0
+
+    # data.max_frames：0 表示不限（写入 null）
+    mf = int(max_frames or 0)
+    cfg["data"]["max_frames"] = None if mf <= 0 else mf
 
     cfg["_enable_rerun"] = bool(enable_rerun)
     return cfg
@@ -217,7 +235,7 @@ _ADVANCED_YAML_PLACEHOLDER = (
 def update_ui_from_yaml(template_name: str) -> tuple:
     """
     Load template YAML and refresh bound UI components.
-    Returns 24 values:
+    Returns 25 values:
       window_size, refresh, keyframe_stride, confidence_threshold,
       max_frame_points, max_full_points,
       enable_tto, enable_filter, enable_conf_filter,
@@ -225,7 +243,8 @@ def update_ui_from_yaml(template_name: str) -> tuple:
       cfg_state (new base dict), config_preview,
       output_root, source_path, data_roots_file, seq_list, camera,
       source_type (dropdown label), generalizable_row (visibility update),
-      streaming_mode, streaming_mode_warning (visibility)
+      streaming_mode, streaming_mode_warning (visibility),
+      max_frames
     advanced_yaml is NOT updated here — it remains the user's override box.
     """
     if template_name == "Custom":
@@ -233,7 +252,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         # 文件不存在时 no-op（用户手动改参数后自动切到 Custom，保持当前值）
         custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
         if not os.path.isfile(custom_path):
-            return tuple(gr.update() for _ in range(24))
+            return tuple(gr.update() for _ in range(25))
         # fall through: load custom_infer.yaml like any other template
 
     cfg   = _load_template(template_name)
@@ -254,6 +273,8 @@ def update_ui_from_yaml(template_name: str) -> tuple:
     source_label = _FORMAT_TO_SRC_LABEL.get(data_fmt, "图片目录 (image_dir)")
 
     preview_text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+
+    mf = data.get("max_frames", None)
 
     return (
         gr.update(value=int(infer.get("window_size",     48))),   # 1
@@ -280,6 +301,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         gr.update(visible=is_gen),                           # 22 generalizable_row
         gr.update(value=infer.get("streaming_mode", "causal")),  # 23 streaming_mode
         gr.update(visible=(infer.get("streaming_mode", "causal") == "causal")),  # 24 streaming_mode_warning
+        gr.update(value=0 if mf is None else int(mf)),       # 25 max_frames
     )
 
 
@@ -310,6 +332,7 @@ def _build_cfg_from_ui(
     seq_list: str = "",
     camera: str = "00",
     streaming_mode: str = "causal",
+    max_frames: int = 0,
 ) -> dict:
     """Build complete cfg from UI values using base_cfg (from cfg_state) as the foundation.
 
@@ -333,6 +356,7 @@ def _build_cfg_from_ui(
         save_outputs=save_outputs, enable_rerun=enable_rerun,
         output_root=output_root,
         streaming_mode=streaming_mode,
+        max_frames=max_frames,
     )
     # 3. UI 可见路径字段最终优先（覆盖 advanced 里可能有的 data.*）
     cfg.setdefault("data", {})
@@ -394,6 +418,7 @@ def _start_runner(
     seq_list: str = "",
     camera: str = "00",
     streaming_mode: str = "causal",
+    max_frames: int = 0,
 ) -> tuple:
     global _active_runner, _rerun_viewer
 
@@ -416,6 +441,7 @@ def _start_runner(
         seq_list=seq_list,
         camera=camera,
         streaming_mode=streaming_mode,
+        max_frames=max_frames,
     )
 
     if simulate_streaming:
@@ -431,7 +457,9 @@ def _start_runner(
                 viewer = RerunViewer(
                     confidence_threshold=float(confidence_threshold),
                     max_frame_points=min(int(max_frame_points), 8000),
-                    max_global_frame_points=2000,
+                    max_global_frame_points=20000,
+                    max_global_points=20000,
+                    rerun_global_update_interval=25,
                     spawn=True,
                 )
                 viewer.init()
@@ -533,6 +561,7 @@ def save_custom_config(
     seq_list: str = "",
     camera: str = "00",
     streaming_mode: str = "causal",
+    max_frames: int = 0,
 ) -> tuple:
     """Save current UI params to custom_infer.yaml. Returns (path, Custom dropdown update, new cfg_state)."""
     cfg = _build_cfg_from_ui(
@@ -547,6 +576,7 @@ def save_custom_config(
         seq_list=seq_list,
         camera=camera,
         streaming_mode=streaming_mode,
+        max_frames=max_frames,
     )
     custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
     os.makedirs(_CONFIGS_DIR, exist_ok=True)
@@ -638,6 +668,12 @@ def main():
                     label="目标帧率 (data.fps，流式模式生效)",
                     minimum=1, maximum=60, step=1, value=18,
                 )
+                max_frames = gr.Number(
+                    label="最大输入帧数 (data.max_frames，0 表示不限)",
+                    value=0,
+                    precision=0,
+                    minimum=0,
+                )
 
         # ─── Basic config ──────────────────────────────────────────────
         with gr.Accordion("基础配置", open=True):
@@ -698,7 +734,7 @@ def main():
             )
             streaming_mode_warning = gr.Markdown(
                 "⚠️ causal 模式与 run.py 默认管线更一致，但长序列显存压力更高；"
-                "如果 3090 长序列崩溃，可切换 window 做稳定性对照实验。",
+                "如果长序列崩溃，可切换 window 做稳定性对照实验。",
                 visible=(_initial_cfg.get("inference", {}).get("streaming_mode", "causal") == "causal"),
             )
 
@@ -747,7 +783,7 @@ def main():
         status_timer.tick(fn=_check_status, outputs=[status_box])
 
         # ─── Template sync ─────────────────────────────────────────────
-        # update_ui_from_yaml returns 24 values.
+        # update_ui_from_yaml returns 25 values.
         # advanced_yaml is intentionally NOT in this output list.
         _template_sync_outputs = [
             window_size, refresh, keyframe_stride,       # 1-3
@@ -768,6 +804,7 @@ def main():
             generalizable_row,                           # 22
             streaming_mode,                              # 23
             streaming_mode_warning,                      # 24
+            max_frames,                                  # 25
         ]
         # 使用 .input() 而非 .change()：
         # .input() 仅在用户直接点击 Dropdown 时触发；
@@ -816,9 +853,10 @@ def main():
                       enable_conf_filter, enable_rerun, save_outputs]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
-        # Textbox / Dropdown / Code / Radio: use .input()
+        # Textbox / Dropdown / Code / Radio / Number: use .input()
         for _comp in [source_type, source_path, advanced_yaml,
-                      output_root, data_roots_file, seq_list, camera, streaming_mode]:
+                      output_root, data_roots_file, seq_list, camera, streaming_mode,
+                      max_frames]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # ─── Shared input list (cfg_state replaces template_name) ─────
@@ -830,7 +868,7 @@ def main():
             enable_tto, enable_filter, enable_conf_filter,
             save_outputs, enable_rerun, advanced_yaml,
             output_root, data_roots_file, seq_list, camera,
-            streaming_mode,
+            streaming_mode, max_frames,
         ]
 
         # ─── Button events ─────────────────────────────────────────────

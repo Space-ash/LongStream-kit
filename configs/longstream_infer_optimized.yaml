@@ -96,6 +96,8 @@ output:
   save_depth: true
   save_points: true
   save_frame_points: true
+  save_point_head: false
+  save_dpt_unproj: true
   mask_sky: true
   skyseg_path: model/skyseg.onnx
   max_full_pointcloud_points: 2000000

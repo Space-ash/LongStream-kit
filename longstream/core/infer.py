@@ -361,6 +361,9 @@ def run_inference_cfg(cfg: dict):
     save_videos = bool(output_cfg.get("save_videos", True))
     save_points = bool(output_cfg.get("save_points", True))
     save_frame_points = bool(output_cfg.get("save_frame_points", True))
+    # 分支开关：缺少时均回退到 save_points 行为（向后兼容旧 YAML）
+    save_point_head = bool(output_cfg.get("save_point_head", save_points))
+    save_dpt_unproj = bool(output_cfg.get("save_dpt_unproj", save_points))
     save_depth = bool(output_cfg.get("save_depth", True))
     save_images = bool(output_cfg.get("save_images", True))
     mask_sky = bool(output_cfg.get("mask_sky", True))
@@ -699,7 +702,7 @@ def run_inference_cfg(cfg: dict):
                     f"[longstream] sequence {seq.name}: saving point clouds", flush=True
                 )
                 # --- point_head 分支 ---
-                if outputs.get("world_points") is not None and extri_np is not None:
+                if save_point_head and outputs.get("world_points") is not None and extri_np is not None:
                     pts_dir = os.path.join(seq_dir, "points", "point_head")
                     _ensure_dir(pts_dir)
                     pts = outputs["world_points"][0].detach().cpu().numpy()
@@ -730,7 +733,7 @@ def run_inference_cfg(cfg: dict):
                             rgb[i],
                             valid_mask,
                         )
-                        if save_frame_points:
+                        if save_frame_points and save_point_head:
                             save_pointcloud(
                                 os.path.join(pts_dir, f"frame_{i:06d}.ply"),
                                 pts_i,
@@ -741,16 +744,17 @@ def run_inference_cfg(cfg: dict):
                         if len(pts_i):
                             full_pts.append(pts_i)
                             full_cols.append(cols_i)
-                    _save_full_pointcloud(
-                        os.path.join(seq_dir, "points", "point_head_full.ply"),
-                        full_pts,
-                        full_cols,
-                        max_points=max_full_pointcloud_points,
-                        seed=0,
-                    )
+                    if save_point_head:
+                        _save_full_pointcloud(
+                            os.path.join(seq_dir, "points", "point_head_full.ply"),
+                            full_pts,
+                            full_cols,
+                            max_points=max_full_pointcloud_points,
+                            seed=0,
+                        )
 
                 # --- dpt_unproj 分支 ---
-                if (
+                if save_dpt_unproj and (
                     outputs.get("depth") is not None
                     and extri_np is not None
                     and intri_np is not None
@@ -782,7 +786,7 @@ def run_inference_cfg(cfg: dict):
                         )[0]
                         R_np = extri_np[i, :3, :3]
                         t_np = extri_np[i, :3, 3]
-                        pts_cam_np = pts_cam.cpu().numpy().reshape(-1, 3)
+                        pts_cam_np = pts_cam.detach().cpu().numpy().reshape(-1, 3)
                         pts_world = (
                             R_np.T @ (pts_cam_np.T - t_np[:, None])
                         ).T.astype(np.float32)
@@ -796,7 +800,7 @@ def run_inference_cfg(cfg: dict):
                             rgb[i],
                             valid_mask,
                         )
-                        if save_frame_points:
+                        if save_frame_points and save_dpt_unproj:
                             save_pointcloud(
                                 os.path.join(dpt_pts_dir, f"frame_{i:06d}.ply"),
                                 pts_i,
@@ -807,13 +811,14 @@ def run_inference_cfg(cfg: dict):
                         if len(pts_i):
                             full_pts.append(pts_i)
                             full_cols.append(cols_i)
-                    _save_full_pointcloud(
-                        os.path.join(seq_dir, "points", "dpt_unproj_full.ply"),
-                        full_pts,
-                        full_cols,
-                        max_points=max_full_pointcloud_points,
-                        seed=1,
-                    )
+                    if save_dpt_unproj:
+                        _save_full_pointcloud(
+                            os.path.join(seq_dir, "points", "dpt_unproj_full.ply"),
+                            full_pts,
+                            full_cols,
+                            max_points=max_full_pointcloud_points,
+                            seed=1,
+                        )
             del outputs
             if device_type == "cuda":
                 torch.cuda.empty_cache()
