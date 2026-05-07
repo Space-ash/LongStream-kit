@@ -16,7 +16,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -75,6 +75,21 @@ def _worker_inference_loop(
     infer_cfg: dict = cfg.get("inference", {})
     opt_cfg: dict = cfg.get("optimizations", {})
     corr_cfg: dict = opt_cfg.get("correction", {})
+    _out_cfg_early = {
+        **cfg.get("output", {}),
+        **cfg.get("optimizations", {}).get("filter", {}),
+    }
+
+    # ── CPU 线程控制（防止子进程过度竞争 CPU 核心导致过热）──────────────
+    try:
+        torch.set_num_threads(int(_out_cfg_early.get("torch_num_threads", 2)))
+    except Exception:
+        pass
+    try:
+        import cv2 as _cv2_init
+        _cv2_init.setNumThreads(int(_out_cfg_early.get("opencv_num_threads", 1)))
+    except Exception:
+        pass
 
     # ── 模型 ──────────────────────────────────────────────────────────────
     print("[LiveInferenceRunner/worker] 初始化模型...", flush=True)
@@ -157,18 +172,33 @@ def _worker_inference_loop(
     _save_points_base: bool = bool(_out_cfg_merged.get("save_points", False))
     _save_point_head: bool = bool(_out_cfg_merged.get("save_point_head", _save_points_base))
     _save_dpt_unproj: bool = bool(_out_cfg_merged.get("save_dpt_unproj", _save_points_base))
-    # reservoir：累积完整过滤后的点（从 filtered_points_np 注入，纯 CPU numpy）
-    _res_pts: Optional[np.ndarray] = None   # [R, 3] float32
+    # reservoir：分块累积（pending 列表 + 已紧凑化 flat 数组，避免每帧 np.concatenate）
+    _res_pts: Optional[np.ndarray] = None   # [R, 3] float32，已紧凑化
     _res_cols: Optional[np.ndarray] = None  # [R, 3] uint8
     _res_rng = np.random.default_rng(seed=0)
+    _res_pending: list = []       # 待合并小分块列表
+    _res_pending_cols: list = []
+    _res_pending_n: int = 0
     # dpt_unproj reservoir（与 point_head reservoir 并行）
     _res_dpu_pts: Optional[np.ndarray] = None   # [R, 3] float32
     _res_dpu_cols: Optional[np.ndarray] = None  # [R, 3] uint8
     _res_dpu_rng = np.random.default_rng(seed=1)
-    # live/ 保存参数（与 Rerun 下采样一致）
-    _max_live_global_pts: int = int(_out_cfg_merged.get("max_live_global_frame_points", 2000))
-    # 崩溃保护 checkpoint：每 N 帧覆盖写一次 live/global/dpt_unproj_latest.ply
-    _checkpoint_interval: int = int(_out_cfg_merged.get("live_global_checkpoint_interval", 50))
+    _res_dpu_pending: list = []
+    _res_dpu_pending_cols: list = []
+    _res_dpu_pending_n: int = 0
+    # 崩溃保护 checkpoint：每 N 帧覆盖写一次 points/dpt_unproj_latest.ply
+    # 默认 0 = 关闭；适合 Gradio 默认场景，避免周期性大 IO 尖峰
+    _checkpoint_interval: int = int(_out_cfg_merged.get("live_global_checkpoint_interval", 0))
+    _checkpoint_max_points: int = int(_out_cfg_merged.get("live_global_checkpoint_points", 200000))
+    # Rerun 是否开启：仅开启时才跨进程传输大 numpy
+    _emit_frame_results: bool = bool(cfg.get("_enable_rerun", False))
+    _viewer_max_global: int = int(_out_cfg_merged.get("rerun_global_points", 20000))
+    _viewer_ingest_points: int = int(_out_cfg_merged.get("rerun_global_ingest_points", 8000))
+    # Rerun 专用实时 viewer reservoir（每帧更新，独立于磁盘保存 reservoir）
+    # 最多 _viewer_max_global 点，保证每帧 global panel 包含当前帧采样
+    _view_res_pts: Optional[np.ndarray] = None
+    _view_res_cols: Optional[np.ndarray] = None
+    _view_res_rng = np.random.default_rng(seed=123)
     # dpt_unproj 警告限频计数器（防止长序列日志刷爆）
     _dpu_warn_count: int = 0
     _dpu_warn_max: int = 3  # 前 3 次打印警告，此后仅累计
@@ -359,12 +389,6 @@ def _worker_inference_loop(
                 _extri_list.append(extri)
                 _pose_frame_ids.append(g)
 
-            # ── 发送结果到主进程（队列满则丢弃，保证推理不被可视化阻塞）──
-            try:
-                result_queue.put_nowait((g, outputs_cpu))
-            except Exception:
-                pass
-
             # ── 每 25 帧打印一次 VRAM 快照（方便定位长序列显存泵露）──
             if g % 25 == 0:
                 _log_cuda_memory("live", g)
@@ -391,12 +415,6 @@ def _worker_inference_loop(
                     _os.makedirs(_dpu_dir, exist_ok=True)
                     _write_ply(_dpu_save, _os.path.join(_dpu_dir, f"frame_{g:06d}.ply"),
                                colors=_dpu_csave)
-
-            # ── live/ 保存（与 Rerun 同源数据落盘）────────────────────────
-            _save_live_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g,
-                               max_frame_pts=_max_frame_pts,
-                               save_point_head=_save_point_head,
-                               save_dpt_unproj=_save_dpt_unproj)
 
             # ── 全局 reservoir 更新（不受逐帧下采样预算限制，直接用完整过滤结果）──
             if _save_point_head:
@@ -428,71 +446,116 @@ def _worker_inference_loop(
                             if len(_rcols_filtered) == len(_new_pts):
                                 _new_cols = _rcols_filtered
 
-                    # 颜色仍不可用则跳过该帧，避免污染全局点云 RGB
-                    if _new_cols is None:
+                    if _new_cols is not None:
+                        _nc = _new_cols.astype(np.uint8, copy=False)
+                        _res_pending.append(_new_pts)
+                        _res_pending_cols.append(_nc)
+                        _res_pending_n += len(_new_pts)
+                        if _res_pending_n >= int(_max_full_pts * 0.1):
+                            _res_pts, _res_cols, _res_pending, _res_pending_cols, _res_pending_n = \
+                                _compact_reservoir(
+                                    _res_pts, _res_cols,
+                                    _res_pending, _res_pending_cols,
+                                    _max_full_pts, _res_rng,
+                                )
+                    else:
                         print(
                             f"[LiveInferenceRunner/worker] 警告：帧 {g} 颜色不可用，"
                             "跳过该帧点云以保持全局点云 RGB 一致性。",
                             flush=True,
                         )
-                    else:
-                        _new_cols = _new_cols.astype(np.uint8)
-                        if _res_pts is None:
-                            _res_pts = _new_pts
-                            _res_cols = _new_cols
-                        else:
-                            _res_pts = np.concatenate([_res_pts, _new_pts], axis=0)
-                            if _res_cols is not None:
-                                _res_cols = np.concatenate([_res_cols, _new_cols], axis=0)
-                            # 注意：不因新帧颜色缺失而将已有 _res_cols 置为 None
-                        # 超过 2× 上限时随机下采样，防止 RAM 无限增长
-                        if len(_res_pts) > _max_full_pts * 2:
-                            _keep_r = _res_rng.choice(len(_res_pts), _max_full_pts, replace=False)
-                            _res_pts = _res_pts[_keep_r]
-                            if _res_cols is not None:
-                                _res_cols = _res_cols[_keep_r]
 
-            # ── dpt_unproj reservoir 更新 ─────────────────────────────────
+            # ── dpt_unproj reservoir 更新（分块累积，避免每帧 O(N) 复制）──────
             if _save_dpt_unproj:
                 _dpu_new = outputs_cpu.get("filtered_dpu_pts_np")
                 _dpu_new_cols = outputs_cpu.get("filtered_dpu_cols_np")
-                if _dpu_new is not None and len(_dpu_new) > 0 and _dpu_new_cols is not None:
-                    _dpu_new = _dpu_new.astype(np.float32)
-                    _dpu_new_cols = _dpu_new_cols.astype(np.uint8)
-                    if _res_dpu_pts is None:
-                        _res_dpu_pts = _dpu_new
-                        _res_dpu_cols = _dpu_new_cols
-                    else:
-                        _res_dpu_pts = np.concatenate([_res_dpu_pts, _dpu_new], axis=0)
-                        if _res_dpu_cols is not None:
-                            _res_dpu_cols = np.concatenate([_res_dpu_cols, _dpu_new_cols], axis=0)
-                    if len(_res_dpu_pts) > _max_full_pts * 2:
-                        _keep_dpu = _res_dpu_rng.choice(len(_res_dpu_pts), _max_full_pts, replace=False)
-                        _res_dpu_pts = _res_dpu_pts[_keep_dpu]
-                        if _res_dpu_cols is not None:
-                            _res_dpu_cols = _res_dpu_cols[_keep_dpu]
+                if _dpu_new is not None and _dpu_new_cols is not None and len(_dpu_new) > 0:
+                    _res_dpu_pending.append(_dpu_new.astype(np.float32, copy=False))
+                    _res_dpu_pending_cols.append(_dpu_new_cols.astype(np.uint8, copy=False))
+                    _res_dpu_pending_n += len(_dpu_new)
+                    if _res_dpu_pending_n >= int(_max_full_pts * 0.1):
+                        _res_dpu_pts, _res_dpu_cols, _res_dpu_pending, _res_dpu_pending_cols, _res_dpu_pending_n = \
+                            _compact_reservoir(
+                                _res_dpu_pts, _res_dpu_cols,
+                                _res_dpu_pending, _res_dpu_pending_cols,
+                                _max_full_pts, _res_dpu_rng,
+                            )
 
-            # ── 崩溃保护 checkpoint：每 N 帧覆盖写 live/global/dpt_unproj_latest.ply ──
-            # 注意：在 dpt reservoir 更新之后执行，确保 checkpoint 包含当前帧
+            # ── 崩溃保护 checkpoint：每 N 帧写 points/dpt_unproj_latest.ply ──
             if _save_dpt_unproj and _checkpoint_interval > 0 and g % _checkpoint_interval == 0:
+                if _res_dpu_pending_n > 0:
+                    _res_dpu_pts, _res_dpu_cols, _res_dpu_pending, _res_dpu_pending_cols, _res_dpu_pending_n = \
+                        _compact_reservoir(
+                            _res_dpu_pts, _res_dpu_cols,
+                            _res_dpu_pending, _res_dpu_pending_cols,
+                            _max_full_pts, _res_dpu_rng,
+                        )
                 if _res_dpu_pts is not None and len(_res_dpu_pts) > 0:
                     try:
-                        _ckpt_pts = _res_dpu_pts.astype(np.float32)
-                        _ckpt_cols = _res_dpu_cols.astype(np.uint8) if _res_dpu_cols is not None else None
-                        if len(_ckpt_pts) > _max_full_pts:
-                            _ckpt_ki = np.random.default_rng(seed=g + 999).choice(
-                                len(_ckpt_pts), _max_full_pts, replace=False
-                            )
-                            _ckpt_pts = _ckpt_pts[_ckpt_ki]
-                            if _ckpt_cols is not None:
-                                _ckpt_cols = _ckpt_cols[_ckpt_ki]
-                        _ckpt_dir = _os.path.join(_out_dir, "live", "global")
-                        _os.makedirs(_ckpt_dir, exist_ok=True)
-                        _write_ply(_ckpt_pts, _os.path.join(_ckpt_dir, "dpt_unproj_latest.ply"),
-                                   colors=_ckpt_cols)
+                        _ckpt_pts, _ckpt_cols = _sample_points_for_viewer(
+                            _res_dpu_pts, _res_dpu_cols, _checkpoint_max_points, g + 999
+                        )
+                        if _ckpt_pts is not None:
+                            _ckpt_dir = _os.path.join(_out_dir, "points")
+                            _os.makedirs(_ckpt_dir, exist_ok=True)
+                            _write_ply(_ckpt_pts, _os.path.join(_ckpt_dir, "dpt_unproj_latest.ply"),
+                                       colors=_ckpt_cols)
                     except Exception as _ckpt_exc:
                         print(f"[LiveInferenceRunner/worker] checkpoint 保存失败 (frame {g}): {_ckpt_exc}",
                               flush=True)
+
+            # ── Rerun viewer reservoir 更新（每帧，独立于磁盘 reservoir）──────
+            # 优先 dpt_unproj，回退 point_head；保证 global panel 每帧包含当前帧
+            if _emit_frame_results:
+                _view_new_pts = outputs_cpu.get("filtered_dpu_pts_np")
+                _view_new_cols = outputs_cpu.get("filtered_dpu_cols_np")
+                if _view_new_pts is None or _view_new_cols is None:
+                    _view_new_pts = outputs_cpu.get("filtered_points_np")
+                    _view_new_cols = outputs_cpu.get("filtered_colors_np")
+                if _view_new_pts is not None and _view_new_cols is not None and len(_view_new_pts) > 0:
+                    _view_new_pts, _view_new_cols = _sample_points_for_viewer(
+                        _view_new_pts, _view_new_cols, _viewer_ingest_points, g + 54321
+                    )
+                    _view_res_pts, _view_res_cols = _update_point_reservoir(
+                        _view_res_pts, _view_res_cols,
+                        _view_new_pts, _view_new_cols,
+                        _viewer_max_global, _view_res_rng,
+                    )
+
+            # ── 注入 viewer 全局快照并发送到主进程（仅 Rerun 开启时）──────────
+            if _emit_frame_results:
+                # 全局快照来自实时 viewer reservoir（每帧已更新，包含当前帧）
+                _gp, _gc = _view_res_pts, _view_res_cols
+                _viewer_payload = _build_viewer_payload(
+                    outputs_cpu, g,
+                    int(_out_cfg_merged.get("rerun_current_points", _max_frame_pts)),
+                    _gp, _gc,
+                )
+                # 丢旧保新：保证 viewer 看到最新帧而非落后多帧的旧帧
+                try:
+                    result_queue.put_nowait((g, _viewer_payload))
+                except Exception:
+                    try:
+                        result_queue.get_nowait()
+                        result_queue.put_nowait((g, _viewer_payload))
+                    except Exception:
+                        pass
+
+    # ── 循环结束后刷入 pending（确保最后几帧纳入最终保存）──────────────────
+    if _save_point_head and _res_pending_n > 0:
+        _res_pts, _res_cols, _res_pending, _res_pending_cols, _res_pending_n = \
+            _compact_reservoir(
+                _res_pts, _res_cols,
+                _res_pending, _res_pending_cols,
+                _max_full_pts, _res_rng,
+            )
+    if _save_dpt_unproj and _res_dpu_pending_n > 0:
+        _res_dpu_pts, _res_dpu_cols, _res_dpu_pending, _res_dpu_pending_cols, _res_dpu_pending_n = \
+            _compact_reservoir(
+                _res_dpu_pts, _res_dpu_cols,
+                _res_dpu_pending, _res_dpu_pending_cols,
+                _max_full_pts, _res_dpu_rng,
+            )
 
     # 全局点云 PLY：从 in-memory reservoir 保存（完整过滤质量，不受逐帧预算影响）
     if _save_point_head and _res_pts is not None and len(_res_pts) > 0:
@@ -533,10 +596,6 @@ def _worker_inference_loop(
             _full_dpu_ply = _os.path.join(_out_dir, "points", "dpt_unproj_full.ply")
             _write_ply(_f_dpu, _full_dpu_ply, colors=_f_dpu_cols)
             np.save(_os.path.join(_out_dir, "points", "dpt_unproj_full.npy"), _f_dpu)
-            # 同步保存到 live/global/
-            _live_glb_dpu = _os.path.join(_out_dir, "live", "global", "dpt_unproj_full.ply")
-            _os.makedirs(_os.path.dirname(_live_glb_dpu), exist_ok=True)
-            _write_ply(_f_dpu, _live_glb_dpu, colors=_f_dpu_cols)
             print(f"[LiveInferenceRunner] dpt_unproj 全局点云已保存: {_full_dpu_ply}  ({len(_f_dpu)} 点)", flush=True)
         except Exception as _dpu_exc:
             print(f"[LiveInferenceRunner] dpt_unproj 全局点云保存失败: {_dpu_exc}", flush=True)
@@ -929,6 +988,119 @@ def _filter_points_colors(
     return pts_flat, colors_flat
 
 
+# ───────────────────────────────────────────────────────────────────────────
+#  全局点云 reservoir 辅助函数
+# ───────────────────────────────────────────────────────────────────────────
+
+def _update_point_reservoir(
+    res_pts: Optional[np.ndarray],
+    res_cols: Optional[np.ndarray],
+    new_pts: Optional[np.ndarray],
+    new_cols: Optional[np.ndarray],
+    max_points: int,
+    rng: np.random.Generator,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    有界 reservoir 更新：合并 new_pts/new_cols 入 res_pts/res_cols，
+    始终将总点数控制在 max_points 以内，无两倍膨胀再下采样。
+    """
+    if new_pts is None or new_cols is None or len(new_pts) == 0:
+        return res_pts, res_cols
+    new_pts = new_pts.astype(np.float32, copy=False)
+    new_cols = new_cols.astype(np.uint8, copy=False)
+    if res_pts is None:
+        if max_points and len(new_pts) > max_points:
+            keep = rng.choice(len(new_pts), max_points, replace=False)
+            return new_pts[keep], new_cols[keep]
+        return new_pts.copy(), new_cols.copy()
+    total = len(res_pts) + len(new_pts)
+    if not max_points or total <= max_points:
+        return (
+            np.concatenate([res_pts, new_pts], axis=0),
+            np.concatenate([res_cols, new_cols], axis=0),
+        )
+    keep = rng.choice(total, max_points, replace=False)
+    old_keep = keep[keep < len(res_pts)]
+    new_keep = keep[keep >= len(res_pts)] - len(res_pts)
+    return (
+        np.concatenate([res_pts[old_keep], new_pts[new_keep]], axis=0),
+        np.concatenate([res_cols[old_keep], new_cols[new_keep]], axis=0),
+    )
+
+
+def _sample_points_for_viewer(
+    pts: Optional[np.ndarray],
+    cols: Optional[np.ndarray],
+    max_points: int,
+    seed: int,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """从 reservoir 下采样供 Rerun viewer 显示，不修改原 reservoir。"""
+    if pts is None or cols is None or len(pts) == 0:
+        return None, None
+    pts = pts.astype(np.float32, copy=False)
+    cols = cols.astype(np.uint8, copy=False)
+    if max_points is not None and max_points > 0 and len(pts) > max_points:
+        rng = np.random.default_rng(seed)
+        keep = rng.choice(len(pts), int(max_points), replace=False)
+        pts = pts[keep]
+        cols = cols[keep]
+    return pts, cols
+
+
+def _compact_reservoir(
+    res_pts: Optional[np.ndarray],
+    res_cols: Optional[np.ndarray],
+    pending_pts: list,
+    pending_cols: list,
+    max_points: int,
+    rng: np.random.Generator,
+):
+    """
+    将 pending 小分块合并入已紧凑化的 res_pts，结果控制在 max_points 以内。
+    返回 (new_res_pts, new_res_cols, [], [], 0) — 调用方直接解包五元组。
+    """
+    if not pending_pts:
+        return res_pts, res_cols, [], [], 0
+    chunks_pts = ([] if res_pts is None else [res_pts]) + pending_pts
+    chunks_cols = ([] if res_cols is None else [res_cols]) + pending_cols
+    merged_pts = np.concatenate(chunks_pts, axis=0)
+    merged_cols = np.concatenate(chunks_cols, axis=0)
+    if max_points and len(merged_pts) > max_points:
+        keep = rng.choice(len(merged_pts), max_points, replace=False)
+        merged_pts = merged_pts[keep]
+        merged_cols = merged_cols[keep]
+    return merged_pts, merged_cols, [], [], 0
+
+
+def _build_viewer_payload(
+    outputs_cpu: dict,
+    frame_idx: int,
+    max_frame_points: int,
+    global_pts: Optional[np.ndarray],
+    global_cols: Optional[np.ndarray],
+) -> dict:
+    """
+    构建瘦 payload 发送给 Rerun viewer 进程。
+    仅包含可视化所需字段，避免跨进程 pickle 传输大型滤波数组。
+    """
+    # 优先 dpt_unproj（与 save_dpt_unproj 语义一致），回退 point_head
+    cur_pts = outputs_cpu.get("filtered_dpu_pts_np")
+    cur_cols = outputs_cpu.get("filtered_dpu_cols_np")
+    if cur_pts is None or cur_cols is None:
+        cur_pts = outputs_cpu.get("filtered_points_np")
+        cur_cols = outputs_cpu.get("filtered_colors_np")
+    cur_pts, cur_cols = _sample_points_for_viewer(cur_pts, cur_cols, max_frame_points, frame_idx)
+    return {
+        "rgb_np":                    outputs_cpu.get("rgb_np"),
+        "depth_np":                  outputs_cpu.get("depth_np"),
+        "center_np":                 outputs_cpu.get("center_np"),
+        "viewer_current_points_np":  cur_pts,
+        "viewer_current_colors_np":  cur_cols,
+        "viewer_global_points_np":   global_pts,
+        "viewer_global_colors_np":   global_cols,
+    }
+
+
 def _save_frame_outputs(
     outputs_cpu: dict,
     out_cfg: dict,
@@ -1020,6 +1192,7 @@ def _save_frame_outputs(
             )
 
 
+# DEPRECATED: no longer called; kept for reference only
 def _save_global_points(
     pts_list: list,
     out_cfg: dict,
@@ -1178,6 +1351,7 @@ def _assemble_depth_video(out_dir: str, fps: int = 24) -> None:
         print(f"[LiveInferenceRunner] 深度视频合成失败: {exc2}", flush=True)
 
 
+# DEPRECATED: live/ duplicate writes removed; kept for reference only
 def _save_live_outputs(
     outputs_cpu: dict,
     out_cfg: dict,

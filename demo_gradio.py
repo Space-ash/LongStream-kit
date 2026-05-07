@@ -39,7 +39,7 @@ SAVE_OUTPUT_CHOICES = [
     ("视频 (save_videos)",                "save_videos"),
     ("深度图 (save_depth)",               "save_depth"),
     ("全局点云 (save_points)",            "save_points"),
-    ("逐帧点云 (save_frame_points)",      "save_frame_points"),
+    ("逐帧点云PLY (save_frame_points，不影响Rerun实时显示)", "save_frame_points"),
     ("保存 point_head 点云 (save_point_head)", "save_point_head"),
     ("保存 dpt_unproj 点云 (save_dpt_unproj)", "save_dpt_unproj"),
     ("天空遮罩 (mask_sky)",               "mask_sky"),
@@ -48,10 +48,8 @@ SAVE_OUTPUT_CHOICES = [
 _SAVE_LABEL_TO_KEY = {label: key for label, key in SAVE_OUTPUT_CHOICES}
 _SAVE_DEFAULT_LABELS = [
     "RGB 图片 (save_images)",
-    "视频 (save_videos)",
     "深度图 (save_depth)",
     "全局点云 (save_points)",
-    "逐帧点云 (save_frame_points)",
     "保存 dpt_unproj 点云 (save_dpt_unproj)",
 ]
 
@@ -457,14 +455,16 @@ def _start_runner(
                 viewer = RerunViewer(
                     confidence_threshold=float(confidence_threshold),
                     max_frame_points=min(int(max_frame_points), 8000),
-                    max_global_frame_points=20000,
-                    max_global_points=20000,
-                    rerun_global_update_interval=25,
+                    max_global_frame_points=None,
+                    rerun_global_update_interval=1,
+                    image_update_interval=1,
+                    depth_update_interval=1,
                     spawn=True,
                 )
                 viewer.init()
                 with _runner_lock:
                     _rerun_viewer = viewer
+                cfg["_enable_rerun"] = True
 
                 def on_frame_cb(frame_idx, outputs_cpu):
                     viewer.log_frame(frame_idx, outputs_cpu)

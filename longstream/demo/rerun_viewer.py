@@ -100,10 +100,14 @@ class RerunViewer:
         世界点云置信度过滤阈值（低于此值的点不推送）。
     max_frame_points : int | None
         每帧最多推送点数，避免 CPU/RAM 过载。None 表示不限。
-    max_global_points : int
-        全局累积点云的上限点数（CPU RAM 有界）。
+    max_global_frame_points : int | None
+        每帧全局点云最多推送点数（下采样到 viewer）。None 表示不限。
     rerun_global_update_interval : int
-        每多少帧更新一次全局点云（降低 Rerun 压力），默认 5。
+        每多少帧更新一次全局点云，默认 1。
+    image_update_interval : int
+        RGB 图像更新频率（帧），默认 1（每帧更新，播放速度由 data.fps 控制）。
+    depth_update_interval : int
+        深度图更新频率（帧），默认 1（每帧更新，播放速度由 data.fps 控制）。
     spawn : bool
         是否在 init() 时自动打开 Rerun Viewer 窗口（spawn=True）。
     """
@@ -113,9 +117,10 @@ class RerunViewer:
         app_name: str = "LongStream Live Reconstruction",
         confidence_threshold: float = 0.5,
         max_frame_points: Optional[int] = 8000,
-        max_global_frame_points: Optional[int] = 2000,
-        max_global_points: int = 100000,
-        rerun_global_update_interval: int = 5,
+        max_global_frame_points: Optional[int] = None,
+        rerun_global_update_interval: int = 1,
+        image_update_interval: int = 1,
+        depth_update_interval: int = 1,
         spawn: bool = True,
     ) -> None:
         if not _RERUN_AVAILABLE:
@@ -126,16 +131,13 @@ class RerunViewer:
         self.confidence_threshold = float(confidence_threshold)
         self.max_frame_points = max_frame_points
         self.max_global_frame_points = max_global_frame_points
-        self.max_global_points = int(max_global_points)
         self.rerun_global_update_interval = max(1, int(rerun_global_update_interval))
+        self.image_update_interval = max(1, int(image_update_interval))
+        self.depth_update_interval = max(1, int(depth_update_interval))
         self.spawn = spawn
         self._initialized = False
         # 轨迹缓冲（相机中心序列）
         self._centers: List[np.ndarray] = []
-        # 全局点云 CPU reservoir（有界，避免前端 VRAM 无限增长）
-        self._global_pts: Optional[np.ndarray] = None   # [N, 3] float32
-        self._global_cols: Optional[np.ndarray] = None  # [N, 3] uint8
-        self._global_rng = np.random.default_rng(seed=42)
 
     # ── 公开接口 ──────────────────────────────────────────────────────────
 
@@ -161,9 +163,6 @@ class RerunViewer:
             rr.init(self.app_name, recording_id=recording_id, spawn=self.spawn)
         self._initialized = True
         self._centers = []
-        self._global_pts = None
-        self._global_cols = None
-        self._global_rng = np.random.default_rng(seed=42)
         print(f"[RerunViewer] 已初始化: app_name={self.app_name!r}, recording_id={recording_id}", flush=True)
         print(
             "[RerunViewer] 注意：如需展示白色背景（论文截图风格），"
@@ -206,12 +205,14 @@ class RerunViewer:
         # ── RGB（左下面板）───────────────────────────────────────────────
         rgb_np: Optional[np.ndarray] = outputs_cpu.get("rgb_np")
         if rgb_np is not None and isinstance(rgb_np, np.ndarray):
-            rr.log("live/rgb", rr.Image(rgb_np))
+            if frame_idx % self.image_update_interval == 0:
+                rr.log("live/rgb", rr.Image(rgb_np))
 
-        # ── 深度图（右下面板）────────────────────────────────────────────
+        # ── 深度图（右下面板）────────────────────────────────────
         depth_np: Optional[np.ndarray] = outputs_cpu.get("depth_np")
         if depth_np is not None and isinstance(depth_np, np.ndarray):
-            rr.log("live/depth", rr.DepthImage(depth_np))
+            if frame_idx % self.depth_update_interval == 0:
+                rr.log("live/depth", rr.DepthImage(depth_np))
 
         # ── 相机位姿轨迹（全局面板）──────────────────────────────────────
         center_np: Optional[np.ndarray] = outputs_cpu.get("center_np")
@@ -236,38 +237,23 @@ class RerunViewer:
         # ── 当前帧 / 全局世界点云 ─────────────────────────────────────────
         # 优先使用 worker 侧已统一过滤的 filtered_points_np / filtered_colors_np
         # 与磁盘落盘保持完全一致（同一 _filter_points_colors 调用结果）
-        points_np: Optional[np.ndarray] = outputs_cpu.get("filtered_points_np")
-        colors_np: Optional[np.ndarray] = outputs_cpu.get("filtered_colors_np")
-
-        if points_np is None:
-            # fallback：worker 未注入预过滤结果时（旧版兼容），在 viewer 侧过滤
-            raw_pts = outputs_cpu.get("world_points_np")
-            conf_np = outputs_cpu.get("conf_np")
-            pre_colors = outputs_cpu.get("point_colors_np")
-            if raw_pts is not None and isinstance(raw_pts, np.ndarray):
-                orig_n = raw_pts.shape[0]
-                mask: Optional[np.ndarray] = None
-                if conf_np is not None and isinstance(conf_np, np.ndarray):
-                    if conf_np.shape[0] == orig_n:
-                        mask = conf_np >= self.confidence_threshold
-                        raw_pts = raw_pts[mask]
-                if pre_colors is not None and isinstance(pre_colors, np.ndarray):
-                    if mask is not None and len(pre_colors) == orig_n:
-                        colors_np = pre_colors[mask].astype(np.uint8)
-                    elif mask is None and len(pre_colors) == len(raw_pts):
-                        colors_np = pre_colors.astype(np.uint8)
-                points_np = raw_pts
-
-        # ── 当前帧候选：point_head → dpt_unproj（禁止无颜色点云）──────────────
-        cur_pts = outputs_cpu.get("filtered_points_np")
-        cur_cols = outputs_cpu.get("filtered_colors_np")
+        # ── 当前帧点云（来自 worker slim payload，已预采样）──────────────────
+        cur_pts = outputs_cpu.get("viewer_current_points_np")
+        cur_cols = outputs_cpu.get("viewer_current_colors_np")
+        # fallback for non-Rerun / compatibility paths
+        if cur_pts is None or cur_cols is None:
+            cur_pts = outputs_cpu.get("filtered_points_np")
+            cur_cols = outputs_cpu.get("filtered_colors_np")
         if cur_pts is None or cur_cols is None:
             cur_pts = outputs_cpu.get("filtered_dpu_pts_np")
             cur_cols = outputs_cpu.get("filtered_dpu_cols_np")
 
-        # ── 全局候选：dpt_unproj → point_head（禁止无颜色点云）───────────────
-        glb_pts = outputs_cpu.get("filtered_dpu_pts_np")
-        glb_cols = outputs_cpu.get("filtered_dpu_cols_np")
+        # ── 全局候选：优先用 worker reservoir 快照，回退至原始过滤数据 ──────────
+        glb_pts = outputs_cpu.get("viewer_global_points_np")
+        glb_cols = outputs_cpu.get("viewer_global_colors_np")
+        if glb_pts is None or glb_cols is None:
+            glb_pts = outputs_cpu.get("filtered_dpu_pts_np")
+            glb_cols = outputs_cpu.get("filtered_dpu_cols_np")
         if glb_pts is None or glb_cols is None:
             glb_pts = outputs_cpu.get("filtered_points_np")
             glb_cols = outputs_cpu.get("filtered_colors_np")
@@ -288,52 +274,28 @@ class RerunViewer:
                 ),
             )
 
-        # ── 右上：全局视图，使用 CPU reservoir 维护有界全局点云，固定路径避免 VRAM 爆炸 ──
+        # ── 右上：全局视图，直接使用 worker reservoir 快照，固定路径更新 ──
         if glb_pts is not None and glb_cols is not None and len(glb_pts) > 0:
-            # 确保为 numpy 而非 torch Tensor（防御性检查）
-            if not isinstance(glb_pts, np.ndarray):
-                glb_pts = np.asarray(glb_pts, dtype=np.float32)
-            if not isinstance(glb_cols, np.ndarray):
-                glb_cols = np.asarray(glb_cols, dtype=np.uint8)
-            # 追加到 CPU reservoir
-            if self._global_pts is None:
-                self._global_pts = glb_pts.astype(np.float32)
-                self._global_cols = glb_cols.astype(np.uint8)
-            else:
-                self._global_pts = np.concatenate([self._global_pts, glb_pts.astype(np.float32)], axis=0)
-                if self._global_cols is not None:
-                    self._global_cols = np.concatenate([self._global_cols, glb_cols.astype(np.uint8)], axis=0)
-            # 超出上限时随机下采样（保持有界）
-            if len(self._global_pts) > self.max_global_points * 2:
-                keep = self._global_rng.choice(len(self._global_pts), self.max_global_points, replace=False)
-                self._global_pts = self._global_pts[keep]
-                if self._global_cols is not None:
-                    self._global_cols = self._global_cols[keep]
-            # 每 rerun_global_update_interval 帧推送一次，降低 Rerun 压力
             if frame_idx % self.rerun_global_update_interval == 0:
-                send_pts = self._global_pts
-                send_cols = self._global_cols
+                send_pts = glb_pts
+                send_cols = glb_cols
                 if self.max_global_frame_points is not None and len(send_pts) > self.max_global_frame_points:
                     rng_g = np.random.default_rng(seed=frame_idx + 100000)
                     keep_g = rng_g.choice(len(send_pts), size=self.max_global_frame_points, replace=False)
                     send_pts = send_pts[keep_g]
                     send_cols = send_cols[keep_g] if send_cols is not None else None
-                points_archetype = rr.Points3D(
+                rr.log(
+                    "live/global/points",
+                    rr.Points3D(
                         send_pts,
                         colors=send_cols,
                         radii=np.full(len(send_pts), 0.008, dtype=np.float32),
-                    )
-                try:
-                    rr.log("live/global/points", points_archetype, static=True)
-                except TypeError:
-                    rr.log("live/global/points", points_archetype)
+                    ),
+                )
 
     def reset(self) -> None:
         """清除所有缓冲（新序列开始时调用）。"""
         self._centers = []
-        self._global_pts = None
-        self._global_cols = None
-        self._global_rng = np.random.default_rng(seed=42)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

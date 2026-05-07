@@ -98,17 +98,23 @@ optimizations:
 
 output:
   root: outputs/kitti_odometry_08/optimized
-  save_videos: true
+  save_videos: false
   save_images: true
   save_depth: true
   save_points: true
-  save_frame_points: true
+  save_frame_points: false
   save_point_head: false
   save_dpt_unproj: true
   mask_sky: true
   skyseg_path: model/skyseg.onnx
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000
+  rerun_current_points: 8000
+  rerun_global_points: 20000
+  rerun_global_ingest_points: 8000
+  live_global_checkpoint_interval: 0
+  torch_num_threads: 2
+  opencv_num_threads: 1
 
 evaluation:
   align_scale: true
