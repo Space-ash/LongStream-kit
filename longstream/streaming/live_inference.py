@@ -280,7 +280,14 @@ def _worker_inference_loop(
                     # 保留当前关键帧全局位姿作为新段 anchor，防止轨迹回原点
                     anchor_R = outputs_cpu.get("R_abs_np")
                     anchor_t = outputs_cpu.get("t_abs_np")
+                    # 先释放 GPU 输出 dict，再测量刷新前的干净基线
+                    del outputs
+                    outputs = None
+                    torch.cuda.empty_cache()
+                    _log_cuda_memory("before_refresh_clear", g)
                     session.clear_cache_only()
+                    torch.cuda.empty_cache()
+                    _log_cuda_memory("after_refresh_clear", g)
                     segment_start = g
                     if anchor_R is not None and anchor_t is not None:
                         seg_R_abs = {0: anchor_R.copy()}
@@ -293,15 +300,20 @@ def _worker_inference_loop(
                         1, 1, dtype=torch.long, device=device_str
                     )
                     anchor_frame = packet.image_tensor.to(device_str, non_blocking=True)
-                    session.forward_stream(
+                    anchor_outputs = session.forward_stream(
                         anchor_frame,
                         is_keyframe=is_keyframe_t,
                         keyframe_indices=anchor_kf_indices,
                         record=False,
                     )
+                    del anchor_outputs
                     del anchor_frame
+                    torch.cuda.empty_cache()
+                    _log_cuda_memory("after_anchor_refresh", g)
 
-            del outputs
+            if outputs is not None:
+                del outputs
+                outputs = None
             del frame_tensor
 
             # ── 统一过滤（一次计算，供磁盘保存 + Rerun 共用）────────────────
@@ -346,6 +358,10 @@ def _worker_inference_loop(
                 result_queue.put_nowait((g, outputs_cpu))
             except Exception:
                 pass
+
+            # ── 每 25 帧打印一次 VRAM 快照（方便定位长序列显存泵露）──
+            if g % 25 == 0:
+                _log_cuda_memory("live", g)
 
             # ── 增量保存到磁盘（使用预计算的 filtered_points_np，严禁 GPU Tensor）──
             _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g,
@@ -573,7 +589,7 @@ class LiveInferenceRunner:
         feeder 始终由子进程从 cfg["data"] 自行构建。
     """
 
-    _QUEUE_MAXSIZE = 30  # 结果队列上限；超过则丢弃最新帧
+    _QUEUE_MAXSIZE = 5   # 结果队列上限；超过则丢弃最新帧，减少共享内存压力
 
     def __init__(
         self,
@@ -1063,6 +1079,25 @@ def _assemble_video(out_dir: str, fps: int = 24) -> None:
         print(f"[LiveInferenceRunner] 视频已保存: {out_video}", flush=True)
     except Exception as exc2:
         print(f"[LiveInferenceRunner] 视频合成失败: {exc2}", flush=True)
+
+
+def _log_cuda_memory(prefix: str, frame_idx: int) -> None:
+    """Print a single-line VRAM snapshot (allocated / reserved / peak) for diagnostics."""
+    try:
+        import torch as _torch
+        if not _torch.cuda.is_available():
+            return
+        allocated    = _torch.cuda.memory_allocated()    / 1024 ** 3
+        reserved     = _torch.cuda.memory_reserved()     / 1024 ** 3
+        max_alloc    = _torch.cuda.max_memory_allocated() / 1024 ** 3
+        print(
+            f"[VRAM] {prefix} frame={frame_idx} "
+            f"allocated={allocated:.2f}GiB reserved={reserved:.2f}GiB "
+            f"peak={max_alloc:.2f}GiB",
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 def _assemble_depth_video(out_dir: str, fps: int = 24) -> None:

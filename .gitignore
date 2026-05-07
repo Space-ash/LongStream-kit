@@ -2,6 +2,7 @@
 
 # Local model
 model/
+KITTI_Odometry/
 
 # Python cache and build artifacts
 __pycache__/

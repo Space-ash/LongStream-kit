@@ -43,13 +43,20 @@ except ImportError:
 
 
 def _make_spatial3d_view(name: str, origin: str):
-    """Create Spatial3DView without background kwarg to avoid numpy-ABI BackgroundKindBatch warning.
-
-    Users can configure the theme (light / white) in the Rerun Viewer GUI:
-      Settings → Appearance → Theme → Light
-    """
+    """Create a Spatial3DView with white background; falls back gracefully on ABI mismatch."""
     import rerun.blueprint as rrb
-    return rrb.Spatial3DView(name=name, origin=origin)
+    try:
+        return rrb.Spatial3DView(name=name, origin=origin, background=[255, 255, 255])
+    except Exception as _bg_exc:
+        print(
+            f"[RerunViewer] 警告：白色背景设置失败（{_bg_exc}）。"
+            "需要对齐服务器环境中 numpy / pandas / rerun-sdk 的 ABI 版本，"
+            "建议重装 pandas 和 rerun-sdk（例如 pip install --force-reinstall pandas rerun-sdk），"
+            "或回退到当前环境兼容的 numpy 版本，而不是单独重装 numpy。"
+            "也可在 Rerun Viewer GUI 中选择 Settings → Appearance → Theme → Light。",
+            flush=True,
+        )
+        return rrb.Spatial3DView(name=name, origin=origin)
 
 
 def _make_blueprint():
@@ -64,7 +71,7 @@ def _make_blueprint():
         import rerun.blueprint as rrb
         blueprint = rrb.Blueprint(
             rrb.Grid(
-                _make_spatial3d_view("Current Frame",        "live/current"),
+                _make_spatial3d_view("Current Frame",        "live/current/points"),
                 _make_spatial3d_view("Global Reconstruction", "live/global"),
                 rrb.Spatial2DView(name="RGB",   origin="live/rgb"),
                 rrb.Spatial2DView(name="Depth", origin="live/depth"),
@@ -238,53 +245,51 @@ class RerunViewer:
                         colors_np = pre_colors.astype(np.uint8)
                 points_np = raw_pts
 
-        if points_np is not None and isinstance(points_np, np.ndarray) and len(points_np) > 0:
-            # 颜色缺失时跳过全部点云日志（当前帧 + 全局拼接），避免白点污染
-            if colors_np is None:
-                print(
-                    f"[RerunViewer] 帧 {frame_idx}: 点云颜色缺失，"
-                    "跳过点云显示（当前帧 + 全局拼接均跳过）。",
-                    flush=True,
-                )
-            else:
-                # ── 左上：当前帧点云（每帧覆盖同一路径），使用 point_head ──
-                cur_pts = points_np
-                cur_cols = colors_np
-                if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
-                    rng = np.random.default_rng(seed=frame_idx)
-                    keep = rng.choice(len(cur_pts), size=self.max_frame_points, replace=False)
-                    cur_pts = cur_pts[keep]
-                    cur_cols = cur_cols[keep]
-                rr.log(
-                    "live/current/points",
-                    rr.Points3D(
-                        cur_pts,
-                        colors=cur_cols,
-                        radii=np.full(len(cur_pts), 0.008, dtype=np.float32),
-                    ),
-                )
+        # ── 当前帧候选：point_head → dpt_unproj（禁止无颜色点云）──────────────
+        cur_pts = outputs_cpu.get("filtered_points_np")
+        cur_cols = outputs_cpu.get("filtered_colors_np")
+        if cur_pts is None or cur_cols is None:
+            cur_pts = outputs_cpu.get("filtered_dpu_pts_np")
+            cur_cols = outputs_cpu.get("filtered_dpu_cols_np")
 
-                # ── 右上：全局视图，优先 dpt_unproj，fallback 到 point_head ──
-                _glb_raw_pts = outputs_cpu.get("filtered_dpu_pts_np")
-                _glb_raw_cols = outputs_cpu.get("filtered_dpu_cols_np")
-                if _glb_raw_pts is None or len(_glb_raw_pts) == 0 or _glb_raw_cols is None:
-                    _glb_raw_pts = points_np
-                    _glb_raw_cols = colors_np
-                glb_pts = _glb_raw_pts
-                glb_cols = _glb_raw_cols
-                if self.max_global_frame_points is not None and len(glb_pts) > self.max_global_frame_points:
-                    rng_g = np.random.default_rng(seed=frame_idx + 100000)
-                    keep_g = rng_g.choice(len(glb_pts), size=self.max_global_frame_points, replace=False)
-                    glb_pts = glb_pts[keep_g]
-                    glb_cols = glb_cols[keep_g]
-                rr.log(
-                    f"live/global/points/frame_{frame_idx:06d}",
-                    rr.Points3D(
-                        glb_pts,
-                        colors=glb_cols,
-                        radii=np.full(len(glb_pts), 0.008, dtype=np.float32),
-                    ),
-                )
+        # ── 全局候选：dpt_unproj → point_head（禁止无颜色点云）───────────────
+        glb_pts = outputs_cpu.get("filtered_dpu_pts_np")
+        glb_cols = outputs_cpu.get("filtered_dpu_cols_np")
+        if glb_pts is None or glb_cols is None:
+            glb_pts = outputs_cpu.get("filtered_points_np")
+            glb_cols = outputs_cpu.get("filtered_colors_np")
+
+        # ── 左上：当前帧点云（每帧覆盖同一路径）──────────────────────────────
+        if cur_pts is not None and cur_cols is not None and len(cur_pts) > 0:
+            if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
+                rng = np.random.default_rng(seed=frame_idx)
+                keep = rng.choice(len(cur_pts), size=self.max_frame_points, replace=False)
+                cur_pts = cur_pts[keep]
+                cur_cols = cur_cols[keep]
+            rr.log(
+                "live/current/points",
+                rr.Points3D(
+                    cur_pts,
+                    colors=cur_cols,
+                    radii=np.full(len(cur_pts), 0.008, dtype=np.float32),
+                ),
+            )
+
+        # ── 右上：全局视图，每帧追加独立路径 ─────────────────────────────────
+        if glb_pts is not None and glb_cols is not None and len(glb_pts) > 0:
+            if self.max_global_frame_points is not None and len(glb_pts) > self.max_global_frame_points:
+                rng_g = np.random.default_rng(seed=frame_idx + 100000)
+                keep_g = rng_g.choice(len(glb_pts), size=self.max_global_frame_points, replace=False)
+                glb_pts = glb_pts[keep_g]
+                glb_cols = glb_cols[keep_g]
+            rr.log(
+                f"live/global/points/frame_{frame_idx:06d}",
+                rr.Points3D(
+                    glb_pts,
+                    colors=glb_cols,
+                    radii=np.full(len(glb_pts), 0.008, dtype=np.float32),
+                ),
+            )
 
     def reset(self) -> None:
         """清除所有缓冲（新序列开始时调用）。"""

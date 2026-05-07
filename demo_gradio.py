@@ -115,6 +115,7 @@ def _merge_basic_into_cfg(
     save_outputs: list,
     enable_rerun: bool,
     output_root: str = "",
+    streaming_mode: str = "causal",
 ) -> dict:
     """Apply UI leaf-values onto base cfg. Never modifies model/checkpoint keys."""
     cfg = copy.deepcopy(cfg)
@@ -129,6 +130,7 @@ def _merge_basic_into_cfg(
     cfg["inference"]["window_size"]     = int(window_size)
     cfg["inference"]["refresh"]         = int(refresh)
     cfg["inference"]["keyframe_stride"] = int(keyframe_stride)
+    cfg["inference"]["streaming_mode"]  = str(streaming_mode)
     cfg["inference"]["mode"] = (
         "streaming_refresh" if simulate_streaming else "batch_refresh"
     )
@@ -215,14 +217,15 @@ _ADVANCED_YAML_PLACEHOLDER = (
 def update_ui_from_yaml(template_name: str) -> tuple:
     """
     Load template YAML and refresh bound UI components.
-    Returns 22 values:
+    Returns 24 values:
       window_size, refresh, keyframe_stride, confidence_threshold,
       max_frame_points, max_full_points,
       enable_tto, enable_filter, enable_conf_filter,
       save_outputs, target_fps, simulate_streaming, enable_rerun,
       cfg_state (new base dict), config_preview,
       output_root, source_path, data_roots_file, seq_list, camera,
-      source_type (dropdown label), generalizable_row (visibility update)
+      source_type (dropdown label), generalizable_row (visibility update),
+      streaming_mode, streaming_mode_warning (visibility)
     advanced_yaml is NOT updated here — it remains the user's override box.
     """
     if template_name == "Custom":
@@ -230,7 +233,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         # 文件不存在时 no-op（用户手动改参数后自动切到 Custom，保持当前值）
         custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
         if not os.path.isfile(custom_path):
-            return tuple(gr.update() for _ in range(22))
+            return tuple(gr.update() for _ in range(24))
         # fall through: load custom_infer.yaml like any other template
 
     cfg   = _load_template(template_name)
@@ -275,6 +278,8 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         gr.update(value=str(data.get("camera", "00"))),      # 20 camera
         gr.update(value=source_label),                       # 21 source_type dropdown
         gr.update(visible=is_gen),                           # 22 generalizable_row
+        gr.update(value=infer.get("streaming_mode", "causal")),  # 23 streaming_mode
+        gr.update(visible=(infer.get("streaming_mode", "causal") == "causal")),  # 24 streaming_mode_warning
     )
 
 
@@ -304,6 +309,7 @@ def _build_cfg_from_ui(
     data_roots_file: str = "data_roots.txt",
     seq_list: str = "",
     camera: str = "00",
+    streaming_mode: str = "causal",
 ) -> dict:
     """Build complete cfg from UI values using base_cfg (from cfg_state) as the foundation.
 
@@ -326,6 +332,7 @@ def _build_cfg_from_ui(
         enable_conf_filter=enable_conf_filter,
         save_outputs=save_outputs, enable_rerun=enable_rerun,
         output_root=output_root,
+        streaming_mode=streaming_mode,
     )
     # 3. UI 可见路径字段最终优先（覆盖 advanced 里可能有的 data.*）
     cfg.setdefault("data", {})
@@ -386,6 +393,7 @@ def _start_runner(
     data_roots_file: str = "data_roots.txt",
     seq_list: str = "",
     camera: str = "00",
+    streaming_mode: str = "causal",
 ) -> tuple:
     global _active_runner, _rerun_viewer
 
@@ -407,6 +415,7 @@ def _start_runner(
         data_roots_file=data_roots_file,
         seq_list=seq_list,
         camera=camera,
+        streaming_mode=streaming_mode,
     )
 
     if simulate_streaming:
@@ -421,7 +430,7 @@ def _start_runner(
                 from longstream.demo.rerun_viewer import RerunViewer
                 viewer = RerunViewer(
                     confidence_threshold=float(confidence_threshold),
-                    max_frame_points=int(max_frame_points),
+                    max_frame_points=min(int(max_frame_points), 8000),
                     max_global_frame_points=2000,
                     spawn=True,
                 )
@@ -523,6 +532,7 @@ def save_custom_config(
     data_roots_file: str = "data_roots.txt",
     seq_list: str = "",
     camera: str = "00",
+    streaming_mode: str = "causal",
 ) -> tuple:
     """Save current UI params to custom_infer.yaml. Returns (path, Custom dropdown update, new cfg_state)."""
     cfg = _build_cfg_from_ui(
@@ -536,6 +546,7 @@ def save_custom_config(
         data_roots_file=data_roots_file,
         seq_list=seq_list,
         camera=camera,
+        streaming_mode=streaming_mode,
     )
     custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
     os.makedirs(_CONFIGS_DIR, exist_ok=True)
@@ -680,6 +691,17 @@ def main():
                 value=_SAVE_DEFAULT_LABELS,
             )
 
+            streaming_mode = gr.Radio(
+                label="流式注意力模式 (inference.streaming_mode)",
+                choices=["causal", "window"],
+                value=_initial_cfg.get("inference", {}).get("streaming_mode", "causal"),
+            )
+            streaming_mode_warning = gr.Markdown(
+                "⚠️ causal 模式与 run.py 默认管线更一致，但长序列显存压力更高；"
+                "如果 3090 长序列崩溃，可切换 window 做稳定性对照实验。",
+                visible=(_initial_cfg.get("inference", {}).get("streaming_mode", "causal") == "causal"),
+            )
+
         # ─── Advanced config ───────────────────────────────────────────
         with gr.Accordion("高级配置（YAML/JSON 额外覆盖）", open=False):
             gr.Markdown(
@@ -725,7 +747,7 @@ def main():
         status_timer.tick(fn=_check_status, outputs=[status_box])
 
         # ─── Template sync ─────────────────────────────────────────────
-        # update_ui_from_yaml returns 22 values.
+        # update_ui_from_yaml returns 24 values.
         # advanced_yaml is intentionally NOT in this output list.
         _template_sync_outputs = [
             window_size, refresh, keyframe_stride,       # 1-3
@@ -744,6 +766,8 @@ def main():
             camera,                                      # 20
             source_type,                                 # 21
             generalizable_row,                           # 22
+            streaming_mode,                              # 23
+            streaming_mode_warning,                      # 24
         ]
         # 使用 .input() 而非 .change()：
         # .input() 仅在用户直接点击 Dropdown 时触发；
@@ -753,6 +777,16 @@ def main():
             fn=update_ui_from_yaml,
             inputs=[template_name],
             outputs=_template_sync_outputs,
+        )
+
+        # ─── streaming_mode 切换提示 Markdown 可见性 ────────────────────
+        def _update_streaming_mode_warning(mode):
+            return gr.update(visible=(mode == "causal"))
+
+        streaming_mode.change(
+            fn=_update_streaming_mode_warning,
+            inputs=[streaming_mode],
+            outputs=[streaming_mode_warning],
         )
 
         # ─── source_type change: show/hide generalizable fields ────────
@@ -782,9 +816,9 @@ def main():
                       enable_conf_filter, enable_rerun, save_outputs]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
-        # Textbox / Dropdown / Code: use .input()
+        # Textbox / Dropdown / Code / Radio: use .input()
         for _comp in [source_type, source_path, advanced_yaml,
-                      output_root, data_roots_file, seq_list, camera]:
+                      output_root, data_roots_file, seq_list, camera, streaming_mode]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # ─── Shared input list (cfg_state replaces template_name) ─────
@@ -796,6 +830,7 @@ def main():
             enable_tto, enable_filter, enable_conf_filter,
             save_outputs, enable_rerun, advanced_yaml,
             output_root, data_roots_file, seq_list, camera,
+            streaming_mode,
         ]
 
         # ─── Button events ─────────────────────────────────────────────
