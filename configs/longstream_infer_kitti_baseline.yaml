@@ -1,14 +1,12 @@
-﻿# LongStream 推理配置：KITTI Odometry Seq 08 (Optimized)
+﻿# LongStream 推理配置：KITTI Odometry Baseline
 #
-# 数据来源：KITTI Odometry sequence 08（城市场景，4071 帧）
-# 预处理：bash prepare_kitti_odometry.sh
+# 数据来源：KITTI Odometry sequence 05（城市场景）
+# 预处理：bash prepare_kitti_odometry.sh  （需提前准备 velodyne + calib_velo_to_cam.txt）
 #
-# 注意：
-#   - 当前数据无 GT depth，depth/pointcloud GT 相关指标不可用
-#   - 可用指标：ATE、位姿轨迹误差（pose/ATE 系列）
+# 用途：基础验证，关闭 TTO 与筛帧，仅用基础重建流程，与 optimized 对照。
 #
 # Smoke test（前 100 帧快速验证）：
-#   将 data.max_frames 设为 100，运行后查看 outputs/kitti_odometry_08/optimized/
+#   将 data.max_frames 设为 100
 
 device: cuda
 
@@ -77,28 +75,21 @@ data:
   patch_size: 14
   gt_source: auto
   gt_poses_file: gt_poses.npy
-  depth_gt_type: auto   # auto: 自动读取 depth_meta.json；无文件时当 dense（vKITTI2 兼容）
+  depth_gt_type: auto     # auto: 自动读取 depth_meta.json；无文件时当 dense
 
 optimizations:
   filter:
     frame_filter_enabled: false
-    confidence_filter_enabled: true
+    confidence_filter_enabled: false
     blur_threshold: 100.0
     motion_threshold: 0.02
     confidence_threshold: 0.5
     save_frame_index_map: false
   correction:
-    tto_enabled: true
-    tto_steps: 20
-    tto_lr: 1.0e-3
-    tto_weight_decay: 0.0
-    tto_window_size: 40
-    tto_min_gps_disp: 1.0
-    tto_max_grad_norm: 1.0
-    tto_pair_stride: 8
+    tto_enabled: false    # baseline: 关闭 TTO
 
 output:
-  root: outputs/kitti_odometry_05/optimized
+  root: outputs/kitti_odometry_05/baseline
   save_videos: false
   save_images: true
   save_depth: true
@@ -116,7 +107,6 @@ output:
   max_frame_pointcloud_points: 200000
   rerun_current_points: 8000
   rerun_global_points: 30000
-  # rerun_global_ingest_points 已废弃（独立 viewer reservoir 已删除）
   rerun_view_coordinates: RIGHT_HAND_Z_UP
   live_global_checkpoint_interval: 0
   torch_num_threads: 2
@@ -129,17 +119,7 @@ evaluation:
   point_eval_max_points: 100000
   point_eval_voxel_size: null
   point_eval_oversample_factor: 4
-  # 稀疏 LiDAR GT 策略：仅计算 GT->pred 推断 recall，不计算对称 Chamfer/F1
+  # 稀疏 LiDAR GT 策略：仅计算 GT->pred recall，不计算对称 Chamfer/F1
   sparse_depth_pointcloud_policy: recall_only
-  # true 时复用对称 Chamfer/F1 并写入 warning（不建议）
   allow_sparse_chamfer_f1: false
-  # 少于此像素数时跳过深度指标
   min_valid_depth_pixels: 1
-
-monitoring:
-  enabled: true
-  interval_sec: 2.0
-  top_process_count: 10
-  write_process_top: true
-  write_cpu_timeseries: true
-  write_gpu_timeseries: true

@@ -131,6 +131,107 @@ def parse_kitti_calib(calib_path: str) -> Dict[str, np.ndarray]:
     return result
 
 
+def parse_kitti_raw_calib(path: str) -> Dict[str, np.ndarray]:
+    """
+    解析 KITTI 官方 raw 标定文件（calib_velo_to_cam.txt / calib_cam_to_cam.txt 等）。
+
+    与 calib.txt 的区别：
+      - 跳过 calib_time 等非数值行（try-except float 转换失败）
+      - 支持任意长度数值行；3 值 -> (3,)，9 值 -> (3,3)，12 值 -> (3,4)，其余保留原形
+
+    若文件不存在则静默返回空字典，由调用方决定如何处理缺失标定。
+    """
+    result: Dict[str, np.ndarray] = {}
+    if not path or not os.path.isfile(path):
+        return result
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            key, vals = line.split(":", 1)
+            key = key.strip()
+            try:
+                arr = np.array([float(x) for x in vals.split()], dtype=np.float64)
+            except ValueError:
+                continue   # 跳过 calib_time 等文本行
+            if arr.size == 0:
+                continue
+            if arr.size == 12:
+                result[key] = arr.reshape(3, 4)
+            elif arr.size == 9:
+                result[key] = arr.reshape(3, 3)
+            elif arr.size == 3:
+                result[key] = arr.reshape(3)
+            else:
+                result[key] = arr
+    return result
+
+
+def load_kitti_calibration(
+    seq_dir: str,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, str]]:
+    """
+    加载序列标定参数，自动合并 calib.txt 与官方 raw 标定文件。
+
+    查找顺序：
+      1. <seq_dir>/calib.txt              — 必须存在，包含 P0-P3（及可选 Tr/R0_rect）
+      2. <seq_dir>/calib_velo_to_cam.txt  — 若存在，从 R/T 合成 Tr_velo_to_cam
+      3. <seq_dir>/calib_cam_to_cam.txt   — 若存在，从 R_rect_00 填充 R0_rect
+      4. <seq_dir>/calib_imu_to_velo.txt  — 若存在，合并（备用）
+
+    返回
+    -----
+    calib        : Dict[str, np.ndarray]
+        合并后的标定字典，key 含 P0-P3、Tr_velo_to_cam（若可解析）、R0_rect（若可解析）
+    calib_sources: Dict[str, str]
+        各关键外参的来源描述，用于写入 depth_meta.json 的 calibration_source 字段
+    """
+    calib_file = os.path.join(seq_dir, "calib.txt")
+    calib = parse_kitti_calib(calib_file)
+    calib_sources: Dict[str, str] = {}
+
+    cam_to_cam_path  = os.path.join(seq_dir, "calib_cam_to_cam.txt")
+    velo_to_cam_path = os.path.join(seq_dir, "calib_velo_to_cam.txt")
+    imu_to_velo_path = os.path.join(seq_dir, "calib_imu_to_velo.txt")
+
+    cam_to_cam  = parse_kitti_raw_calib(cam_to_cam_path)
+    velo_to_cam = parse_kitti_raw_calib(velo_to_cam_path)
+    imu_to_velo = parse_kitti_raw_calib(imu_to_velo_path)
+
+    # 将 raw 标定项以带前缀的 key 写入 calib，避免与 calib.txt 原有 key 冲突
+    calib.update({f"cam_to_cam.{k}": v for k, v in cam_to_cam.items()})
+    calib.update({f"velo_to_cam.{k}": v for k, v in velo_to_cam.items()})
+    calib.update({f"imu_to_velo.{k}": v for k, v in imu_to_velo.items()})
+
+    # 合成标准 Tr_velo_to_cam（若 calib.txt 无，但 calib_velo_to_cam.txt 有 R/T）
+    if "Tr_velo_to_cam" not in calib and "Tr" not in calib:
+        if "velo_to_cam.R" in calib and "velo_to_cam.T" in calib:
+            Tr = np.zeros((3, 4), dtype=np.float64)
+            Tr[:3, :3] = calib["velo_to_cam.R"].reshape(3, 3)
+            Tr[:3, 3]  = calib["velo_to_cam.T"].reshape(3)
+            calib["Tr_velo_to_cam"] = Tr
+            calib_sources["velo_to_cam"] = "calib_velo_to_cam.txt:R/T"
+    elif "Tr_velo_to_cam" in calib:
+        calib_sources["velo_to_cam"] = "calib.txt:Tr_velo_to_cam"
+    elif "Tr" in calib:
+        calib_sources["velo_to_cam"] = "calib.txt:Tr"
+
+    # 合成标准 R0_rect（若 calib.txt 无，但 calib_cam_to_cam.txt 有 R_rect_00）
+    if "R0_rect" not in calib and "R_rect" not in calib:
+        if "cam_to_cam.R_rect_00" in calib:
+            calib["R0_rect"] = np.asarray(
+                calib["cam_to_cam.R_rect_00"], dtype=np.float64
+            ).reshape(3, 3)
+            calib_sources["rectification"] = "calib_cam_to_cam.txt:R_rect_00"
+    elif "R0_rect" in calib:
+        calib_sources["rectification"] = "calib.txt:R0_rect"
+    elif "R_rect" in calib:
+        calib_sources["rectification"] = "calib.txt:R_rect"
+
+    return calib, calib_sources
+
+
 # ------------------------------------------------------------------ #
 # LiDAR 辅助函数
 # ------------------------------------------------------------------ #
@@ -171,8 +272,11 @@ def resolve_velodyne_to_rect_cam0(calib: Dict[str, np.ndarray]) -> np.ndarray:
         tr = calib.get("Tr")
     if tr is None:
         raise KeyError(
-            "[kitti_odometry] calib.txt 中未找到 Tr_velo_to_cam 或 Tr，"
-            "无法投影 LiDAR 点云。若该序列无 velodyne 外参，请显式设置 --depth_mode none。"
+            "[kitti_odometry] calib 中未找到 LiDAR 外参（Tr_velo_to_cam / Tr）。\n"
+            "  calib.txt 可能只包含 P0-P3，需要以下任一方式提供 LiDAR 外参：\n"
+            "  1. 在 calib.txt 同级目录放置 calib_velo_to_cam.txt（包含 R 和 T）\n"
+            "  2. 在 calib.txt 中直接写入 Tr_velo_to_cam 或 Tr 行\n"
+            "  3. 若该序列确实无 LiDAR，请显式设置 --depth_mode none"
         )
     Tr_4x4 = make_4x4(tr)
     r0 = calib.get("R0_rect")
@@ -374,26 +478,38 @@ def _process_lidar_depths(
     save_depth_mask: bool,
     overwrite_depths: bool,
     num_workers: int,
+    calib_sources: Optional[Dict[str, str]] = None,
+    allow_missing_lidar_calib: bool = False,
 ) -> None:
     """
     投影 velodyne 点云到相机视平面，保存稀疏深度图（float32 EXR）。
 
     输出：
       <scene_out>/depths/<camera_out>/<stem>.exr   — 与 images/<camera>/<stem>.png 同名
-      <scene_out>/depth_meta.json                  — 描述稀疏 GT 属性
+      <scene_out>/depth_meta.json                  — 描述稀疏 GT 属性（含标定来源）
       <scene_out>/depth_masks/<camera_out>/<stem>.png（可选，当 save_depth_mask=True）
     """
     import concurrent.futures
 
     velo_dir = os.path.join(seq_dir, "velodyne")
     if not os.path.isdir(velo_dir):
-        raise FileNotFoundError(
+        msg = (
             f"[kitti_odometry] velodyne 目录不存在: {velo_dir}\n"
             f"  若该序列无 LiDAR 数据，请显式设置 --depth_mode none。"
         )
+        if allow_missing_lidar_calib:
+            log(f"[kitti_odometry] seq {seq}: WARN: {msg.splitlines()[0]}，跳过深度投影。")
+            return
+        raise FileNotFoundError(msg)
 
     # 解析 LiDAR -> rectified cam0 变换（此处会检查 Tr 是否存在）
-    T_rect0_velo = resolve_velodyne_to_rect_cam0(calib)
+    try:
+        T_rect0_velo = resolve_velodyne_to_rect_cam0(calib)
+    except KeyError as exc:
+        if allow_missing_lidar_calib:
+            log(f"[kitti_odometry] seq {seq}: WARN: {exc}，跳过深度投影。")
+            return
+        raise
 
     depth_out_dir = os.path.join(scene_out, "depths", camera_out)
     os.makedirs(depth_out_dir, exist_ok=True)
@@ -454,7 +570,7 @@ def _process_lidar_depths(
                 log(f"[kitti_odometry] seq {seq}: depth {i + 1}/{N}")
 
     # 写 depth_meta.json
-    meta = {
+    meta: Dict = {
         "depth_gt_type": "sparse_lidar",
         "source": "KITTI Odometry velodyne",
         "invalid_value": 0.0,
@@ -463,6 +579,8 @@ def _process_lidar_depths(
         "max_depth": max_depth,
         "metric_scope": "valid_lidar_projected_pixels_only",
     }
+    if calib_sources:
+        meta["calibration_source"] = calib_sources
     meta_path = os.path.join(scene_out, "depth_meta.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
@@ -487,6 +605,7 @@ def process_sequence(
     save_depth_mask: bool = False,
     overwrite_depths: bool = False,
     num_workers: int = 1,
+    allow_missing_lidar_calib: bool = False,
 ) -> None:
     """
     将 KITTI Odometry 中的一个 sequence 转换为 generalizable 格式。
@@ -518,6 +637,10 @@ def process_sequence(
         True 表示强制重写已存在的 EXR 文件。
     num_workers : int
         深度投影的并行线程数。
+    allow_missing_lidar_calib : bool
+        True 表示当缺少 velodyne/ 或 LiDAR 外参时仅输出 WARNING、跳过深度生成，
+        而不中断预处理（适用于混有缺己 LiDAR 的序列批）。
+        默认 False（fail fast）。
     """
     # camera_out：两位补零形式，用于输出目录 images/<camera_out>、cameras/<camera_out>
     camera_out = str(camera).zfill(2)       # e.g. "02"
@@ -549,8 +672,8 @@ def process_sequence(
             + ", ".join(_img_dir_candidates)
         )
 
-    # ------ 加载 calib ------
-    calib = parse_kitti_calib(calib_file)
+    # ------ 加载 calib：自动合并 calib.txt 与周边 raw 标定文件 ------
+    calib, calib_sources = load_kitti_calibration(seq_dir)
     p_key = f"P{camera_idx}"  # KITTI calib 使用 P0/P1/P2/P3（无前导零）
     if p_key not in calib:
         raise KeyError(f"[kitti_odometry] {p_key} not found in calib.txt of seq {seq}")
@@ -652,6 +775,8 @@ def process_sequence(
 
     # ------ 离线 LiDAR 深度投影 ------
     if depth_mode == "sparse_lidar":
+        # 将相机的投影矩阵来源写入标定信息
+        calib_sources["projection"] = f"calib.txt:P{camera_idx}"
         _process_lidar_depths(
             kitti_root=kitti_root,
             seq=seq,
@@ -669,6 +794,8 @@ def process_sequence(
             save_depth_mask=save_depth_mask,
             overwrite_depths=overwrite_depths,
             num_workers=num_workers,
+            calib_sources=calib_sources,
+            allow_missing_lidar_calib=allow_missing_lidar_calib,
         )
     elif depth_mode == "none":
         log(f"[kitti_odometry] seq {seq}: depth_mode=none，跳过 LiDAR 深度投影。")
@@ -752,6 +879,14 @@ def main() -> None:
         default=1,
         help="深度投影的并行线程数，默认 1（串行）。",
     )
+    parser.add_argument(
+        "--allow_missing_lidar_calib",
+        action="store_true",
+        help=(
+            "当 velodyne/ 目录或 LiDAR 外参缺失时，仅输出 WARNING 并跳过深度生成，"
+            "不中断预处理。默认为严格模式（fail fast）。"
+        ),
+    )
     args = parser.parse_args()
 
     kitti_root = os.path.abspath(args.kitti_root)
@@ -771,6 +906,7 @@ def main() -> None:
             save_depth_mask=args.save_depth_mask,
             overwrite_depths=args.overwrite_depths,
             num_workers=args.num_workers,
+            allow_missing_lidar_calib=args.allow_missing_lidar_calib,
         )
 
     # 写 data_roots.txt

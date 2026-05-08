@@ -48,6 +48,7 @@ MAX_DEPTH="${MAX_DEPTH:-80.0}"
 SAVE_DEPTH_MASK="${SAVE_DEPTH_MASK:-0}"
 OVERWRITE_DEPTHS="${OVERWRITE_DEPTHS:-0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+ALLOW_MISSING_LIDAR_CALIB="${ALLOW_MISSING_LIDAR_CALIB:-0}"
 
 echo "[prepare-kitti-odometry] root_dir=$ROOT_DIR"
 echo "[prepare-kitti-odometry] kitti_root=$KITTI_ROOT"
@@ -78,15 +79,33 @@ if [[ ! -d "$KITTI_ROOT/poses" ]]; then
 fi
 
 # ------------------------------------------------------------------
-# 深度模式预检查：若 DEPTH_MODE=sparse_lidar，提前检查 velodyne/ 是否存在
+# 深度模式预检查：若 DEPTH_MODE=sparse_lidar，提前检查 velodyne/ 和 LiDAR 外参覆盖
 # ------------------------------------------------------------------
 if [[ "$DEPTH_MODE" == "sparse_lidar" ]]; then
   for SEQ in $SEQS; do
-    VELO_DIR="$KITTI_ROOT/sequences/$SEQ/velodyne"
+    SEQ_DIR="$KITTI_ROOT/sequences/$SEQ"
+    VELO_DIR="$SEQ_DIR/velodyne"
     if [[ ! -d "$VELO_DIR" ]]; then
       echo "[prepare-kitti-odometry] error: DEPTH_MODE=sparse_lidar 但 velodyne 目录不存在: $VELO_DIR" >&2
       echo "  若该序列无 LiDAR 数据，请显式设置: DEPTH_MODE=none bash prepare_kitti_odometry.sh" >&2
       exit 1
+    fi
+    # 检查 LiDAR 外参覆盖：calib.txt 有 Tr/Tr_velo_to_cam 或同目录有 calib_velo_to_cam.txt
+    CALIB_TXT="$SEQ_DIR/calib.txt"
+    VELO_CALIB="$SEQ_DIR/calib_velo_to_cam.txt"
+    HAS_TR=$(grep -E "^(Tr|Tr_velo_to_cam):" "$CALIB_TXT" 2>/dev/null | head -1)
+    if [[ -z "$HAS_TR" && ! -f "$VELO_CALIB" ]]; then
+      echo "[prepare-kitti-odometry] error: seq $SEQ 缺少 LiDAR 外参标定文件。" >&2
+      echo "  calib.txt only contains P0-P3." >&2
+      echo "  Need calib_velo_to_cam.txt with R/T, or Tr/Tr_velo_to_cam in calib.txt." >&2
+      echo "  Expected files are in the same directory as calib.txt: $SEQ_DIR" >&2
+      echo "  Or set DEPTH_MODE=none to skip LiDAR depth." >&2
+      exit 1
+    fi
+    # 建议（不强制）存在 calib_cam_to_cam.txt，用于 R_rect_00
+    CAM_CALIB="$SEQ_DIR/calib_cam_to_cam.txt"
+    if [[ ! -f "$CAM_CALIB" ]]; then
+      echo "[prepare-kitti-odometry] WARN: seq $SEQ 缺少 $CAM_CALIB，R_rect_00 将用单位阵 I 代替。" >&2
     fi
   done
 fi
@@ -107,6 +126,9 @@ if [[ "$SAVE_DEPTH_MASK" == "1" ]]; then
 fi
 if [[ "$OVERWRITE_DEPTHS" == "1" ]]; then
   DEPTH_EXTRA_ARGS="$DEPTH_EXTRA_ARGS --overwrite_depths"
+fi
+if [[ "$ALLOW_MISSING_LIDAR_CALIB" == "1" ]]; then
+  DEPTH_EXTRA_ARGS="$DEPTH_EXTRA_ARGS --allow_missing_lidar_calib"
 fi
 
 # shellcheck disable=SC2086

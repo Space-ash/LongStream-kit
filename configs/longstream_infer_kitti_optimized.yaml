@@ -1,6 +1,6 @@
-﻿# LongStream 推理配置：KITTI Odometry Seq 08 (Optimized)
+﻿# LongStream 推理配置：KITTI Odometry Seq 05 (Optimized)
 #
-# 数据来源：KITTI Odometry sequence 08（城市场景，4071 帧）
+# 数据来源：KITTI Odometry sequence 05
 # 预处理：bash prepare_kitti_odometry.sh
 #
 # 注意：
@@ -8,7 +8,7 @@
 #   - 可用指标：ATE、位姿轨迹误差（pose/ATE 系列）
 #
 # Smoke test（前 100 帧快速验证）：
-#   将 data.max_frames 设为 100，运行后查看 outputs/kitti_odometry_08/optimized/
+#   将 data.max_frames 设为 100，运行后查看 outputs/kitti_odometry_05/optimized/
 
 device: cuda
 
@@ -68,10 +68,10 @@ data:
   format: generalizable
   data_roots_file: data_roots.txt
   img_path: prepared_inputs/kitti_odometry
-  seq_list: ["05"]
+  seq_list: ["05"]       # 选择场景
   camera: "02"
   stride: 1
-  max_frames: null        # 改为 100 可进行 smoke test
+  max_frames: 200        # 改为 100 可进行 smoke test
   size: 518
   crop: false
   patch_size: 14
