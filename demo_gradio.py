@@ -29,9 +29,12 @@ import yaml
 # ─── Config template paths ────────────────────────────────────────────────
 _CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "configs")
 _TEMPLATE_PATHS = {
-    "optimized": os.path.join(_CONFIGS_DIR, "longstream_infer_optimized.yaml"),
-    "baseline":  os.path.join(_CONFIGS_DIR, "longstream_infer_baseline.yaml"),
+    "kitti_optimized":   os.path.join(_CONFIGS_DIR, "longstream_infer_kitti_optimized.yaml"),
+    "kitti_baseline":    os.path.join(_CONFIGS_DIR, "longstream_infer_kitti_baseline.yaml"),
+    "vkitti2_optimized": os.path.join(_CONFIGS_DIR, "longstream_infer_optimized.yaml"),
+    "vkitti2_baseline":  os.path.join(_CONFIGS_DIR, "longstream_infer_baseline.yaml"),
 }
+_DEFAULT_TEMPLATE = "kitti_optimized"
 
 # ─── Save-output choices (label -> YAML key) ─────────────────────────────
 SAVE_OUTPUT_CHOICES = [
@@ -43,7 +46,6 @@ SAVE_OUTPUT_CHOICES = [
     ("逐帧点云PLY (save_frame_points，不影响Rerun实时显示)", "save_frame_points"),
     ("保存 point_head 点云 (save_point_head)", "save_point_head"),
     ("保存 dpt_unproj 点云 (save_dpt_unproj)", "save_dpt_unproj"),
-    ("启用天空过滤 (enable_sky_mask)",  "enable_sky_mask"),
     ("保存天空遮罩PNG (save_sky_mask)",   "save_sky_mask"),
     ("GLB 导出 (export_glb)",             "export_glb"),
 ]
@@ -53,7 +55,6 @@ _SAVE_DEFAULT_LABELS = [
     "深度图.npy (save_depth)",
     "全局点云 (save_points)",
     "保存 dpt_unproj 点云 (save_dpt_unproj)",
-    "启用天空过滤 (enable_sky_mask)",
 ]
 
 # ─── Input type mapping ───────────────────────────────────────────────────
@@ -94,7 +95,7 @@ def _load_template(template_name: str) -> dict:
             with open(custom_path, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
         return {}
-    path = _TEMPLATE_PATHS.get(template_name, _TEMPLATE_PATHS["optimized"])
+    path = _TEMPLATE_PATHS.get(template_name, _TEMPLATE_PATHS[_DEFAULT_TEMPLATE])
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
@@ -106,11 +107,6 @@ def _cfg_to_save_output_labels(cfg: dict) -> list:
         if key in ("save_point_head", "save_dpt_unproj"):
             # 若模板中未显式设置，以 save_points 总开关为默认值，避免切换后全关
             enabled = bool(out.get(key, out.get("save_points", False)))
-        elif key == "enable_sky_mask":
-            # 向后兼容旧 YAML：mask_sky 同时控制 enable_sky_mask
-            enabled = bool(out.get("enable_sky_mask", out.get("mask_sky", False)))
-        elif key == "save_sky_mask":
-            enabled = bool(out.get("save_sky_mask", False))
         else:
             enabled = bool(out.get(key, False))
         if enabled:
@@ -131,6 +127,7 @@ def _merge_basic_into_cfg(
     enable_tto: bool,
     enable_filter: bool,
     enable_conf_filter: bool,
+    enable_sky_mask: bool,
     save_outputs: list,
     enable_rerun: bool,
     output_root: str = "",
@@ -176,8 +173,9 @@ def _merge_basic_into_cfg(
     for std_key in ["save_images", "save_videos", "save_depth", "save_depth_vis",
                     "save_points", "save_frame_points",
                     "save_point_head", "save_dpt_unproj",
-                    "enable_sky_mask", "save_sky_mask"]:
+                    "save_sky_mask"]:
         cfg["output"][std_key] = std_key in selected_keys
+    cfg["output"]["enable_sky_mask"] = bool(enable_sky_mask)
     cfg["output"]["export_glb"]                   = "export_glb" in selected_keys
     cfg["output"]["max_frame_pointcloud_points"]  = int(max_frame_points)
     cfg["output"]["max_full_pointcloud_points"]   = int(max_full_points)
@@ -246,7 +244,7 @@ _ADVANCED_YAML_PLACEHOLDER = (
 def update_ui_from_yaml(template_name: str) -> tuple:
     """
     Load template YAML and refresh bound UI components.
-    Returns 26 values:
+    Returns 27 values:
       window_size, refresh, keyframe_stride, confidence_threshold,
       max_frame_points, max_full_points,
       enable_tto, enable_filter, enable_conf_filter,
@@ -255,7 +253,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
       output_root, source_path, data_roots_file, seq_list, camera,
       source_type (dropdown label), generalizable_row (visibility update),
       streaming_mode, streaming_mode_warning (visibility),
-      max_frames, enable_monitoring
+      max_frames, enable_monitoring, enable_sky_mask
     advanced_yaml is NOT updated here — it remains the user's override box.
     """
     if template_name == "Custom":
@@ -263,7 +261,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         # 文件不存在时 no-op（用户手动改参数后自动切到 Custom，保持当前值）
         custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
         if not os.path.isfile(custom_path):
-            return tuple(gr.update() for _ in range(25))
+            return tuple(gr.update() for _ in range(27))
         # fall through: load custom_infer.yaml like any other template
 
     cfg   = _load_template(template_name)
@@ -315,6 +313,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         gr.update(visible=(infer.get("streaming_mode", "causal") == "causal")),  # 24 streaming_mode_warning
         gr.update(value=0 if mf is None else int(mf)),       # 25 max_frames
         gr.update(value=monitoring_val),                     # 26 enable_monitoring
+        gr.update(value=bool(out.get("enable_sky_mask", out.get("mask_sky", False)))),  # 27 enable_sky_mask
     )
 
 
@@ -337,6 +336,7 @@ def _build_cfg_from_ui(
     enable_tto: bool,
     enable_filter: bool,
     enable_conf_filter: bool,
+    enable_sky_mask: bool,
     save_outputs: list,
     enable_rerun: bool,
     advanced_yaml: str,
@@ -367,6 +367,7 @@ def _build_cfg_from_ui(
         simulate_streaming=simulate_streaming, target_fps=target_fps,
         enable_tto=enable_tto, enable_filter=enable_filter,
         enable_conf_filter=enable_conf_filter,
+        enable_sky_mask=enable_sky_mask,
         save_outputs=save_outputs, enable_rerun=enable_rerun,
         output_root=output_root,
         streaming_mode=streaming_mode,
@@ -425,6 +426,7 @@ def _start_runner(
     enable_tto: bool,
     enable_filter: bool,
     enable_conf_filter: bool,
+    enable_sky_mask: bool,
     save_outputs: list,
     enable_rerun: bool,
     advanced_yaml: str,
@@ -451,6 +453,7 @@ def _start_runner(
         confidence_threshold, max_frame_points, max_full_points,
         simulate_streaming, target_fps,
         enable_tto, enable_filter, enable_conf_filter,
+        enable_sky_mask,
         save_outputs, enable_rerun, advanced_yaml,
         output_root=output_root,
         data_roots_file=data_roots_file,
@@ -578,6 +581,7 @@ def save_custom_config(
     enable_tto: bool,
     enable_filter: bool,
     enable_conf_filter: bool,
+    enable_sky_mask: bool,
     save_outputs: list,
     enable_rerun: bool,
     advanced_yaml: str,
@@ -596,6 +600,7 @@ def save_custom_config(
         confidence_threshold, max_frame_points, max_full_points,
         simulate_streaming, target_fps,
         enable_tto, enable_filter, enable_conf_filter,
+        enable_sky_mask,
         save_outputs, enable_rerun, advanced_yaml,
         output_root=output_root,
         data_roots_file=data_roots_file,
@@ -618,7 +623,7 @@ def save_custom_config(
 # ═════════════════════════════════════════════════════════════════════════
 
 def main():
-    _initial_cfg = _load_template("optimized")
+    _initial_cfg = _load_template(_DEFAULT_TEMPLATE)
 
     with gr.Blocks(title="LongStream 推理控制台") as demo:
         gr.Markdown("# LongStream 推理控制台")
@@ -652,8 +657,8 @@ def main():
                 )
                 template_name = gr.Dropdown(
                     label="配置模板",
-                    choices=["optimized", "baseline", "Custom"],
-                    value="optimized",
+                    choices=["kitti_optimized", "kitti_baseline", "vkitti2_optimized", "vkitti2_baseline", "Custom"],
+                    value=_DEFAULT_TEMPLATE,
                 )
             source_path = gr.Textbox(
                 label="输入路径 (data.img_path)",
@@ -742,6 +747,10 @@ def main():
                 enable_conf_filter = gr.Checkbox(
                     label="置信度过滤 (optimizations.filter.confidence_filter_enabled)",
                     value=True,
+                )
+                enable_sky_mask = gr.Checkbox(
+                    label="启用天空过滤 (output.enable_sky_mask)",
+                    value=bool(_initial_out.get("enable_sky_mask", _initial_out.get("mask_sky", False))),
                 )
                 enable_rerun = gr.Checkbox(
                     label="Rerun 渲染（仅流式模式）",
@@ -837,6 +846,7 @@ def main():
             streaming_mode_warning,                      # 24
             max_frames,                                  # 25
             enable_monitoring,                           # 26
+            enable_sky_mask,                             # 27
         ]
         # 使用 .input() 而非 .change()：
         # .input() 仅在用户直接点击 Dropdown 时触发；
@@ -882,7 +892,7 @@ def main():
 
         # Checkboxes / CheckboxGroup: use .input()
         for _comp in [simulate_streaming, enable_tto, enable_filter,
-                      enable_conf_filter, enable_rerun, save_outputs, enable_monitoring]:
+                      enable_conf_filter, enable_sky_mask, enable_rerun, save_outputs, enable_monitoring]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # Textbox / Dropdown / Code / Radio / Number: use .input()
@@ -897,7 +907,7 @@ def main():
             window_size, refresh, keyframe_stride,
             confidence_threshold, max_frame_points, max_full_points,
             simulate_streaming, target_fps,
-            enable_tto, enable_filter, enable_conf_filter,
+            enable_tto, enable_filter, enable_conf_filter, enable_sky_mask,
             save_outputs, enable_rerun, advanced_yaml,
             output_root, data_roots_file, seq_list, camera,
             streaming_mode, max_frames,

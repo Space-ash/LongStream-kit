@@ -103,6 +103,20 @@ def _write_list(path: str, lines: List[str]) -> None:
             f.write(f"{ln}\n")
 
 
+def refresh_data_roots(out_root: str, camera: str) -> None:
+    """Scan out_root for valid generalizable sequences and rewrite data_roots.txt."""
+    roots = []
+    for name in sorted(os.listdir(out_root)):
+        scene_dir = os.path.join(out_root, name)
+        if not os.path.isdir(scene_dir):
+            continue
+        if (os.path.isdir(os.path.join(scene_dir, "images", camera))
+                and os.path.isdir(os.path.join(scene_dir, "cameras", camera))):
+            roots.append(name)
+    _write_list(os.path.join(out_root, "data_roots.txt"), roots)
+    log(f"[kitti_odometry] data_roots.txt refreshed: {roots}")
+
+
 # ------------------------------------------------------------------ #
 # calib.txt 解析
 # ------------------------------------------------------------------ #
@@ -909,10 +923,8 @@ def main() -> None:
             allow_missing_lidar_calib=args.allow_missing_lidar_calib,
         )
 
-    # 写 data_roots.txt
-    roots_file = os.path.join(out_root, "data_roots.txt")
-    _write_list(roots_file, args.seqs)
-    log(f"[kitti_odometry] data_roots.txt written: {args.seqs}")
+    # 写 data_roots.txt（扫描 out_root，包含所有已生成序列）
+    refresh_data_roots(out_root, str(args.camera).zfill(2))
     log(f"[kitti_odometry] all done. output: {out_root}")
 
 

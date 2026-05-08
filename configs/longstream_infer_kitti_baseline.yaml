@@ -69,7 +69,7 @@ data:
   seq_list: ["05"]
   camera: "02"
   stride: 1
-  max_frames: null        # 改为 100 可进行 smoke test
+  max_frames: 200        # 改为 100 可进行 smoke test, null 则处理全部帧
   size: 518
   crop: false
   patch_size: 14
@@ -113,7 +113,7 @@ output:
   opencv_num_threads: 1
 
 evaluation:
-  align_scale: true
+  align_scale: false
   depth_rel_delta_threshold: 1.25
   point_f1_threshold: 0.25
   point_eval_max_points: 100000

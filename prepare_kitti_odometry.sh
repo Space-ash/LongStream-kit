@@ -113,7 +113,7 @@ fi
 # ------------------------------------------------------------------
 # Step 1: Convert KITTI -> generalizable
 # ------------------------------------------------------------------
-echo "[prepare-kitti-odometry] step 1/2: converting KITTI Odometry to generalizable format"
+echo "[prepare-kitti-odometry] step 1/3: converting KITTI Odometry to generalizable format"
 
 COPY_ARG=""
 if [[ "$COPY_FLAG" == "1" ]]; then
@@ -147,7 +147,7 @@ fi
 # ------------------------------------------------------------------
 # Step 2: Validate output
 # ------------------------------------------------------------------
-echo "[prepare-kitti-odometry] step 2/2: validating output"
+echo "[prepare-kitti-odometry] step 2/3: validating output"
 
 ALL_OK=1
 for SEQ in $SEQS; do
@@ -175,6 +175,20 @@ for SEQ in $SEQS; do
 done
 
 [[ "$ALL_OK" == "1" ]] || { echo "[prepare-kitti-odometry] some sequences have issues (see above)." >&2; exit 1; }
+
+# ------------------------------------------------------------------
+# Step 3: Refresh data_roots.txt by scanning out_root
+# ------------------------------------------------------------------
+echo "[prepare-kitti-odometry] step 3/3: refreshing data_roots.txt"
+find "$OUT_ROOT" -mindepth 1 -maxdepth 1 -type d \
+  | while read -r scene_dir; do
+      scene_name="$(basename "$scene_dir")"
+      if [[ -d "$scene_dir/images/$CAMERA" && -d "$scene_dir/cameras/$CAMERA" ]]; then
+        echo "$scene_name"
+      fi
+    done \
+  | sort > "$OUT_ROOT/data_roots.txt"
+echo "[prepare-kitti-odometry] data_roots.txt: $(cat "$OUT_ROOT/data_roots.txt" | tr '\n' ' ')"
 
 # ------------------------------------------------------------------
 # Summary
