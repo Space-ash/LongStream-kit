@@ -114,3 +114,67 @@ def chamfer_and_f1(
         "num_pred_points": int(len(pred)),
         "num_gt_points": int(len(gt)),
     }
+
+
+def sparse_gt_recall(
+    pred_points,
+    gt_points,
+    threshold=0.25,
+    max_points=None,
+    voxel_size=None,
+    seed=0,
+):
+    """
+    计算预测点云对稀疏 GT 点云的覆盖率（recall-only）。
+
+    仅计算 GT -> pred 方向的距离，不计算 pred -> GT 方向，
+    以避免将"GT 未采样的真实表面"误判为预测错误。
+
+    适用于 KITTI 稀疏 LiDAR GT，与 dense GT 的对称 Chamfer/F1 语义不同，
+    不要混用。
+
+    Parameters
+    ----------
+    pred_points : array-like (N, 3)
+        预测点云（世界坐标系，已经过 Sim3 对齐）。
+    gt_points : array-like (M, 3)
+        稀疏 GT 点云（LiDAR 投影反投影得到）。
+    threshold : float
+        recall 判定距离阈值（米），默认 0.25。
+    max_points : int or None
+        随机采样上限（分别对 pred / gt 采样）。
+    voxel_size : float or None
+        体素下采样尺寸（米）；None 表示不下采样。
+    seed : int
+        随机采样种子。
+
+    Returns
+    -------
+    dict with keys:
+        recall, gt_to_pred_mean_dist, gt_to_pred_median_dist,
+        recall_threshold, num_gt_points, num_pred_points
+    """
+    pred = prepare_pointcloud(
+        pred_points, max_points=max_points, voxel_size=voxel_size, seed=seed
+    )
+    gt = prepare_pointcloud(
+        gt_points, max_points=max_points, voxel_size=voxel_size, seed=seed + 1
+    )
+    if len(pred) == 0 or len(gt) == 0:
+        return None
+
+    pred_tree = cKDTree(pred)
+    dist_gt_to_pred, _ = pred_tree.query(gt, k=1)
+
+    recall = float(np.mean(dist_gt_to_pred < threshold))
+    mean_dist = float(np.mean(dist_gt_to_pred))
+    median_dist = float(np.median(dist_gt_to_pred))
+
+    return {
+        "recall": recall,
+        "gt_to_pred_mean_dist": mean_dist,
+        "gt_to_pred_median_dist": median_dist,
+        "recall_threshold": float(threshold),
+        "num_gt_points": int(len(gt)),
+        "num_pred_points": int(len(pred)),
+    }

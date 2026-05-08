@@ -42,6 +42,7 @@ KITTI Odometry -> LongStream generalizable 格式预处理脚本。
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -50,6 +51,8 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
 # ------------------------------------------------------------------ #
 # Unicode-safe cv2 I/O helpers（解决 Windows 中文路径问题）
@@ -106,8 +109,11 @@ def _write_list(path: str, lines: List[str]) -> None:
 
 def parse_kitti_calib(calib_path: str) -> Dict[str, np.ndarray]:
     """
-    解析 KITTI calib.txt，返回 P0..P3 以 key 为索引的字典。
-    每个 value 形状为 (3, 4)。
+    解析 KITTI calib.txt，返回以 key 为索引的字典。
+    支持的条目：
+      - P0..P3              形状 (3, 4)，投影矩阵
+      - Tr / Tr_velo_to_cam 形状 (3, 4)，LiDAR->cam0 外参
+      - R0_rect / R_rect    形状 (3, 3)，整流旋转矩阵
     """
     result: Dict[str, np.ndarray] = {}
     with open(calib_path) as f:
@@ -120,7 +126,123 @@ def parse_kitti_calib(calib_path: str) -> Dict[str, np.ndarray]:
             vals_arr = np.array([float(v) for v in vals.split()], dtype=np.float64)
             if vals_arr.size == 12:
                 result[key] = vals_arr.reshape(3, 4)
+            elif vals_arr.size == 9:
+                result[key] = vals_arr.reshape(3, 3)
     return result
+
+
+# ------------------------------------------------------------------ #
+# LiDAR 辅助函数
+# ------------------------------------------------------------------ #
+
+def load_velodyne_bin(path: str) -> np.ndarray:
+    """加载 KITTI velodyne .bin 文件，返回 Nx4 float32（x, y, z, intensity）。"""
+    return np.fromfile(path, dtype=np.float32).reshape(-1, 4)
+
+
+def make_4x4(mat: np.ndarray) -> np.ndarray:
+    """将 3x4 或 3x3 矩阵扩展为 4x4 齐次变换矩阵；4x4 直接返回副本。"""
+    mat = np.asarray(mat, dtype=np.float64)
+    if mat.shape == (4, 4):
+        return mat.copy()
+    out = np.eye(4, dtype=np.float64)
+    if mat.shape == (3, 4):
+        out[:3, :] = mat
+    elif mat.shape == (3, 3):
+        out[:3, :3] = mat
+    else:
+        raise ValueError(f"[make_4x4] unsupported shape: {mat.shape}")
+    return out
+
+
+def resolve_velodyne_to_rect_cam0(calib: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    从 calib 字典中解析 T_rect0_velo = R0_rect @ Tr_velo_to_cam（均扩展为 4x4）。
+
+    命名兼容：
+      - KITTI Odometry  ：Tr + R0_rect
+      - KITTI raw        ：Tr_velo_to_cam + R0_rect / R_rect
+
+    R0_rect / R_rect 缺失时用 I 代替（等效不使用整流变换）。
+    Tr / Tr_velo_to_cam 均缺失时抛出 KeyError，调用方应传 --depth_mode none。
+    """
+    tr = calib.get("Tr_velo_to_cam")
+    if tr is None:
+        tr = calib.get("Tr")
+    if tr is None:
+        raise KeyError(
+            "[kitti_odometry] calib.txt 中未找到 Tr_velo_to_cam 或 Tr，"
+            "无法投影 LiDAR 点云。若该序列无 velodyne 外参，请显式设置 --depth_mode none。"
+        )
+    Tr_4x4 = make_4x4(tr)
+    r0 = calib.get("R0_rect")
+    if r0 is None:
+        r0 = calib.get("R_rect")
+    R0_4x4 = make_4x4(r0) if r0 is not None else np.eye(4, dtype=np.float64)
+    return R0_4x4 @ Tr_4x4
+
+
+def project_velodyne_to_sparse_depth(
+    bin_path: str,
+    K: np.ndarray,
+    T_cam_i_cam0: np.ndarray,
+    T_rect0_velo: np.ndarray,
+    H: int,
+    W: int,
+    min_depth: float = 0.1,
+    max_depth: float = 80.0,
+) -> np.ndarray:
+    """
+    将 velodyne 点云投影到相机 i 平面，生成稀疏深度图（float32）。
+
+    投影流程：
+      1. velo Nx4 -> 齐次坐标 Nx4
+      2. p_rect0   = T_rect0_velo @ p_velo
+      3. p_cam_i   = T_cam_i_cam0 @ p_rect0
+      4. 深度范围过滤（min_depth <= z <= max_depth）
+      5. u = fx*x/z + cx，v = fy*y/z + cy
+      6. 边界过滤
+      7. z-buffer（同一像素保留最近 z）
+
+    Returns
+    -------
+    float32 depth map 形状 (H, W)，无效像素写 0.0，不做插值。
+    """
+    pts = load_velodyne_bin(bin_path)                                    # Nx4
+    ones = np.ones((len(pts), 1), dtype=np.float64)
+    pts_h = np.concatenate([pts[:, :3].astype(np.float64), ones], axis=1)  # Nx4
+
+    # 1. velo -> rect cam0
+    p_rect0 = (T_rect0_velo @ pts_h.T).T                                 # Nx4
+    # 2. rect cam0 -> cam_i
+    p_cam_i = (T_cam_i_cam0 @ p_rect0.T).T                               # Nx4
+
+    # 3. 深度过滤
+    z = p_cam_i[:, 2]
+    mask = (z >= min_depth) & (z <= max_depth)
+    p_cam_i = p_cam_i[mask]
+    z = z[mask]
+    if len(z) == 0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    # 4. 投影
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    x, y = p_cam_i[:, 0], p_cam_i[:, 1]
+    u = np.round(fx * x / z + cx).astype(np.int32)
+    v = np.round(fy * y / z + cy).astype(np.int32)
+
+    # 5. 边界过滤
+    in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    u, v, z = u[in_bounds], v[in_bounds], z[in_bounds]
+    if len(z) == 0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    # 6. z-buffer：按 z 降序排列后写入，最近点（最小 z）最后覆盖
+    order = np.argsort(z)[::-1]
+    depth_map = np.zeros((H, W), dtype=np.float32)
+    depth_map[v[order], u[order]] = z[order].astype(np.float32)
+    return depth_map
 
 
 # ------------------------------------------------------------------ #
@@ -204,6 +326,152 @@ def _write_camera(camera_dict: Dict[str, dict], out_dir: str) -> None:
 
 
 # ------------------------------------------------------------------ #
+# Unicode-safe EXR 写入
+# ------------------------------------------------------------------ #
+
+def _imwrite_exr_unicode(path: str, depth: np.ndarray) -> None:
+    """
+    Unicode-safe float32 EXR 写入。
+
+    cv2.imwrite 在 Windows 中文路径下无法正常打开文件，
+    先写到 ASCII 临时路径，再 shutil.move 到目标路径。
+    """
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".exr")
+    os.close(tmp_fd)
+    try:
+        ok = cv2.imwrite(tmp_path, depth.astype(np.float32))
+        if not ok:
+            raise RuntimeError(
+                f"[kitti_odometry] cv2.imwrite EXR 失败: {path}\n"
+                "  请确认 OpenCV 已编译 OpenEXR 支持（OPENCV_IO_ENABLE_OPENEXR=1）。"
+            )
+        shutil.move(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+# ------------------------------------------------------------------ #
+# 离线 LiDAR 深度处理
+# ------------------------------------------------------------------ #
+
+def _process_lidar_depths(
+    kitti_root: str,
+    seq: str,
+    seq_dir: str,
+    scene_out: str,
+    calib: Dict[str, np.ndarray],
+    K: np.ndarray,
+    T_cam_i_cam0: np.ndarray,
+    img_files: List[str],
+    camera_out: str,
+    H: int,
+    W: int,
+    min_depth: float,
+    max_depth: float,
+    save_depth_mask: bool,
+    overwrite_depths: bool,
+    num_workers: int,
+) -> None:
+    """
+    投影 velodyne 点云到相机视平面，保存稀疏深度图（float32 EXR）。
+
+    输出：
+      <scene_out>/depths/<camera_out>/<stem>.exr   — 与 images/<camera>/<stem>.png 同名
+      <scene_out>/depth_meta.json                  — 描述稀疏 GT 属性
+      <scene_out>/depth_masks/<camera_out>/<stem>.png（可选，当 save_depth_mask=True）
+    """
+    import concurrent.futures
+
+    velo_dir = os.path.join(seq_dir, "velodyne")
+    if not os.path.isdir(velo_dir):
+        raise FileNotFoundError(
+            f"[kitti_odometry] velodyne 目录不存在: {velo_dir}\n"
+            f"  若该序列无 LiDAR 数据，请显式设置 --depth_mode none。"
+        )
+
+    # 解析 LiDAR -> rectified cam0 变换（此处会检查 Tr 是否存在）
+    T_rect0_velo = resolve_velodyne_to_rect_cam0(calib)
+
+    depth_out_dir = os.path.join(scene_out, "depths", camera_out)
+    os.makedirs(depth_out_dir, exist_ok=True)
+
+    mask_out_dir: Optional[str] = None
+    if save_depth_mask:
+        mask_out_dir = os.path.join(scene_out, "depth_masks", camera_out)
+        os.makedirs(mask_out_dir, exist_ok=True)
+
+    def _process_one(fname: str) -> Optional[str]:
+        stem = Path(fname).stem
+        exr_path = os.path.join(depth_out_dir, f"{stem}.exr")
+        if not overwrite_depths and os.path.exists(exr_path):
+            return None  # 已存在，跳过
+        bin_path = os.path.join(velo_dir, f"{stem}.bin")
+        if not os.path.isfile(bin_path):
+            return f"[kitti_odometry] WARN: velodyne bin 不存在: {bin_path}"
+        depth = project_velodyne_to_sparse_depth(
+            bin_path=bin_path,
+            K=K,
+            T_cam_i_cam0=T_cam_i_cam0,
+            T_rect0_velo=T_rect0_velo,
+            H=H,
+            W=W,
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
+        _imwrite_exr_unicode(exr_path, depth)
+        if save_depth_mask and mask_out_dir is not None:
+            mask = (depth > 0).astype(np.uint8) * 255
+            _, buf = cv2.imencode(".png", mask)
+            np.array(buf).tofile(os.path.join(mask_out_dir, f"{stem}.png"))
+        return None
+
+    N = len(img_files)
+    log(
+        f"[kitti_odometry] seq {seq}: "
+        f"投影 {N} 帧 LiDAR 深度图（workers={num_workers}）"
+    )
+
+    if num_workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = {pool.submit(_process_one, fname): fname for fname in img_files}
+            done = 0
+            for fut in concurrent.futures.as_completed(futures):
+                warn = fut.result()
+                if warn:
+                    log(warn)
+                done += 1
+                if done % 500 == 0:
+                    log(f"[kitti_odometry] seq {seq}: depth {done}/{N}")
+    else:
+        for i, fname in enumerate(img_files):
+            warn = _process_one(fname)
+            if warn:
+                log(warn)
+            if (i + 1) % 500 == 0:
+                log(f"[kitti_odometry] seq {seq}: depth {i + 1}/{N}")
+
+    # 写 depth_meta.json
+    meta = {
+        "depth_gt_type": "sparse_lidar",
+        "source": "KITTI Odometry velodyne",
+        "invalid_value": 0.0,
+        "camera": camera_out,
+        "min_depth": min_depth,
+        "max_depth": max_depth,
+        "metric_scope": "valid_lidar_projected_pixels_only",
+    }
+    meta_path = os.path.join(scene_out, "depth_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    log(f"[kitti_odometry] seq {seq}: depth_meta.json → {meta_path}")
+    log(f"[kitti_odometry] seq {seq}: 稀疏深度图已写入 → {depth_out_dir}")
+
+
+# ------------------------------------------------------------------ #
 # 单个 sequence 预处理
 # ------------------------------------------------------------------ #
 
@@ -213,6 +481,12 @@ def process_sequence(
     seq: str,
     camera: str = "02",
     copy: bool = False,
+    depth_mode: str = "sparse_lidar",
+    min_depth: float = 0.1,
+    max_depth: float = 80.0,
+    save_depth_mask: bool = False,
+    overwrite_depths: bool = False,
+    num_workers: int = 1,
 ) -> None:
     """
     将 KITTI Odometry 中的一个 sequence 转换为 generalizable 格式。
@@ -228,10 +502,22 @@ def process_sequence(
     camera : str
         使用的相机编号，可以是 "2"、"02"、"3"、"03" 等。
         输出目录使用两位补零形式（如 "02"）；读取 KITTI 图片目录时
-        同时尝试 image_<N> 和 image_<NN> 两种命名（KITTI 数据集存在两种）。
-        使用的相机编号（KITTI image_<camera>），默认 "02"（左目彩色）。
+        同时尝试 image_<N> 和 image_<NN> 两种命名。
     copy : bool
         True 表示复制图片，False 表示软链接。
+    depth_mode : str
+        "sparse_lidar" 表示生成离线 LiDAR 深度图；
+        "none" 表示跳过深度生成（该序列无 velodyne 或无 LiDAR 外参时使用）。
+    min_depth : float
+        投影深度下限（米）。
+    max_depth : float
+        投影深度上限（米）。
+    save_depth_mask : bool
+        True 表示额外保存深度有效像素掋码图（PNG）。
+    overwrite_depths : bool
+        True 表示强制重写已存在的 EXR 文件。
+    num_workers : int
+        深度投影的并行线程数。
     """
     # camera_out：两位补零形式，用于输出目录 images/<camera_out>、cameras/<camera_out>
     camera_out = str(camera).zfill(2)       # e.g. "02"
@@ -364,6 +650,33 @@ def process_sequence(
     np.save(os.path.join(scene_out, "gps_xyz.npy"), gps_xyz.astype(np.float32))
     log(f"[kitti_odometry] seq {seq}: gps_xyz.npy saved (shape={gps_xyz.shape})")
 
+    # ------ 离线 LiDAR 深度投影 ------
+    if depth_mode == "sparse_lidar":
+        _process_lidar_depths(
+            kitti_root=kitti_root,
+            seq=seq,
+            seq_dir=seq_dir,
+            scene_out=scene_out,
+            calib=calib,
+            K=K,
+            T_cam_i_cam0=T_cam_i_cam0,
+            img_files=img_files,
+            camera_out=camera_out,
+            H=H,
+            W=W,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            save_depth_mask=save_depth_mask,
+            overwrite_depths=overwrite_depths,
+            num_workers=num_workers,
+        )
+    elif depth_mode == "none":
+        log(f"[kitti_odometry] seq {seq}: depth_mode=none，跳过 LiDAR 深度投影。")
+    else:
+        raise ValueError(
+            f"[kitti_odometry] 未知 depth_mode: {depth_mode!r}，可选: sparse_lidar, none"
+        )
+
     log(f"[kitti_odometry] seq {seq}: done. total {N} frames.")
 
 
@@ -401,6 +714,44 @@ def main() -> None:
         action="store_true",
         help="Copy image files instead of creating symlinks.",
     )
+    # ---- 离线 LiDAR 深度相关参数 ----
+    parser.add_argument(
+        "--depth_mode",
+        default="sparse_lidar",
+        choices=["sparse_lidar", "none"],
+        help=(
+            "LiDAR 深度生成模式：sparse_lidar（默认）生成稀疏深度图；"
+            "若序列缺少 velodyne/ 目录或 calib 无 LiDAR 外参，请显式设置 none。"
+        ),
+    )
+    parser.add_argument(
+        "--min_depth",
+        type=float,
+        default=0.1,
+        help="投影深度下限（米），默认 0.1。",
+    )
+    parser.add_argument(
+        "--max_depth",
+        type=float,
+        default=80.0,
+        help="投影深度上限（米），默认 80.0。",
+    )
+    parser.add_argument(
+        "--save_depth_mask",
+        action="store_true",
+        help="额外保存深度有效像素掩码图（PNG）到 depth_masks/<camera>/。",
+    )
+    parser.add_argument(
+        "--overwrite_depths",
+        action="store_true",
+        help="强制重写已存在的 EXR 文件，默认跳过。",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="深度投影的并行线程数，默认 1（串行）。",
+    )
     args = parser.parse_args()
 
     kitti_root = os.path.abspath(args.kitti_root)
@@ -414,6 +765,12 @@ def main() -> None:
             seq=seq,
             camera=args.camera,
             copy=args.copy,
+            depth_mode=args.depth_mode,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            save_depth_mask=args.save_depth_mask,
+            overwrite_depths=args.overwrite_depths,
+            num_workers=args.num_workers,
         )
 
     # 写 data_roots.txt

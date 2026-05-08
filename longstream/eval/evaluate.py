@@ -17,13 +17,27 @@ from longstream.eval.io import (
     read_pred_w2c_txt,
     read_pred_w2c_txt_with_frame_map,
 )
-from longstream.eval.metrics import ate_rmse, chamfer_and_f1, transform_points
+from longstream.eval.metrics import ate_rmse, chamfer_and_f1, sparse_gt_recall, transform_points
 from longstream.io.frame_index_map import load_frame_index_map
 from longstream.utils.sky_mask import sky_mask_filename
 
 
 def _ensure_dir(path):
     os.makedirs(path, exist_ok=True)
+
+
+def _load_depth_meta(seq_info):
+    """
+    读取 <scene_root>/depth_meta.json。
+
+    若文件不存在（如 vKITTI2 场景），返回 {"depth_gt_type": "dense"} 作为默认值，
+    保证现有 vKITTI2 流程完全不受影响。
+    """
+    meta_path = os.path.join(seq_info.scene_root, "depth_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            return json.load(f)
+    return {"depth_gt_type": "dense"}
 
 
 def _sequence_output_dir(output_root, seq_name):
@@ -290,11 +304,19 @@ def _evaluate_pointclouds(seq_info, seq_dir, eval_cfg, pose_align, gt_cloud):
     return metrics_by_branch or None
 
 
-def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping=None):
+def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping=None, depth_meta=None):
     pred_dir = os.path.join(seq_dir, "depth", "dpt")
     gt_dir = _resolve_gt_depth_root(seq_info)
     if not os.path.isdir(pred_dir) or gt_dir is None:
         return None
+
+    depth_gt_type = (depth_meta or {}).get("depth_gt_type", "dense")
+    metric_scope = (
+        "valid_lidar_projected_pixels_only"
+        if depth_gt_type == "sparse_lidar"
+        else "all_valid_dense_pixels"
+    )
+    min_valid_pixels = int(eval_cfg.get("min_valid_depth_pixels", 1))
 
     size = int(data_cfg.get("size", 518))
     crop = bool(data_cfg.get("crop", False))
@@ -304,6 +326,7 @@ def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping=Non
     abs_rel_sum = 0.0
     rel_delta_hits = 0
     valid_pixels = 0
+    total_pixels_seen = 0
     evaluated_frames = 0
 
     stems = frame_stems(seq_info.image_paths)
@@ -335,6 +358,8 @@ def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping=Non
             target_shape=pred.shape,
             interpolation=cv2.INTER_NEAREST,
         )
+
+        total_pixels_seen += int(gt.size)
 
         valid = np.isfinite(gt) & (gt > 0)
         if not np.any(valid):
@@ -369,7 +394,7 @@ def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping=Non
         valid_pixels += int(gt_valid.size)
         evaluated_frames += 1
 
-    if valid_pixels == 0:
+    if valid_pixels < min_valid_pixels:
         return None
 
     return {
@@ -378,6 +403,9 @@ def _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping=Non
         "rel_delta_threshold": rel_delta_threshold,
         "num_valid_pixels": int(valid_pixels),
         "num_frames": int(evaluated_frames),
+        "gt_depth_type": depth_gt_type,
+        "metric_scope": metric_scope,
+        "valid_pixel_density": float(valid_pixels / max(total_pixels_seen, 1)),
     }
 
 
@@ -445,6 +473,56 @@ def _save_traj_plot_3d(path, pred_xyz, gt_xyz):
     plt.close(fig)
 
 
+def _evaluate_sparse_lidar_pointclouds(seq_info, seq_dir, eval_cfg, pose_align, gt_cloud):
+    """
+    稀疏 LiDAR GT 点云评估：仅计算预测点到 GT 采样点的覆盖率（recall-only）。
+
+    不计算对称 Chamfer/F1，避免把"GT 未采样的真实表面"误判为预测错误。
+    结果写入 pointcloud_sparse_lidar 字段，不污染现有 pointcloud 字段。
+    """
+    if pose_align is None or gt_cloud is None:
+        return None
+
+    scale, R, t = pose_align
+    point_paths = {
+        "point_head": [
+            os.path.join(seq_dir, "points", "point_head_full.npy"),
+            os.path.join(seq_dir, "points", "point_head_full.npz"),
+            os.path.join(seq_dir, "points", "point_head_full.ply"),
+        ],
+        "dpt_unproj": [
+            os.path.join(seq_dir, "points", "dpt_unproj_full.npy"),
+            os.path.join(seq_dir, "points", "dpt_unproj_full.npz"),
+            os.path.join(seq_dir, "points", "dpt_unproj_full.ply"),
+        ],
+    }
+    threshold = float(eval_cfg.get("point_f1_threshold", 0.25))
+    max_points = int(eval_cfg.get("point_eval_max_points", 100000))
+    voxel_size = eval_cfg.get("point_eval_voxel_size", None)
+    voxel_size = None if voxel_size in (None, "", "null") else float(voxel_size)
+
+    metrics_by_branch = {}
+    for branch, candidates in point_paths.items():
+        path = next(
+            (candidate for candidate in candidates if os.path.exists(candidate)), None
+        )
+        if path is None:
+            continue
+        pred_cloud = read_pointcloud_xyz(path)
+        pred_cloud = transform_points(pred_cloud, scale, R, t)
+        metrics = sparse_gt_recall(
+            pred_cloud,
+            gt_cloud,
+            threshold=threshold,
+            max_points=max_points,
+            voxel_size=voxel_size,
+            seed=0 if branch == "point_head" else 1,
+        )
+        if metrics is not None:
+            metrics_by_branch[branch] = metrics
+    return metrics_by_branch or None
+
+
 def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg, cfg=None):
     seq_dir = _sequence_output_dir(output_root, seq_info.name)
     result = {
@@ -491,20 +569,58 @@ def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg, cfg=None):
             pose_metrics["traj_3d_plot"] = plot_path
             result["pose"] = pose_metrics
 
-    video_dpt_metrics = _evaluate_video_dpt(seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping)
+    video_dpt_metrics = _evaluate_video_dpt(
+        seq_info, seq_dir, eval_cfg, data_cfg, frame_mapping,
+        depth_meta=_load_depth_meta(seq_info),
+    )
     if video_dpt_metrics is not None:
         result["has_gt"] = True
         result["has_gt_depth"] = True
+        result["gt_depth_type"] = video_dpt_metrics.get("gt_depth_type", "dense")
         result["video_dpt"] = video_dpt_metrics
 
+    # ------ 点云评估：根据 depth_gt_type 选择策略 ------
+    depth_meta = _load_depth_meta(seq_info)
+    depth_gt_type = depth_meta.get("depth_gt_type", "dense")
+    result["gt_depth_type"] = depth_gt_type
+
+    sparse_policy = str(eval_cfg.get("sparse_depth_pointcloud_policy", "recall_only"))
+    allow_sparse_chamfer = bool(eval_cfg.get("allow_sparse_chamfer_f1", False))
+
     gt_cloud = _load_gt_pointcloud(seq_info, seq_dir, gt_extri, gt_intri, eval_cfg, frame_mapping)
-    pointcloud_metrics = _evaluate_pointclouds(
-        seq_info, seq_dir, eval_cfg, pose_align, gt_cloud
-    )
-    if pointcloud_metrics is not None:
-        result["has_gt"] = True
-        result["has_gt_depth"] = True
-        result["pointcloud"] = pointcloud_metrics
+
+    if depth_gt_type == "dense":
+        # vKITTI2 等 dense GT：沿用现有对称 Chamfer/F1
+        pointcloud_metrics = _evaluate_pointclouds(
+            seq_info, seq_dir, eval_cfg, pose_align, gt_cloud
+        )
+        if pointcloud_metrics is not None:
+            result["has_gt"] = True
+            result["has_gt_depth"] = True
+            result["pointcloud"] = pointcloud_metrics
+    elif depth_gt_type == "sparse_lidar":
+        if allow_sparse_chamfer:
+            # 用户显式允许：复用对称 Chamfer/F1，并写入警告
+            pointcloud_metrics = _evaluate_pointclouds(
+                seq_info, seq_dir, eval_cfg, pose_align, gt_cloud
+            )
+            if pointcloud_metrics is not None:
+                for branch_metrics in pointcloud_metrics.values():
+                    branch_metrics["warning"] = (
+                        "symmetric F1 against sparse LiDAR is not comparable to dense GT"
+                    )
+                result["has_gt"] = True
+                result["has_gt_depth"] = True
+                result["pointcloud"] = pointcloud_metrics
+        elif sparse_policy == "recall_only":
+            # 默认：只计算 GT->pred recall，不写入 pointcloud 字段
+            sparse_pc_metrics = _evaluate_sparse_lidar_pointclouds(
+                seq_info, seq_dir, eval_cfg, pose_align, gt_cloud
+            )
+            if sparse_pc_metrics is not None:
+                result["has_gt"] = True
+                result["has_gt_depth"] = True
+                result["pointcloud_sparse_lidar"] = sparse_pc_metrics
 
     if not result["has_gt"]:
         result["skipped"] = "missing_gt"
@@ -583,6 +699,19 @@ def evaluate_predictions_cfg(cfg):
         ),
         "dpt_unproj_f1_mean": _mean_metric(
             sequence_results, "pointcloud.dpt_unproj", "f1"
+        ),
+        # sparse LiDAR recall 汇总（仅 depth_gt_type=sparse_lidar 的序列才会有值）
+        "point_head_sparse_recall_mean": _mean_metric(
+            sequence_results, "pointcloud_sparse_lidar.point_head", "recall"
+        ),
+        "dpt_unproj_sparse_recall_mean": _mean_metric(
+            sequence_results, "pointcloud_sparse_lidar.dpt_unproj", "recall"
+        ),
+        "point_head_sparse_gt_to_pred_mean_dist": _mean_metric(
+            sequence_results, "pointcloud_sparse_lidar.point_head", "gt_to_pred_mean_dist"
+        ),
+        "dpt_unproj_sparse_gt_to_pred_mean_dist": _mean_metric(
+            sequence_results, "pointcloud_sparse_lidar.dpt_unproj", "gt_to_pred_mean_dist"
         ),
         "sequences": sequence_results,
     }

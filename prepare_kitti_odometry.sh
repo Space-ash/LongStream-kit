@@ -41,12 +41,21 @@ OUT_ROOT="${OUT_ROOT:-prepared_inputs/kitti_odometry}"
 CONFIG_PATH="${CONFIG_PATH:-configs/longstream_infer_kitti08_optimized.yaml}"
 COPY_FLAG="${COPY:-0}"
 
+# LiDAR 深度相关
+DEPTH_MODE="${DEPTH_MODE:-sparse_lidar}"
+MIN_DEPTH="${MIN_DEPTH:-0.1}"
+MAX_DEPTH="${MAX_DEPTH:-80.0}"
+SAVE_DEPTH_MASK="${SAVE_DEPTH_MASK:-0}"
+OVERWRITE_DEPTHS="${OVERWRITE_DEPTHS:-0}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+
 echo "[prepare-kitti-odometry] root_dir=$ROOT_DIR"
 echo "[prepare-kitti-odometry] kitti_root=$KITTI_ROOT"
 echo "[prepare-kitti-odometry] seqs=$SEQS"
 echo "[prepare-kitti-odometry] camera=$CAMERA"
 echo "[prepare-kitti-odometry] out_root=$OUT_ROOT"
 echo "[prepare-kitti-odometry] config=$CONFIG_PATH"
+echo "[prepare-kitti-odometry] depth_mode=$DEPTH_MODE  min_depth=$MIN_DEPTH  max_depth=$MAX_DEPTH  num_workers=$NUM_WORKERS"
 
 # ------------------------------------------------------------------
 # Validation
@@ -69,6 +78,20 @@ if [[ ! -d "$KITTI_ROOT/poses" ]]; then
 fi
 
 # ------------------------------------------------------------------
+# 深度模式预检查：若 DEPTH_MODE=sparse_lidar，提前检查 velodyne/ 是否存在
+# ------------------------------------------------------------------
+if [[ "$DEPTH_MODE" == "sparse_lidar" ]]; then
+  for SEQ in $SEQS; do
+    VELO_DIR="$KITTI_ROOT/sequences/$SEQ/velodyne"
+    if [[ ! -d "$VELO_DIR" ]]; then
+      echo "[prepare-kitti-odometry] error: DEPTH_MODE=sparse_lidar 但 velodyne 目录不存在: $VELO_DIR" >&2
+      echo "  若该序列无 LiDAR 数据，请显式设置: DEPTH_MODE=none bash prepare_kitti_odometry.sh" >&2
+      exit 1
+    fi
+  done
+fi
+
+# ------------------------------------------------------------------
 # Step 1: Convert KITTI -> generalizable
 # ------------------------------------------------------------------
 echo "[prepare-kitti-odometry] step 1/2: converting KITTI Odometry to generalizable format"
@@ -78,13 +101,26 @@ if [[ "$COPY_FLAG" == "1" ]]; then
   COPY_ARG="--copy"
 fi
 
+DEPTH_EXTRA_ARGS=""
+if [[ "$SAVE_DEPTH_MASK" == "1" ]]; then
+  DEPTH_EXTRA_ARGS="$DEPTH_EXTRA_ARGS --save_depth_mask"
+fi
+if [[ "$OVERWRITE_DEPTHS" == "1" ]]; then
+  DEPTH_EXTRA_ARGS="$DEPTH_EXTRA_ARGS --overwrite_depths"
+fi
+
 # shellcheck disable=SC2086
 "$PYTHON_BIN" scripts/kitti_odometry_to_generalizable.py \
   --kitti_root "$KITTI_ROOT" \
   --out_root   "$OUT_ROOT" \
   --seqs       $SEQS \
   --camera     "$CAMERA" \
-  $COPY_ARG
+  --depth_mode "$DEPTH_MODE" \
+  --min_depth  "$MIN_DEPTH" \
+  --max_depth  "$MAX_DEPTH" \
+  --num_workers "$NUM_WORKERS" \
+  $COPY_ARG \
+  $DEPTH_EXTRA_ARGS
 
 # ------------------------------------------------------------------
 # Step 2: Validate output
@@ -101,6 +137,12 @@ for SEQ in $SEQS; do
   [[ -f "$SCENE_DIR/cameras/$CAMERA/intri.yml"  ]] || ISSUES="$ISSUES cameras/$CAMERA/intri.yml"
   [[ -f "$SCENE_DIR/gt_poses.npy"               ]] || ISSUES="$ISSUES gt_poses.npy"
   [[ -f "$SCENE_DIR/gt_poses_${CAMERA}.npy"     ]] || ISSUES="$ISSUES gt_poses_${CAMERA}.npy"
+
+  # sparse_lidar 深度输出验证
+  if [[ "$DEPTH_MODE" == "sparse_lidar" ]]; then
+    [[ -d "$SCENE_DIR/depths/$CAMERA" ]]    || ISSUES="$ISSUES depths/$CAMERA/"
+    [[ -f "$SCENE_DIR/depth_meta.json" ]]   || ISSUES="$ISSUES depth_meta.json"
+  fi
 
   if [[ -n "$ISSUES" ]]; then
     echo "[prepare-kitti-odometry] WARNING: seq $SEQ missing:$ISSUES" >&2
