@@ -99,13 +99,18 @@ output:
   save_point_head: false
   save_dpt_unproj: true
   rerun_current_points: 8000
-  rerun_global_points: 20000
-  rerun_global_ingest_points: 8000
+  rerun_global_points: 30000
+  # rerun_global_ingest_points 已废弃（独立 viewer reservoir 已删除，viewer 直接采样 dpt_unproj 全局 reservoir）
+  rerun_view_coordinates: RIGHT_HAND_Z_UP  # 可选 RIGHT_HAND_Y_UP
   live_global_checkpoint_interval: 0
   torch_num_threads: 2
   opencv_num_threads: 1
-  mask_sky: true
+  enable_sky_mask: true      # 启用 sky segmentation 过滤点云中的天空区域
+  save_sky_mask: false        # 是否将天空遮罩 mask PNG 写入磁盘（不影响过滤）
   skyseg_path: model/skyseg.onnx
+  skyseg_num_threads: 1       # onnxruntime skyseg 线程数，控制 CPU 占用
+  save_depth_vis: false       # 是否生成深度伪彩色 PNG（save_depth=true 时生效）
+  global_compact_pending_points: 800000  # reservoir compact 触发默认 800k（降低周期性 CPU 尖峰）
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000
 
@@ -116,3 +121,11 @@ evaluation:
   point_eval_max_points: 100000
   point_eval_voxel_size: null
   point_eval_oversample_factor: 4
+
+monitoring:
+  enabled: false             # 设为 true 启动后台资源采样（需要 psutil）
+  interval_sec: 2.0
+  top_process_count: 10
+  write_process_top: true    # cpu_process_top.csv（debug 用）
+  write_cpu_timeseries: true # cpu_timeseries.csv（论文绘图用）
+  write_gpu_timeseries: true # gpu_timeseries.csv（需要 nvidia-smi）

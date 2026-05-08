@@ -89,7 +89,8 @@ output:
   save_depth: true
   save_points: true
   save_frame_points: false
-  mask_sky: false
+  enable_sky_mask: false   # 平消组关闭天空过滤
+  save_sky_mask: false
   skyseg_path: model/skyseg.onnx
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000

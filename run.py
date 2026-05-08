@@ -9,6 +9,7 @@ from longstream.core.cli import (
 )
 from longstream.core.infer import run_inference_cfg
 from longstream.eval import evaluate_predictions_cfg
+from longstream.utils.resource_monitor import from_cfg as _monitor_from_cfg
 
 
 def _reset_output_root(cfg: dict):
@@ -38,12 +39,24 @@ def main():
 
     cfg = load_config_with_overrides(args)
     _reset_output_root(cfg)
-    print("[longstream] run: inference", flush=True)
-    run_inference_cfg(cfg)
-    if not args.skip_eval:
-        print("[longstream] run: evaluation", flush=True)
-        evaluate_predictions_cfg(cfg)
-        print("[longstream] run: done", flush=True)
+
+    output_root = os.path.abspath(
+        os.path.expanduser(cfg.get("output", {}).get("root", "outputs"))
+    )
+    monitor = _monitor_from_cfg(cfg.get("monitoring", {}))
+    if monitor is not None:
+        monitor.start(output_root)
+
+    try:
+        print("[longstream] run: inference", flush=True)
+        run_inference_cfg(cfg)
+        if not args.skip_eval:
+            print("[longstream] run: evaluation", flush=True)
+            evaluate_predictions_cfg(cfg)
+            print("[longstream] run: done", flush=True)
+    finally:
+        if monitor is not None:
+            monitor.stop()
 
 
 if __name__ == "__main__":

@@ -91,11 +91,16 @@ output:
   save_frame_points: false
   save_point_head: false
   save_dpt_unproj: true
-  mask_sky: true
+  enable_sky_mask: true
+  save_sky_mask: false
   skyseg_path: model/skyseg.onnx
+  skyseg_num_threads: 1
+  save_depth_vis: false
+  global_compact_pending_points: 800000
   rerun_current_points: 8000
-  rerun_global_points: 20000
-  rerun_global_ingest_points: 8000
+  rerun_global_points: 30000
+  # rerun_global_ingest_points 已废弃（独立 viewer reservoir 已删除）
+  rerun_view_coordinates: RIGHT_HAND_Z_UP
   live_global_checkpoint_interval: 0
   torch_num_threads: 2
   opencv_num_threads: 1
@@ -109,3 +114,11 @@ evaluation:
   point_eval_max_points: 100000
   point_eval_voxel_size: null
   point_eval_oversample_factor: 4
+
+monitoring:
+  enabled: false
+  interval_sec: 2.0
+  top_process_count: 10
+  write_process_top: true
+  write_cpu_timeseries: true
+  write_gpu_timeseries: true

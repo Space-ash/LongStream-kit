@@ -37,20 +37,23 @@ _TEMPLATE_PATHS = {
 SAVE_OUTPUT_CHOICES = [
     ("RGB 图片 (save_images)",            "save_images"),
     ("视频 (save_videos)",                "save_videos"),
-    ("深度图 (save_depth)",               "save_depth"),
+    ("深度图.npy (save_depth)",           "save_depth"),
+    ("深度伪彩色PNG (save_depth_vis)",     "save_depth_vis"),
     ("全局点云 (save_points)",            "save_points"),
     ("逐帧点云PLY (save_frame_points，不影响Rerun实时显示)", "save_frame_points"),
     ("保存 point_head 点云 (save_point_head)", "save_point_head"),
     ("保存 dpt_unproj 点云 (save_dpt_unproj)", "save_dpt_unproj"),
-    ("天空遮罩 (mask_sky)",               "mask_sky"),
+    ("启用天空过滤 (enable_sky_mask)",  "enable_sky_mask"),
+    ("保存天空遮罩PNG (save_sky_mask)",   "save_sky_mask"),
     ("GLB 导出 (export_glb)",             "export_glb"),
 ]
 _SAVE_LABEL_TO_KEY = {label: key for label, key in SAVE_OUTPUT_CHOICES}
 _SAVE_DEFAULT_LABELS = [
     "RGB 图片 (save_images)",
-    "深度图 (save_depth)",
+    "深度图.npy (save_depth)",
     "全局点云 (save_points)",
     "保存 dpt_unproj 点云 (save_dpt_unproj)",
+    "启用天空过滤 (enable_sky_mask)",
 ]
 
 # ─── Input type mapping ───────────────────────────────────────────────────
@@ -73,9 +76,10 @@ def _seq_list_to_text(value) -> str:
     return ", ".join(str(x) for x in value)
 
 # ─── Global runner state ──────────────────────────────────────────────────
-_runner_lock   = threading.Lock()
-_active_runner = None
-_rerun_viewer  = None
+_runner_lock      = threading.Lock()
+_active_runner    = None
+_rerun_viewer     = None
+_resource_monitor = None
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -102,6 +106,11 @@ def _cfg_to_save_output_labels(cfg: dict) -> list:
         if key in ("save_point_head", "save_dpt_unproj"):
             # 若模板中未显式设置，以 save_points 总开关为默认值，避免切换后全关
             enabled = bool(out.get(key, out.get("save_points", False)))
+        elif key == "enable_sky_mask":
+            # 向后兼容旧 YAML：mask_sky 同时控制 enable_sky_mask
+            enabled = bool(out.get("enable_sky_mask", out.get("mask_sky", False)))
+        elif key == "save_sky_mask":
+            enabled = bool(out.get("save_sky_mask", False))
         else:
             enabled = bool(out.get(key, False))
         if enabled:
@@ -163,9 +172,10 @@ def _merge_basic_into_cfg(
         for label in (save_outputs or [])
         if label in _SAVE_LABEL_TO_KEY
     }
-    for std_key in ["save_images", "save_videos", "save_depth",
+    for std_key in ["save_images", "save_videos", "save_depth", "save_depth_vis",
                     "save_points", "save_frame_points",
-                    "save_point_head", "save_dpt_unproj", "mask_sky"]:
+                    "save_point_head", "save_dpt_unproj",
+                    "enable_sky_mask", "save_sky_mask"]:
         cfg["output"][std_key] = std_key in selected_keys
     cfg["output"]["export_glb"]                   = "export_glb" in selected_keys
     cfg["output"]["max_frame_pointcloud_points"]  = int(max_frame_points)
@@ -418,7 +428,7 @@ def _start_runner(
     streaming_mode: str = "causal",
     max_frames: int = 0,
 ) -> tuple:
-    global _active_runner, _rerun_viewer
+    global _active_runner, _rerun_viewer, _resource_monitor
 
     if not source_path or not source_path.strip():
         return "警告：请先填写输入路径。", gr.update(), gr.update()
@@ -459,6 +469,7 @@ def _start_runner(
                     rerun_global_update_interval=1,
                     image_update_interval=1,
                     depth_update_interval=1,
+                    view_coordinates=str(cfg.get("output", {}).get("rerun_view_coordinates", "RIGHT_HAND_Z_UP")),
                     spawn=True,
                 )
                 viewer.init()
@@ -488,6 +499,20 @@ def _start_runner(
     with _runner_lock:
         _active_runner = runner
 
+    # 资源监控：在 runner.start() 前启动，覆盖模型加载到输出全过程
+    try:
+        from longstream.utils.resource_monitor import from_cfg as _monitor_from_cfg
+        _mon = _monitor_from_cfg(cfg.get("monitoring", {}))
+        if _mon is not None:
+            _out_dir = os.path.abspath(
+                cfg.get("output", {}).get("root", "outputs")
+            )
+            _mon.start(_out_dir)
+            with _runner_lock:
+                _resource_monitor = _mon
+    except Exception:
+        pass
+
     runner.start()
     return (
         f"已启动：{mode_label}",
@@ -497,11 +522,12 @@ def _start_runner(
 
 
 def _stop_runner() -> tuple:
-    global _active_runner, _rerun_viewer
+    global _active_runner, _rerun_viewer, _resource_monitor
 
     with _runner_lock:
         runner = _active_runner
         viewer = _rerun_viewer
+        monitor = _resource_monitor
 
     if runner is None:
         return (
@@ -512,9 +538,13 @@ def _stop_runner() -> tuple:
 
     runner.stop()
 
+    if monitor is not None:
+        monitor.stop()
+
     with _runner_lock:
-        _active_runner = None
-        _rerun_viewer  = None
+        _active_runner    = None
+        _rerun_viewer     = None
+        _resource_monitor = None
 
     import torch
     torch.cuda.empty_cache()

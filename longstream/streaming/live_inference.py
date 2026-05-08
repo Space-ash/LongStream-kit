@@ -193,12 +193,9 @@ def _worker_inference_loop(
     # Rerun 是否开启：仅开启时才跨进程传输大 numpy
     _emit_frame_results: bool = bool(cfg.get("_enable_rerun", False))
     _viewer_max_global: int = int(_out_cfg_merged.get("rerun_global_points", 20000))
-    _viewer_ingest_points: int = int(_out_cfg_merged.get("rerun_global_ingest_points", 8000))
-    # Rerun 专用实时 viewer reservoir（每帧更新，独立于磁盘保存 reservoir）
-    # 最多 _viewer_max_global 点，保证每帧 global panel 包含当前帧采样
-    _view_res_pts: Optional[np.ndarray] = None
-    _view_res_cols: Optional[np.ndarray] = None
-    _view_res_rng = np.random.default_rng(seed=123)
+    # 全局 reservoir compact 触发阈值（待合并点数达到此值才触发一次合并）
+    # 默认 800000：VKITTI 每帧约 7 万点，约 11 帧合并一次，比原来的 0.1*2M=200k 更宽松
+    _compact_pending_points: int = int(_out_cfg_merged.get("global_compact_pending_points", 800000))
     # dpt_unproj 警告限频计数器（防止长序列日志刷爆）
     _dpu_warn_count: int = 0
     _dpu_warn_max: int = 3  # 前 3 次打印警告，此后仅累计
@@ -206,8 +203,15 @@ def _worker_inference_loop(
     # ── sky segmentation session（真实初始化）────────────────────────────
     _sky_session = None
     _sky_mask_dir: Optional[str] = None
-    _mask_sky = bool(_out_cfg_merged.get("mask_sky", False))
-    if _mask_sky:
+    # enable_sky_mask：控制是否运行 sky segmentation 以过滤点云（不影响保存 mask 文件）
+    # save_sky_mask：仅控制 mask PNG 是否落盘；向后兼容旧 YAML mask_sky
+    _enable_sky_mask: bool = bool(_out_cfg_merged.get(
+        "enable_sky_mask", _out_cfg_merged.get("mask_sky", False)
+    ))
+    _save_sky_mask: bool = bool(_out_cfg_merged.get(
+        "save_sky_mask", _out_cfg_merged.get("mask_sky", False)
+    ))
+    if _enable_sky_mask:
         try:
             import onnxruntime as _ort
             # 优先读取 cfg["output"]["skyseg_path"]，再回退到项目根默认路径
@@ -227,8 +231,16 @@ def _worker_inference_loop(
                     flush=True,
                 )
                 raise FileNotFoundError(_sky_model_path)
-            _sky_session = _ort.InferenceSession(_sky_model_path)
-            _sky_mask_dir = os.path.join(_out_dir, "sky_masks")
+            _sky_so = _ort.SessionOptions()
+            _sky_so.intra_op_num_threads = int(_out_cfg_merged.get("skyseg_num_threads", 1))
+            _sky_so.inter_op_num_threads = 1
+            _sky_session = _ort.InferenceSession(
+                _sky_model_path,
+                sess_options=_sky_so,
+                providers=["CPUExecutionProvider"],
+            )
+            # _save_sky_mask=True 时才创建 sky_masks 目录（避免不必要的磁盘目录）
+            _sky_mask_dir = os.path.join(_out_dir, "sky_masks") if _save_sky_mask else None
             print("[LiveInferenceRunner/worker] sky segmentation session 初始化成功", flush=True)
         except Exception as _sky_init_err:
             print(
@@ -300,9 +312,10 @@ def _worker_inference_loop(
             )
 
             # ── sky mask（decode 完成后、filter 之前追加）────────────────
-            if _sky_session is not None and packet.image_path:
+            if _sky_session is not None:
                 outputs_cpu["sky_valid_mask_np"] = _compute_sky_valid_mask(
-                    packet.image_path, _sky_session, _sky_mask_dir,
+                    outputs_cpu.get("rgb_np"), packet.image_path,
+                    _sky_session, _sky_mask_dir,
                     int(data_cfg.get("size", 518)),
                     bool(data_cfg.get("crop", False)),
                     int(data_cfg.get("patch_size", 14)),
@@ -451,7 +464,7 @@ def _worker_inference_loop(
                         _res_pending.append(_new_pts)
                         _res_pending_cols.append(_nc)
                         _res_pending_n += len(_new_pts)
-                        if _res_pending_n >= int(_max_full_pts * 0.1):
+                        if _res_pending_n >= _compact_pending_points:
                             _res_pts, _res_cols, _res_pending, _res_pending_cols, _res_pending_n = \
                                 _compact_reservoir(
                                     _res_pts, _res_cols,
@@ -473,7 +486,7 @@ def _worker_inference_loop(
                     _res_dpu_pending.append(_dpu_new.astype(np.float32, copy=False))
                     _res_dpu_pending_cols.append(_dpu_new_cols.astype(np.uint8, copy=False))
                     _res_dpu_pending_n += len(_dpu_new)
-                    if _res_dpu_pending_n >= int(_max_full_pts * 0.1):
+                    if _res_dpu_pending_n >= _compact_pending_points:
                         _res_dpu_pts, _res_dpu_cols, _res_dpu_pending, _res_dpu_pending_cols, _res_dpu_pending_n = \
                             _compact_reservoir(
                                 _res_dpu_pts, _res_dpu_cols,
@@ -504,28 +517,23 @@ def _worker_inference_loop(
                         print(f"[LiveInferenceRunner/worker] checkpoint 保存失败 (frame {g}): {_ckpt_exc}",
                               flush=True)
 
-            # ── Rerun viewer reservoir 更新（每帧，独立于磁盘 reservoir）──────
-            # 优先 dpt_unproj，回退 point_head；保证 global panel 每帧包含当前帧
-            if _emit_frame_results:
-                _view_new_pts = outputs_cpu.get("filtered_dpu_pts_np")
-                _view_new_cols = outputs_cpu.get("filtered_dpu_cols_np")
-                if _view_new_pts is None or _view_new_cols is None:
-                    _view_new_pts = outputs_cpu.get("filtered_points_np")
-                    _view_new_cols = outputs_cpu.get("filtered_colors_np")
-                if _view_new_pts is not None and _view_new_cols is not None and len(_view_new_pts) > 0:
-                    _view_new_pts, _view_new_cols = _sample_points_for_viewer(
-                        _view_new_pts, _view_new_cols, _viewer_ingest_points, g + 54321
-                    )
-                    _view_res_pts, _view_res_cols = _update_point_reservoir(
-                        _view_res_pts, _view_res_cols,
-                        _view_new_pts, _view_new_cols,
-                        _viewer_max_global, _view_res_rng,
-                    )
-
             # ── 注入 viewer 全局快照并发送到主进程（仅 Rerun 开启时）──────────
             if _emit_frame_results:
-                # 全局快照来自实时 viewer reservoir（每帧已更新，包含当前帧）
-                _gp, _gc = _view_res_pts, _view_res_cols
+                # 全局快照直接从最终全局 reservoir 采样，与磁盘保存数据一致
+                if _save_dpt_unproj:
+                    _gp, _gc = _sample_global_snapshot(
+                        _res_dpu_pts, _res_dpu_cols,
+                        _res_dpu_pending, _res_dpu_pending_cols,
+                        _viewer_max_global, g + 12345,
+                    )
+                elif _save_point_head:
+                    _gp, _gc = _sample_global_snapshot(
+                        _res_pts, _res_cols,
+                        _res_pending, _res_pending_cols,
+                        _viewer_max_global, g + 12345,
+                    )
+                else:
+                    _gp, _gc = None, None
                 _viewer_payload = _build_viewer_payload(
                     outputs_cpu, g,
                     int(_out_cfg_merged.get("rerun_current_points", _max_frame_pts)),
@@ -825,7 +833,8 @@ def _get_stream_seq_name(cfg: dict) -> str:
 
 
 def _compute_sky_valid_mask(
-    image_path: str,
+    rgb_np: Optional[np.ndarray],
+    image_path: Optional[str],
     sky_session,
     mask_dir: Optional[str],
     size: int,
@@ -837,6 +846,9 @@ def _compute_sky_valid_mask(
     对单帧图像计算 sky valid mask（True = 非天空 = 保留），
     并调整到与 world_points 相同的分辨率。
 
+    优先使用已解码的 rgb_np（避免重复磁盘读取），
+    仅当 mask_dir 不为 None 时才将 mask PNG 保存到磁盘。
+
     返回 [H_pts * W_pts] bool ndarray 或 None（失败时降级）。
     所有操作均为纯 CPU，无 GPU 张量。
     """
@@ -847,10 +859,17 @@ def _compute_sky_valid_mask(
             run_skyseg, _normalize_skyseg_output, sky_mask_filename, SKYSEG_THRESHOLD
         )
 
-        # ── 运行 skyseg ────────────────────────────────────────────────
-        img_bgr = _cv2.imread(image_path)
+        # ── 获取 BGR 图像：优先复用已解码 rgb_np，避免额外磁盘 IO ────────
+        if rgb_np is not None and len(rgb_np.shape) == 3:
+            img_bgr = rgb_np[:, :, ::-1].copy()
+        elif image_path:
+            img_bgr = _cv2.imread(image_path)
+        else:
+            return None
         if img_bgr is None:
             return None
+
+        # ── 运行 skyseg ────────────────────────────────────────────────
         result_map = run_skyseg(sky_session, [320, 320], img_bgr)
         result_map_full = _cv2.resize(
             result_map, (img_bgr.shape[1], img_bgr.shape[0])
@@ -860,8 +879,8 @@ def _compute_sky_valid_mask(
         sky_raw = np.zeros(result_map_full.shape, dtype=np.uint8)
         sky_raw[result_map_full < SKYSEG_THRESHOLD] = 255  # 非天空像素=255
 
-        # 保存 sky mask 到磁盘（可选）
-        if mask_dir is not None:
+        # 保存 sky mask 到磁盘（仅 _save_sky_mask=True 且 mask_dir 不为 None 时）
+        if mask_dir is not None and image_path:
             _os.makedirs(mask_dir, exist_ok=True)
             fname = sky_mask_filename(image_path)
             _cv2.imwrite(_os.path.join(mask_dir, fname), sky_raw)
@@ -1072,6 +1091,58 @@ def _compact_reservoir(
     return merged_pts, merged_cols, [], [], 0
 
 
+def _sample_global_snapshot(
+    res_pts: Optional[np.ndarray],
+    res_cols: Optional[np.ndarray],
+    pending_pts: list,
+    pending_cols: list,
+    max_points: int,
+    seed: int,
+) -> tuple:
+    """
+    从全局 reservoir（已紧凑化数组 + pending 分块列表）中随机采样 max_points 点，
+    不修改 reservoir 本身，不触发 compact。
+    每帧调用，确保 Rerun global 快照与最终保存使用同一套数据。
+
+    返回 (pts: np.ndarray | None, cols: np.ndarray | None)。
+    """
+    chunks_p = ([] if res_pts is None else [res_pts]) + list(pending_pts or [])
+    chunks_c = ([] if res_cols is None else [res_cols]) + list(pending_cols or [])
+    chunks = [
+        (p, c) for p, c in zip(chunks_p, chunks_c)
+        if p is not None and c is not None and len(p) > 0
+    ]
+    if not chunks:
+        return None, None
+
+    sizes = np.array([len(p) for p, _ in chunks], dtype=np.int64)
+    total = int(sizes.sum())
+
+    if max_points <= 0 or total <= max_points:
+        return (
+            np.concatenate([p for p, _ in chunks], axis=0).astype(np.float32, copy=False),
+            np.concatenate([c for _, c in chunks], axis=0).astype(np.uint8, copy=False),
+        )
+
+    rng = np.random.default_rng(seed)
+    global_idx = rng.choice(total, int(max_points), replace=False)
+    global_idx.sort()
+
+    out_p: list = []
+    out_c: list = []
+    offset = 0
+    for (p, c), n in zip(chunks, sizes):
+        local = global_idx[(global_idx >= offset) & (global_idx < offset + n)] - offset
+        if len(local):
+            out_p.append(p[local])
+            out_c.append(c[local])
+        offset += n
+
+    if not out_p:
+        return None, None
+    return np.concatenate(out_p, axis=0), np.concatenate(out_c, axis=0)
+
+
 def _build_viewer_payload(
     outputs_cpu: dict,
     frame_idx: int,
@@ -1141,25 +1212,27 @@ def _save_frame_outputs(
         depth_np = outputs_cpu.get("depth_np")
         if depth_np is not None:
             dpt_dir = _os.path.join(out_dir, "depth", "dpt")
-            plasma_dir = _os.path.join(out_dir, "depth", "dpt_plasma")
             _os.makedirs(dpt_dir, exist_ok=True)
-            _os.makedirs(plasma_dir, exist_ok=True)
             np.save(_os.path.join(dpt_dir, f"frame_{frame_idx:06d}.npy"), depth_np)
-            # plasma 伪彩色可视化：复用 longstream.utils.depth.colorize_depth
-            try:
-                from longstream.utils.depth import colorize_depth as _colorize_depth
-                d_vis = _colorize_depth(depth_np, cmap="plasma")  # uint8 [H,W,3]
-            except Exception:
-                # 降级：灰度归一化（应急）
-                d_min, d_max = depth_np.min(), depth_np.max()
-                if d_max > d_min:
-                    d_vis = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-                else:
-                    d_vis = np.zeros_like(depth_np, dtype=np.uint8)
-                d_vis = np.stack([d_vis, d_vis, d_vis], axis=-1)
-            PIL.Image.fromarray(d_vis).save(
-                _os.path.join(plasma_dir, f"frame_{frame_idx:06d}.png")
-            )
+            # dpt_plasma 伪彩色 PNG：save_depth_vis=false 时跳过（默认 True 向后兼容）
+            if out_cfg.get("save_depth_vis", True):
+                plasma_dir = _os.path.join(out_dir, "depth", "dpt_plasma")
+                _os.makedirs(plasma_dir, exist_ok=True)
+                # plasma 伪彩色可视化：复用 longstream.utils.depth.colorize_depth
+                try:
+                    from longstream.utils.depth import colorize_depth as _colorize_depth
+                    d_vis = _colorize_depth(depth_np, cmap="plasma")  # uint8 [H,W,3]
+                except Exception:
+                    # 降级：灰度归一化（应急）
+                    d_min, d_max = depth_np.min(), depth_np.max()
+                    if d_max > d_min:
+                        d_vis = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+                    else:
+                        d_vis = np.zeros_like(depth_np, dtype=np.uint8)
+                    d_vis = np.stack([d_vis, d_vis, d_vis], axis=-1)
+                PIL.Image.fromarray(d_vis).save(
+                    _os.path.join(plasma_dir, f"frame_{frame_idx:06d}.png")
+                )
 
     # ── 逐帧点云 PLY（使用预计算的 filtered_points_np，与 Rerun 保持完全一致）──
     # 按 max_frame_pts 下采样，与非流式 core/infer.py 相同语义

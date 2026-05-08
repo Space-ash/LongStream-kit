@@ -132,7 +132,8 @@ output:
   save_points: true
   save_frame_points: true
 
-  mask_sky: true
+  enable_sky_mask: true    # 启用天空过滤
+  save_sky_mask: false      # 是否将天空遮罩 PNG 写入磁盘
   skyseg_path: model/skyseg.onnx
 
   max_full_pointcloud_points: 2000000
@@ -148,3 +149,11 @@ evaluation:
   point_eval_max_points: 100000
   point_eval_voxel_size: null
   point_eval_oversample_factor: 4
+
+monitoring:
+  enabled: false
+  interval_sec: 2.0
+  top_process_count: 10
+  write_process_top: true
+  write_cpu_timeseries: true
+  write_gpu_timeseries: true

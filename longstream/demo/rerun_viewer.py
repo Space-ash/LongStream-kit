@@ -39,24 +39,26 @@ except ImportError:
     _RERUN_AVAILABLE = False
     rr = None  # type: ignore[assignment]
 
-# 论文截图友好的浅灰背景色
+# 默认坐标系字符串 → rr.ViewCoordinates 属性名（如 RIGHT_HAND_Z_UP）
+_VIEW_COORD_DEFAULT = "RIGHT_HAND_Z_UP"
 
 
 def _make_spatial3d_view(name: str, origin: str):
-    """Create a Spatial3DView with white background; falls back gracefully on ABI mismatch."""
+    """Create a Spatial3DView with default background."""
     import rerun.blueprint as rrb
+    return rrb.Spatial3DView(name=name, origin=origin)
+
+
+def _log_rerun_coordinate_system(view_coordinates: str) -> None:
+    """Log coordinate system to 'live' entity (static, best-effort)."""
     try:
-        return rrb.Spatial3DView(name=name, origin=origin, background=[255, 255, 255])
-    except Exception as _bg_exc:
-        print(
-            f"[RerunViewer] 警告：白色背景设置失败（{_bg_exc}）。"
-            "需要对齐服务器环境中 numpy / pandas / rerun-sdk 的 ABI 版本，"
-            "建议重装 pandas 和 rerun-sdk（例如 pip install --force-reinstall pandas rerun-sdk），"
-            "或回退到当前环境兼容的 numpy 版本，而不是单独重装 numpy。"
-            "也可在 Rerun Viewer GUI 中选择 Settings → Appearance → Theme → Light。",
-            flush=True,
-        )
-        return rrb.Spatial3DView(name=name, origin=origin)
+        coord = getattr(rr.ViewCoordinates, view_coordinates, None)
+        if coord is None:
+            print(f"[RerunViewer] 警告：未知坐标系 '{view_coordinates}'，跳过设置。", flush=True)
+            return
+        rr.log("live", coord, static=True)
+    except Exception as _ce:
+        print(f"[RerunViewer] 坐标系设置失败（{_ce}），跳过。", flush=True)
 
 
 def _make_blueprint():
@@ -108,6 +110,8 @@ class RerunViewer:
         RGB 图像更新频率（帧），默认 1（每帧更新，播放速度由 data.fps 控制）。
     depth_update_interval : int
         深度图更新频率（帧），默认 1（每帧更新，播放速度由 data.fps 控制）。
+    view_coordinates : str
+        Rerun 坐标系，对应 rr.ViewCoordinates 的属性名，默认 RIGHT_HAND_Z_UP。
     spawn : bool
         是否在 init() 时自动打开 Rerun Viewer 窗口（spawn=True）。
     """
@@ -121,6 +125,7 @@ class RerunViewer:
         rerun_global_update_interval: int = 1,
         image_update_interval: int = 1,
         depth_update_interval: int = 1,
+        view_coordinates: str = _VIEW_COORD_DEFAULT,
         spawn: bool = True,
     ) -> None:
         if not _RERUN_AVAILABLE:
@@ -134,6 +139,7 @@ class RerunViewer:
         self.rerun_global_update_interval = max(1, int(rerun_global_update_interval))
         self.image_update_interval = max(1, int(image_update_interval))
         self.depth_update_interval = max(1, int(depth_update_interval))
+        self.view_coordinates = str(view_coordinates) or _VIEW_COORD_DEFAULT
         self.spawn = spawn
         self._initialized = False
         # 轨迹缓冲（相机中心序列）
@@ -164,11 +170,7 @@ class RerunViewer:
         self._initialized = True
         self._centers = []
         print(f"[RerunViewer] 已初始化: app_name={self.app_name!r}, recording_id={recording_id}", flush=True)
-        print(
-            "[RerunViewer] 注意：如需展示白色背景（论文截图风格），"
-            "请在 Rerun Viewer 界面选择 Settings → Appearance → Theme → Light。",
-            flush=True,
-        )
+        _log_rerun_coordinate_system(self.view_coordinates)
 
     def log_frame(self, frame_idx: int, outputs_cpu: dict) -> None:
         """

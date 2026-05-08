@@ -366,7 +366,13 @@ def run_inference_cfg(cfg: dict):
     save_dpt_unproj = bool(output_cfg.get("save_dpt_unproj", save_points))
     save_depth = bool(output_cfg.get("save_depth", True))
     save_images = bool(output_cfg.get("save_images", True))
-    mask_sky = bool(output_cfg.get("mask_sky", True))
+    # 天空过滤：enable_sky_mask 控制过滤开关，save_sky_mask 控制 PNG 写盘；兼容旧字段 mask_sky
+    enable_sky_mask = bool(
+        output_cfg.get("enable_sky_mask", output_cfg.get("mask_sky", True))
+    )
+    save_sky_mask = bool(
+        output_cfg.get("save_sky_mask", output_cfg.get("mask_sky", False))
+    )
     max_full_pointcloud_points = output_cfg.get("max_full_pointcloud_points", None)
     if max_full_pointcloud_points is not None:
         max_full_pointcloud_points = int(max_full_pointcloud_points)
@@ -636,9 +642,12 @@ def run_inference_cfg(cfg: dict):
                     )
 
             sky_masks = None
-            if mask_sky:
+            if enable_sky_mask:
+                sky_target_dir = (
+                    os.path.join(seq_dir, "sky_masks") if save_sky_mask else None
+                )
                 raw_sky_masks = compute_sky_mask(
-                    seq.image_paths, skyseg_path, os.path.join(seq_dir, "sky_masks")
+                    seq.image_paths, skyseg_path, sky_target_dir
                 )
                 if raw_sky_masks is not None:
                     sky_masks = [
