@@ -73,7 +73,7 @@ def _make_blueprint():
         import rerun.blueprint as rrb
         blueprint = rrb.Blueprint(
             rrb.Grid(
-                _make_spatial3d_view("Current Frame",        "live/current/points"),
+                _make_spatial3d_view("Current Frame",        "live/current"),
                 _make_spatial3d_view("Global Reconstruction", "live/global"),
                 rrb.Spatial2DView(name="RGB",   origin="live/rgb"),
                 rrb.Spatial2DView(name="Depth", origin="live/depth"),
@@ -250,9 +250,13 @@ class RerunViewer:
             cur_pts = outputs_cpu.get("filtered_dpu_pts_np")
             cur_cols = outputs_cpu.get("filtered_dpu_cols_np")
 
-        # ── 全局候选：优先用 worker reservoir 快照，回退至原始过滤数据 ──────────
-        glb_pts = outputs_cpu.get("viewer_global_points_np")
-        glb_cols = outputs_cpu.get("viewer_global_colors_np")
+        # ── 全局候选：优先用 viewer_global_frame_points_np（per-frame 下采样），
+        # 回退 viewer_global_points_np（旧 reservoir 快照），最终回退原始过滤数据 ──
+        glb_pts = outputs_cpu.get("viewer_global_frame_points_np")
+        glb_cols = outputs_cpu.get("viewer_global_frame_colors_np")
+        if glb_pts is None or glb_cols is None:
+            glb_pts = outputs_cpu.get("viewer_global_points_np")
+            glb_cols = outputs_cpu.get("viewer_global_colors_np")
         if glb_pts is None or glb_cols is None:
             glb_pts = outputs_cpu.get("filtered_dpu_pts_np")
             glb_cols = outputs_cpu.get("filtered_dpu_cols_np")
@@ -260,7 +264,7 @@ class RerunViewer:
             glb_pts = outputs_cpu.get("filtered_points_np")
             glb_cols = outputs_cpu.get("filtered_colors_np")
 
-        # ── 左上：当前帧点云（每帧覆盖同一路径）──────────────────────────────
+        # ── 左上：当前帧点云（每帧覆盖同一路径，origin=live/current）─────────
         if cur_pts is not None and cur_cols is not None and len(cur_pts) > 0:
             if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
                 rng = np.random.default_rng(seed=frame_idx)
@@ -276,7 +280,7 @@ class RerunViewer:
                 ),
             )
 
-        # ── 右上：全局视图，直接使用 worker reservoir 快照，固定路径更新 ──
+        # ── 右上：全局视图，每帧独立 entity 累积（恢复 889f81 策略，数据源换成 dpt_unproj）──
         if glb_pts is not None and glb_cols is not None and len(glb_pts) > 0:
             if frame_idx % self.rerun_global_update_interval == 0:
                 send_pts = glb_pts
@@ -287,7 +291,7 @@ class RerunViewer:
                     send_pts = send_pts[keep_g]
                     send_cols = send_cols[keep_g] if send_cols is not None else None
                 rr.log(
-                    "live/global/points",
+                    f"live/global/points/frame_{frame_idx:06d}",
                     rr.Points3D(
                         send_pts,
                         colors=send_cols,

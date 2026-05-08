@@ -136,6 +136,7 @@ def _merge_basic_into_cfg(
     output_root: str = "",
     streaming_mode: str = "causal",
     max_frames: int = 0,
+    enable_monitoring: bool = True,
 ) -> dict:
     """Apply UI leaf-values onto base cfg. Never modifies model/checkpoint keys."""
     cfg = copy.deepcopy(cfg)
@@ -191,6 +192,8 @@ def _merge_basic_into_cfg(
     cfg["data"]["max_frames"] = None if mf <= 0 else mf
 
     cfg["_enable_rerun"] = bool(enable_rerun)
+    cfg.setdefault("monitoring", {})
+    cfg["monitoring"]["enabled"] = bool(enable_monitoring)
     return cfg
 
 
@@ -243,7 +246,7 @@ _ADVANCED_YAML_PLACEHOLDER = (
 def update_ui_from_yaml(template_name: str) -> tuple:
     """
     Load template YAML and refresh bound UI components.
-    Returns 25 values:
+    Returns 26 values:
       window_size, refresh, keyframe_stride, confidence_threshold,
       max_frame_points, max_full_points,
       enable_tto, enable_filter, enable_conf_filter,
@@ -252,7 +255,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
       output_root, source_path, data_roots_file, seq_list, camera,
       source_type (dropdown label), generalizable_row (visibility update),
       streaming_mode, streaming_mode_warning (visibility),
-      max_frames
+      max_frames, enable_monitoring
     advanced_yaml is NOT updated here — it remains the user's override box.
     """
     if template_name == "Custom":
@@ -274,6 +277,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
     fps_val = data.get("fps", 18) or 18
     sim_val = bool(rt.get("simulate_streaming", True))
     rerun_val = bool(cfg.get("_enable_rerun", True))
+    monitoring_val = bool(cfg.get("monitoring", {}).get("enabled", True))
 
     out = cfg.get("output", {})
     data_fmt = data.get("format", "image_dir")
@@ -310,6 +314,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         gr.update(value=infer.get("streaming_mode", "causal")),  # 23 streaming_mode
         gr.update(visible=(infer.get("streaming_mode", "causal") == "causal")),  # 24 streaming_mode_warning
         gr.update(value=0 if mf is None else int(mf)),       # 25 max_frames
+        gr.update(value=monitoring_val),                     # 26 enable_monitoring
     )
 
 
@@ -341,6 +346,7 @@ def _build_cfg_from_ui(
     camera: str = "00",
     streaming_mode: str = "causal",
     max_frames: int = 0,
+    enable_monitoring: bool = True,
 ) -> dict:
     """Build complete cfg from UI values using base_cfg (from cfg_state) as the foundation.
 
@@ -365,6 +371,7 @@ def _build_cfg_from_ui(
         output_root=output_root,
         streaming_mode=streaming_mode,
         max_frames=max_frames,
+        enable_monitoring=enable_monitoring,
     )
     # 3. UI 可见路径字段最终优先（覆盖 advanced 里可能有的 data.*）
     cfg.setdefault("data", {})
@@ -427,6 +434,7 @@ def _start_runner(
     camera: str = "00",
     streaming_mode: str = "causal",
     max_frames: int = 0,
+    enable_monitoring: bool = True,
 ) -> tuple:
     global _active_runner, _rerun_viewer, _resource_monitor
 
@@ -450,6 +458,7 @@ def _start_runner(
         camera=camera,
         streaming_mode=streaming_mode,
         max_frames=max_frames,
+        enable_monitoring=enable_monitoring,
     )
 
     if simulate_streaming:
@@ -499,19 +508,8 @@ def _start_runner(
     with _runner_lock:
         _active_runner = runner
 
-    # 资源监控：在 runner.start() 前启动，覆盖模型加载到输出全过程
-    try:
-        from longstream.utils.resource_monitor import from_cfg as _monitor_from_cfg
-        _mon = _monitor_from_cfg(cfg.get("monitoring", {}))
-        if _mon is not None:
-            _out_dir = os.path.abspath(
-                cfg.get("output", {}).get("root", "outputs")
-            )
-            _mon.start(_out_dir)
-            with _runner_lock:
-                _resource_monitor = _mon
-    except Exception:
-        pass
+    # 资源监控由推理子进程自行启动（记录真实推理进程的 CPU/GPU 数据）
+    # Gradio 主进程仅负责将 monitoring.enabled 写入 cfg，不在此处启动
 
     runner.start()
     return (
@@ -537,9 +535,6 @@ def _stop_runner() -> tuple:
         )
 
     runner.stop()
-
-    if monitor is not None:
-        monitor.stop()
 
     with _runner_lock:
         _active_runner    = None
@@ -592,6 +587,7 @@ def save_custom_config(
     camera: str = "00",
     streaming_mode: str = "causal",
     max_frames: int = 0,
+    enable_monitoring: bool = True,
 ) -> tuple:
     """Save current UI params to custom_infer.yaml. Returns (path, Custom dropdown update, new cfg_state)."""
     cfg = _build_cfg_from_ui(
@@ -607,6 +603,7 @@ def save_custom_config(
         camera=camera,
         streaming_mode=streaming_mode,
         max_frames=max_frames,
+        enable_monitoring=enable_monitoring,
     )
     custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
     os.makedirs(_CONFIGS_DIR, exist_ok=True)
@@ -750,6 +747,10 @@ def main():
                     label="Rerun 渲染（仅流式模式）",
                     value=True,
                 )
+                enable_monitoring = gr.Checkbox(
+                    label="启用 CPU/GPU 资源监控 (monitoring.enabled)",
+                    value=bool(_initial_cfg.get("monitoring", {}).get("enabled", True)),
+                )
 
             save_outputs = gr.CheckboxGroup(
                 label="保存输出 (output.*)",
@@ -835,6 +836,7 @@ def main():
             streaming_mode,                              # 23
             streaming_mode_warning,                      # 24
             max_frames,                                  # 25
+            enable_monitoring,                           # 26
         ]
         # 使用 .input() 而非 .change()：
         # .input() 仅在用户直接点击 Dropdown 时触发；
@@ -880,7 +882,7 @@ def main():
 
         # Checkboxes / CheckboxGroup: use .input()
         for _comp in [simulate_streaming, enable_tto, enable_filter,
-                      enable_conf_filter, enable_rerun, save_outputs]:
+                      enable_conf_filter, enable_rerun, save_outputs, enable_monitoring]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # Textbox / Dropdown / Code / Radio / Number: use .input()
@@ -899,6 +901,7 @@ def main():
             save_outputs, enable_rerun, advanced_yaml,
             output_root, data_roots_file, seq_list, camera,
             streaming_mode, max_frames,
+            enable_monitoring,
         ]
 
         # ─── Button events ─────────────────────────────────────────────

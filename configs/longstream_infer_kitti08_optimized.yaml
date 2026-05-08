@@ -130,7 +130,7 @@ evaluation:
   point_eval_oversample_factor: 4
 
 monitoring:
-  enabled: false
+  enabled: true
   interval_sec: 2.0
   top_process_count: 10
   write_process_top: true

@@ -155,6 +155,18 @@ def _worker_inference_loop(
     _out_dir: str = os.path.join(_out_root, _seq_name)
     print(f"[LiveInferenceRunner/worker] 输出目录: {_out_dir}", flush=True)
 
+    # ── 资源监控：在推理进程内启动，记录真实推理进程的 CPU/GPU ──────────
+    _live_monitor = None
+    try:
+        from longstream.utils.resource_monitor import from_cfg as _mon_from_cfg
+        _live_monitor = _mon_from_cfg(cfg.get("monitoring", {}))
+        if _live_monitor is not None:
+            _live_monitor.start(_out_dir)
+            print("[LiveInferenceRunner/worker] 资源监控已启动", flush=True)
+    except Exception as _mon_err:
+        print(f"[LiveInferenceRunner/worker] 资源监控启动失败（忽略）: {_mon_err}", flush=True)
+        _live_monitor = None
+
     # 如果启用 GLB 导出，自动启用逐帧点云
     if _out_cfg_merged.get("export_glb", False) and not _out_cfg_merged.get("save_frame_points", False):
         _out_cfg_merged = dict(_out_cfg_merged)
@@ -253,12 +265,22 @@ def _worker_inference_loop(
 
     print("[LiveInferenceRunner/worker] 开始逐帧推理", flush=True)
 
+    # ── 逐帧 timing 统计（每 N 帧打印一次，默认 10 帧）─────────────────
+    _timing_interval: int = int(_out_cfg_merged.get("timing_log_interval", 10))
+    _timing_acc = {
+        "decode_infer": 0.0, "skyseg": 0.0, "filter": 0.0,
+        "save": 0.0, "rerun_payload": 0.0, "queue_put": 0.0, "total": 0.0,
+    }
+    _timing_n: int = 0
+
     with torch.no_grad():
         for packet in feeder:
             if stop_flag.is_set():
                 break
 
             g: int = packet.frame_index
+            _t_frame_start = time.perf_counter()
+            _t0 = _t_frame_start
             local_pos: int = g - segment_start
 
             is_kf = (g == 0) or (g % keyframe_stride == 0)
@@ -310,6 +332,8 @@ def _worker_inference_loop(
                 outputs, packet, kf_idx_local, local_pos, is_kf,
                 seg_R_abs, seg_t_abs,
             )
+            _t1 = time.perf_counter()
+            _timing_acc["decode_infer"] += _t1 - _t0
 
             # ── sky mask（decode 完成后、filter 之前追加）────────────────
             if _sky_session is not None:
@@ -321,6 +345,8 @@ def _worker_inference_loop(
                     int(data_cfg.get("patch_size", 14)),
                     outputs_cpu,
                 )
+            _t2 = time.perf_counter()
+            _timing_acc["skyseg"] += _t2 - _t1
 
             # ── refresh 逻辑 ──────────────────────────────────────────────
             if is_kf and g > 0:
@@ -366,6 +392,7 @@ def _worker_inference_loop(
             del frame_tensor
 
             # ── 统一过滤（一次计算，供磁盘保存 + Rerun 共用）────────────────
+            _t3_start = time.perf_counter()
             _fpts, _fcols = _filter_points_colors(outputs_cpu, _out_cfg_merged)
             if _fpts is not None and len(_fpts) > 0:
                 outputs_cpu["filtered_points_np"] = _fpts.astype(np.float32)
@@ -391,6 +418,8 @@ def _worker_inference_loop(
                 else:
                     outputs_cpu["filtered_dpu_pts_np"] = None
                     outputs_cpu["filtered_dpu_cols_np"] = None
+            _t3 = time.perf_counter()
+            _timing_acc["filter"] += _t3 - _t3_start
 
             # ── 累积位姿（用于结束后写 abs_pose.txt）────────────────────────
             R_abs_np = outputs_cpu.get("R_abs_np")
@@ -407,6 +436,7 @@ def _worker_inference_loop(
                 _log_cuda_memory("live", g)
 
             # ── 增量保存到磁盘（使用预计算的 filtered_points_np，严禁 GPU Tensor）──
+            _t4_start = time.perf_counter()
             _save_frame_outputs(outputs_cpu, _out_cfg_merged, _out_dir, g,
                                 max_frame_pts=_max_frame_pts,
                                 save_point_head=_save_point_head)
@@ -428,6 +458,8 @@ def _worker_inference_loop(
                     _os.makedirs(_dpu_dir, exist_ok=True)
                     _write_ply(_dpu_save, _os.path.join(_dpu_dir, f"frame_{g:06d}.ply"),
                                colors=_dpu_csave)
+            _t4 = time.perf_counter()
+            _timing_acc["save"] += _t4 - _t4_start
 
             # ── 全局 reservoir 更新（不受逐帧下采样预算限制，直接用完整过滤结果）──
             if _save_point_head:
@@ -519,26 +551,29 @@ def _worker_inference_loop(
 
             # ── 注入 viewer 全局快照并发送到主进程（仅 Rerun 开启时）──────────
             if _emit_frame_results:
-                # 全局快照直接从最终全局 reservoir 采样，与磁盘保存数据一致
+                # ── per-frame entity 累积策略（恢复 889f81 方案，数据源改为 dpt_unproj）──
+                # 不再从百万级 reservoir 采样；每帧只传当前帧下采样点到 Rerun，
+                # Rerun 侧写 live/global/points/frame_XXXXXX 独立 entity，自然累积。
+                _t5_start = time.perf_counter()
+                _rerun_global_max: int = int(_out_cfg_merged.get(
+                    "rerun_global_frame_points", _viewer_max_global
+                ))
                 if _save_dpt_unproj:
-                    _gp, _gc = _sample_global_snapshot(
-                        _res_dpu_pts, _res_dpu_cols,
-                        _res_dpu_pending, _res_dpu_pending_cols,
-                        _viewer_max_global, g + 12345,
-                    )
+                    _gfp = outputs_cpu.get("filtered_dpu_pts_np")
+                    _gfc = outputs_cpu.get("filtered_dpu_cols_np")
                 elif _save_point_head:
-                    _gp, _gc = _sample_global_snapshot(
-                        _res_pts, _res_cols,
-                        _res_pending, _res_pending_cols,
-                        _viewer_max_global, g + 12345,
-                    )
+                    _gfp = outputs_cpu.get("filtered_points_np")
+                    _gfc = outputs_cpu.get("filtered_colors_np")
                 else:
-                    _gp, _gc = None, None
+                    _gfp, _gfc = None, None
+                _gfp, _gfc = _sample_points_for_viewer(_gfp, _gfc, _rerun_global_max, g + 77777)
                 _viewer_payload = _build_viewer_payload(
                     outputs_cpu, g,
                     int(_out_cfg_merged.get("rerun_current_points", _max_frame_pts)),
-                    _gp, _gc,
+                    _gfp, _gfc,
                 )
+                _t5 = time.perf_counter()
+                _timing_acc["rerun_payload"] += _t5 - _t5_start
                 # 丢旧保新：保证 viewer 看到最新帧而非落后多帧的旧帧
                 try:
                     result_queue.put_nowait((g, _viewer_payload))
@@ -548,6 +583,32 @@ def _worker_inference_loop(
                         result_queue.put_nowait((g, _viewer_payload))
                     except Exception:
                         pass
+                _t6 = time.perf_counter()
+                _timing_acc["queue_put"] += _t6 - _t5
+
+            # ── 帧计时统计（每 N 帧打印一次）────────────────────────────────
+            _t_frame_end = time.perf_counter()
+            _timing_acc["total"] += _t_frame_end - _t_frame_start
+            _timing_n += 1
+            if _timing_n > 0 and _timing_n % _timing_interval == 0:
+                _n = float(_timing_n)
+                print(
+                    f"[LiveInferenceRunner/timing] frame={g}  "
+                    f"avg/{_timing_interval}帧(ms): "
+                    f"decode_infer={1000*_timing_acc['decode_infer']/_n:.1f}  "
+                    f"skyseg={1000*_timing_acc['skyseg']/_n:.1f}  "
+                    f"filter={1000*_timing_acc['filter']/_n:.1f}  "
+                    f"save={1000*_timing_acc['save']/_n:.1f}  "
+                    f"rerun_payload={1000*_timing_acc['rerun_payload']/_n:.1f}  "
+                    f"queue_put={1000*_timing_acc['queue_put']/_n:.1f}  "
+                    f"total={1000*_timing_acc['total']/_n:.1f}  "
+                    f"fps={_n/max(_timing_acc['total'],1e-6):.2f}",
+                    flush=True,
+                )
+                # 重置累积（滑动窗口，便于持续观察性能变化）
+                for _k in _timing_acc:
+                    _timing_acc[_k] = 0.0
+                _timing_n = 0
 
     # ── 循环结束后刷入 pending（确保最后几帧纳入最终保存）──────────────────
     if _save_point_head and _res_pending_n > 0:
@@ -660,6 +721,12 @@ def _worker_inference_loop(
 
     session.clear()
     torch.cuda.empty_cache()
+    # ── 资源监控：推理结束后停止 ─────────────────────────────────────────
+    if _live_monitor is not None:
+        try:
+            _live_monitor.stop()
+        except Exception:
+            pass
     print("[LiveInferenceRunner/worker] 推理循环正常结束", flush=True)
 
 
@@ -1147,28 +1214,53 @@ def _build_viewer_payload(
     outputs_cpu: dict,
     frame_idx: int,
     max_frame_points: int,
-    global_pts: Optional[np.ndarray],
-    global_cols: Optional[np.ndarray],
+    global_frame_pts: Optional[np.ndarray],
+    global_frame_cols: Optional[np.ndarray],
 ) -> dict:
     """
     构建瘦 payload 发送给 Rerun viewer 进程。
     仅包含可视化所需字段，避免跨进程 pickle 传输大型滤波数组。
+
+    current 字段：优先 dpt_unproj，颜色缺失时从 point_colors_np 兜底（同一 mask）。
+    global 字段：已由调用方按 rerun_global_frame_points 下采样的当前帧点。
     """
-    # 优先 dpt_unproj（与 save_dpt_unproj 语义一致），回退 point_head
+    # ── 当前帧点云：优先 dpt_unproj，回退 point_head ──────────────────
     cur_pts = outputs_cpu.get("filtered_dpu_pts_np")
     cur_cols = outputs_cpu.get("filtered_dpu_cols_np")
+
+    # 颜色兜底：dpt_unproj pts 存在但颜色为空时，从 point_colors_np 恢复
+    if cur_pts is not None and len(cur_pts) > 0 and cur_cols is None:
+        _raw_colors = outputs_cpu.get("point_colors_np")
+        _conf = outputs_cpu.get("depth_conf_np") or outputs_cpu.get("conf_np")
+        if _raw_colors is not None:
+            _rcf = _raw_colors.reshape(-1, 3).astype(np.uint8)
+            _rmask = np.ones(len(_rcf), dtype=bool)
+            if _conf is not None:
+                _cf_flat = _conf.reshape(-1)
+                if len(_cf_flat) == len(_rcf):
+                    _rmask &= _cf_flat >= 0.5
+            _sky = outputs_cpu.get("sky_valid_mask_np")
+            if _sky is not None:
+                _sv = _sky.reshape(-1) > 0
+                if len(_sv) == len(_rcf):
+                    _rmask &= _sv
+            _rcf = _rcf[_rmask]
+            if len(_rcf) == len(cur_pts):
+                cur_cols = _rcf
+
     if cur_pts is None or cur_cols is None:
         cur_pts = outputs_cpu.get("filtered_points_np")
         cur_cols = outputs_cpu.get("filtered_colors_np")
+
     cur_pts, cur_cols = _sample_points_for_viewer(cur_pts, cur_cols, max_frame_points, frame_idx)
     return {
-        "rgb_np":                    outputs_cpu.get("rgb_np"),
-        "depth_np":                  outputs_cpu.get("depth_np"),
-        "center_np":                 outputs_cpu.get("center_np"),
-        "viewer_current_points_np":  cur_pts,
-        "viewer_current_colors_np":  cur_cols,
-        "viewer_global_points_np":   global_pts,
-        "viewer_global_colors_np":   global_cols,
+        "rgb_np":                        outputs_cpu.get("rgb_np"),
+        "depth_np":                      outputs_cpu.get("depth_np"),
+        "center_np":                     outputs_cpu.get("center_np"),
+        "viewer_current_points_np":      cur_pts,
+        "viewer_current_colors_np":      cur_cols,
+        "viewer_global_frame_points_np": global_frame_pts,
+        "viewer_global_frame_colors_np": global_frame_cols,
     }
 
 
@@ -1891,6 +1983,19 @@ def _batch_worker_main(
     """
     import traceback as _tb
 
+    # ── 资源监控：在推理进程内启动，记录真实推理进程的 CPU/GPU ──────────
+    _batch_monitor = None
+    try:
+        from longstream.utils.resource_monitor import from_cfg as _mon_from_cfg
+        _batch_monitor = _mon_from_cfg(cfg.get("monitoring", {}))
+        if _batch_monitor is not None:
+            _batch_out_dir = os.path.abspath(
+                cfg.get("output", {}).get("root", "outputs")
+            )
+            _batch_monitor.start(_batch_out_dir)
+    except Exception:
+        _batch_monitor = None
+
     try:
         from longstream.core.infer import run_inference_cfg
         run_inference_cfg(cfg)
@@ -1902,6 +2007,11 @@ def _batch_worker_main(
             pass
         _tb.print_exc()
     finally:
+        if _batch_monitor is not None:
+            try:
+                _batch_monitor.stop()
+            except Exception:
+                pass
         try:
             torch.cuda.empty_cache()
         except Exception:

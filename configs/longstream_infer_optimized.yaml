@@ -123,7 +123,7 @@ evaluation:
   point_eval_oversample_factor: 4
 
 monitoring:
-  enabled: false             # 设为 true 启动后台资源采样（需要 psutil）
+  enabled: true             # 设为 true 启动后台资源采样（需要 psutil）
   interval_sec: 2.0
   top_process_count: 10
   write_process_top: true    # cpu_process_top.csv（debug 用）
