@@ -779,6 +779,8 @@ def _worker_inference_loop(
 
     session.clear()
     torch.cuda.empty_cache()
+    # ── skyseg cache 清理（正常结束路径）────────────────────────────────
+    _cleanup_sky_cache_dir(_sky_cache_dir, _out_dir)
     # ── 资源监控：推理结束后停止 ─────────────────────────────────────────
     if _live_monitor is not None:
         try:
@@ -936,6 +938,36 @@ def _write_ply(pts: np.ndarray, path: str, colors: np.ndarray = None) -> None:
     """将 [N, 3] float32 数组写出为二进制 PLY 文件（支持可选颜色）。"""
     from longstream.io.save_points import save_pointcloud
     save_pointcloud(path, pts, colors=colors)
+
+
+def _cleanup_sky_cache_dir(cache_dir: Optional[str], out_dir: str) -> None:
+    """当 cache_dir 属于 out_dir 子目录时，推理结束后自动删除。"""
+    if not cache_dir:
+        return
+    try:
+        cache_abs = _os.path.abspath(cache_dir)
+        out_abs = _os.path.abspath(out_dir)
+        if cache_abs.startswith(out_abs + _os.sep) and _os.path.isdir(cache_abs):
+            import shutil as _shutil
+            _shutil.rmtree(cache_abs)
+            print(f"[LiveInferenceRunner/worker] skyseg cache 已清理: {cache_abs}", flush=True)
+    except Exception as exc:
+        print(f"[LiveInferenceRunner/worker] skyseg cache 清理失败（忽略）: {exc}", flush=True)
+
+
+def _cleanup_sky_cache_dir(cache_dir: Optional[str], out_dir: str) -> None:
+    """当 cache_dir 属于 out_dir 子目录时，推理结束后自动删除。"""
+    if not cache_dir:
+        return
+    try:
+        cache_abs = _os.path.abspath(cache_dir)
+        out_abs = _os.path.abspath(out_dir)
+        if cache_abs.startswith(out_abs + _os.sep) and _os.path.isdir(cache_abs):
+            import shutil as _shutil
+            _shutil.rmtree(cache_abs)
+            print(f"[LiveInferenceRunner/worker] skyseg cache 已清理: {cache_abs}", flush=True)
+    except Exception as exc:
+        print(f"[LiveInferenceRunner/worker] skyseg cache 清理失败（忽略）: {exc}", flush=True)
 
 
 def _select_skyseg_providers(ort_module, out_cfg: dict, device_str: str) -> list:

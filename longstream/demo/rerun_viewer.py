@@ -73,7 +73,7 @@ def _make_blueprint():
         import rerun.blueprint as rrb
         blueprint = rrb.Blueprint(
             rrb.Grid(
-                _make_spatial3d_view("Current Frame",        "live/current"),
+                _make_spatial3d_view("Current Frame",        "live/current/points"),
                 _make_spatial3d_view("Global Reconstruction", "live/global"),
                 rrb.Spatial2DView(name="RGB",   origin="live/rgb"),
                 rrb.Spatial2DView(name="Depth", origin="live/depth"),
@@ -278,7 +278,7 @@ class RerunViewer:
                 cur_pts = cur_pts[keep]
                 cur_cols = cur_cols[keep]
             rr.log(
-                "live/current",
+                "live/current/points",
                 rr.Points3D(
                     cur_pts,
                     colors=cur_cols,
