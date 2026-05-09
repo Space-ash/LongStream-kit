@@ -290,7 +290,7 @@ class RerunViewer:
                     rr.Points3D(
                         cur_pts,
                         colors=cur_cols,
-                        radii=np.full(len(cur_pts), 0.008, dtype=np.float32),
+                        radii=np.full(len(cur_pts), 0.08, dtype=np.float32),
                     ),
                 )
             except Exception as exc:
