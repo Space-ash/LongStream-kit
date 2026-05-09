@@ -265,6 +265,12 @@ class RerunViewer:
             glb_cols = outputs_cpu.get("filtered_colors_np")
 
         # ── 左上：当前帧点云（每帧覆盖同一路径，origin=live/current）─────────
+        if frame_idx == 0:
+            print(
+                f"[RerunViewer] current_points={None if cur_pts is None else len(cur_pts)} "
+                f"current_colors={None if cur_cols is None else len(cur_cols)}",
+                flush=True,
+            )
         if cur_pts is not None and cur_cols is not None and len(cur_pts) > 0:
             if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
                 rng = np.random.default_rng(seed=frame_idx)
@@ -272,7 +278,7 @@ class RerunViewer:
                 cur_pts = cur_pts[keep]
                 cur_cols = cur_cols[keep]
             rr.log(
-                "live/current/points",
+                "live/current",
                 rr.Points3D(
                     cur_pts,
                     colors=cur_cols,

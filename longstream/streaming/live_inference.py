@@ -246,14 +246,34 @@ def _worker_inference_loop(
             _sky_so = _ort.SessionOptions()
             _sky_so.intra_op_num_threads = int(_out_cfg_merged.get("skyseg_num_threads", 1))
             _sky_so.inter_op_num_threads = 1
-            _sky_session = _ort.InferenceSession(
-                _sky_model_path,
-                sess_options=_sky_so,
-                providers=["CPUExecutionProvider"],
+            _sky_providers = _select_skyseg_providers(_ort, _out_cfg_merged, device_str)
+            try:
+                _sky_session = _ort.InferenceSession(
+                    _sky_model_path,
+                    sess_options=_sky_so,
+                    providers=_sky_providers,
+                )
+            except Exception as _cuda_err:
+                if _sky_providers != ["CPUExecutionProvider"]:
+                    print(
+                        f"[LiveInferenceRunner/worker] skyseg CUDA session 初始化失败，回退 CPU。"
+                        f"原因: {_cuda_err}",
+                        flush=True,
+                    )
+                    _sky_session = _ort.InferenceSession(
+                        _sky_model_path,
+                        sess_options=_sky_so,
+                        providers=["CPUExecutionProvider"],
+                    )
+                else:
+                    raise
+            print(
+                f"[LiveInferenceRunner/worker] sky segmentation session 初始化成功, "
+                f"providers={_sky_session.get_providers()}",
+                flush=True,
             )
             # _save_sky_mask=True 时才创建 sky_masks 目录（避免不必要的磁盘目录）
             _sky_mask_dir = os.path.join(_out_dir, "sky_masks") if _save_sky_mask else None
-            print("[LiveInferenceRunner/worker] sky segmentation session 初始化成功", flush=True)
         except Exception as _sky_init_err:
             print(
                 f"[LiveInferenceRunner/worker] 警告：sky segmentation 初始化失败，本次跳过天空过滤。"
@@ -262,6 +282,23 @@ def _worker_inference_loop(
             )
             _sky_session = None
             _sky_mask_dir = None
+
+    # ── skyseg mask 复用状态 ──────────────────────────────────────────────
+    _skyseg_reuse_enabled = bool(_out_cfg_merged.get("skyseg_reuse_enabled", True))
+    _skyseg_stride = max(1, int(_out_cfg_merged.get("skyseg_stride", 4)))
+    _skyseg_run_on_keyframes = bool(_out_cfg_merged.get("skyseg_run_on_keyframes", True))
+    _skyseg_max_stale_frames = max(0, int(_out_cfg_merged.get("skyseg_max_stale_frames", 8)))
+    _last_sky_valid_mask_np: Optional[np.ndarray] = None
+    _last_sky_valid_mask_frame: int = -1
+
+    # ── skyseg cache 配置 ─────────────────────────────────────────────────
+    _sky_cache_enabled = bool(_out_cfg_merged.get("skyseg_cache_enabled", False))
+    _sky_cache_dir = _out_cfg_merged.get("skyseg_cache_dir", None)
+    if _sky_cache_enabled:
+        if not _sky_cache_dir:
+            _sky_cache_dir = _os.path.join(_out_dir, "sky_masks_cache")
+    else:
+        _sky_cache_dir = None
 
     print("[LiveInferenceRunner/worker] 开始逐帧推理", flush=True)
 
@@ -337,14 +374,35 @@ def _worker_inference_loop(
 
             # ── sky mask（decode 完成后、filter 之前追加）────────────────
             if _sky_session is not None:
-                outputs_cpu["sky_valid_mask_np"] = _compute_sky_valid_mask(
-                    outputs_cpu.get("rgb_np"), packet.image_path,
-                    _sky_session, _sky_mask_dir,
-                    int(data_cfg.get("size", 518)),
-                    bool(data_cfg.get("crop", False)),
-                    int(data_cfg.get("patch_size", 14)),
-                    outputs_cpu,
+                need_skyseg = (
+                    _last_sky_valid_mask_np is None
+                    or g == 0
+                    or (g % _skyseg_stride == 0)
+                    or (_skyseg_run_on_keyframes and is_kf)
                 )
+                can_reuse = (
+                    _skyseg_reuse_enabled
+                    and _last_sky_valid_mask_np is not None
+                    and _last_sky_valid_mask_frame >= 0
+                    and (g - _last_sky_valid_mask_frame) <= _skyseg_max_stale_frames
+                )
+                if need_skyseg or not can_reuse:
+                    mask = _compute_sky_valid_mask(
+                        outputs_cpu.get("rgb_np"), packet.image_path,
+                        _sky_session, _sky_mask_dir,
+                        int(data_cfg.get("size", 518)),
+                        bool(data_cfg.get("crop", False)),
+                        int(data_cfg.get("patch_size", 14)),
+                        outputs_cpu,
+                        cache_dir=_sky_cache_dir,
+                        cache_enabled=_sky_cache_enabled,
+                    )
+                    outputs_cpu["sky_valid_mask_np"] = mask
+                    if mask is not None:
+                        _last_sky_valid_mask_np = mask
+                        _last_sky_valid_mask_frame = g
+                else:
+                    outputs_cpu["sky_valid_mask_np"] = _last_sky_valid_mask_np
             _t2 = time.perf_counter()
             _timing_acc["skyseg"] += _t2 - _t1
 
@@ -880,6 +938,51 @@ def _write_ply(pts: np.ndarray, path: str, colors: np.ndarray = None) -> None:
     save_pointcloud(path, pts, colors=colors)
 
 
+def _select_skyseg_providers(ort_module, out_cfg: dict, device_str: str) -> list:
+    """
+    根据 out_cfg["skyseg_provider"]（auto/cuda/cpu）选择 ONNX Runtime providers。
+    auto 模式下检查空闲显存，低于 skyseg_cuda_min_free_gb 则回退 CPU。
+    """
+    requested = str(out_cfg.get("skyseg_provider", "auto")).lower()
+    if requested not in ("auto", "cuda", "cpu"):
+        requested = "auto"
+
+    available = ort_module.get_available_providers()
+    if requested == "cpu":
+        return ["CPUExecutionProvider"]
+
+    if "CUDAExecutionProvider" not in available:
+        if requested == "cuda":
+            print(
+                "[LiveInferenceRunner/worker] skyseg_provider=cuda requested, "
+                "but CUDAExecutionProvider is unavailable; fallback to CPU.",
+                flush=True,
+            )
+        return ["CPUExecutionProvider"]
+
+    if requested == "auto":
+        try:
+            if str(device_str).startswith("cuda") and torch.cuda.is_available():
+                free_bytes, _ = torch.cuda.mem_get_info()
+                free_gb = free_bytes / (1024 ** 3)
+                min_free = float(out_cfg.get("skyseg_cuda_min_free_gb", 4.0))
+                if free_gb < min_free:
+                    print(
+                        f"[LiveInferenceRunner/worker] skyseg auto fallback CPU: "
+                        f"free_vram={free_gb:.2f}GiB < {min_free:.2f}GiB",
+                        flush=True,
+                    )
+                    return ["CPUExecutionProvider"]
+        except Exception as exc:
+            print(
+                f"[LiveInferenceRunner/worker] skyseg VRAM check failed ({exc}); "
+                "try CUDA provider anyway.",
+                flush=True,
+            )
+
+    return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
 def _get_stream_seq_name(cfg: dict) -> str:
     """
     从 cfg 中解析序列名称（与 LongStreamDataLoader 命名规则一致）。
@@ -908,6 +1011,8 @@ def _compute_sky_valid_mask(
     crop: bool,
     patch_size: int,
     outputs_cpu: dict,
+    cache_dir: Optional[str] = None,
+    cache_enabled: bool = False,
 ) -> Optional[np.ndarray]:
     """
     对单帧图像计算 sky valid mask（True = 非天空 = 保留），
@@ -915,6 +1020,7 @@ def _compute_sky_valid_mask(
 
     优先使用已解码的 rgb_np（避免重复磁盘读取），
     仅当 mask_dir 不为 None 时才将 mask PNG 保存到磁盘。
+    当 cache_enabled=True 且 cache_dir 不为 None 时，读写 .npy cache 以跳过重复计算。
 
     返回 [H_pts * W_pts] bool ndarray 或 None（失败时降级）。
     所有操作均为纯 CPU，无 GPU 张量。
@@ -936,6 +1042,39 @@ def _compute_sky_valid_mask(
         if img_bgr is None:
             return None
 
+        # ── 确定目标分辨率（用于 cache 校验）────────────────────────────
+        pts = outputs_cpu.get("world_points_np")
+        if pts is None:
+            return None
+        depth = outputs_cpu.get("depth_np")
+        if depth is not None:
+            H_pts, W_pts = depth.shape[:2]
+        else:
+            n = len(pts)
+            side = int(n ** 0.5)
+            H_pts, W_pts = side, side
+
+        # ── 读 cache（若命中直接返回）─────────────────────────────────────
+        cache_path = None
+        if cache_enabled and cache_dir is not None and image_path:
+            from longstream.utils.sky_mask import sky_mask_filename as _smfn
+            base = _smfn(image_path)
+            stem, _ = _os.path.splitext(base)
+            # 包含目标分辨率和配置参数，避免不同分辨率/配置复用旧 mask
+            cache_name = (
+                f"{stem}"
+                f"__h{H_pts}_w{W_pts}"
+                f"__size{size}_crop{int(crop)}_patch{patch_size}.npy"
+            )
+            cache_path = _os.path.join(cache_dir, cache_name)
+            if _os.path.exists(cache_path):
+                try:
+                    cached = np.load(cache_path)
+                    if cached.reshape(-1).shape[0] == H_pts * W_pts:
+                        return cached.reshape(-1) > 0
+                except Exception:
+                    pass
+
         # ── 运行 skyseg ────────────────────────────────────────────────
         result_map = run_skyseg(sky_session, [320, 320], img_bgr)
         result_map_full = _cv2.resize(
@@ -953,18 +1092,6 @@ def _compute_sky_valid_mask(
             _cv2.imwrite(_os.path.join(mask_dir, fname), sky_raw)
 
         # ── 调整到 world_points 分辨率（复用与非流式 core/infer.py 相同的处理逻辑）──
-        pts = outputs_cpu.get("world_points_np")
-        if pts is None:
-            return None
-        # 从 depth_np 的 shape 推断点云分辨率
-        depth = outputs_cpu.get("depth_np")
-        if depth is not None:
-            H_pts, W_pts = depth.shape[:2]
-        else:
-            n = len(pts)
-            side = int(n ** 0.5)
-            H_pts, W_pts = side, side
-
         # _prepare_mask_for_model 处理 long-edge resize + crop/resize + 最终 resize 到 target_shape
         # 与非流式 infer.py L642-L648 使用相同参数，避免 crop=True 时 sky mask 错位
         try:
@@ -983,6 +1110,15 @@ def _compute_sky_valid_mask(
         if sky_resized is None:
             return None
         valid_mask = sky_resized.reshape(-1) > 0  # True = 保留（非天空）
+
+        # ── 写 cache ───────────────────────────────────────────────────
+        if cache_path is not None:
+            try:
+                _os.makedirs(_os.path.dirname(cache_path), exist_ok=True)
+                np.save(cache_path, valid_mask.astype(np.uint8))
+            except Exception:
+                pass
+
         return valid_mask
     except Exception as _sky_err:
         return None

@@ -1,5 +1,4 @@
-﻿#!/usr/bin/env bash
-set -euo pipefail
+﻿set -euo pipefail
 
 # Prepare KITTI Odometry sequence(s) into LongStream generalizable layout.
 #
@@ -18,7 +17,7 @@ set -euo pipefail
 #   OUT_ROOT      Output generalizable meta_root.
 #                 Default: prepared_inputs/kitti_odometry
 #   CONFIG_PATH   YAML config to run inference after preprocessing (optional).
-#                 Default: configs/longstream_infer_kitti08_optimized.yaml
+#                 Default: configs/longstream_infer_kitti_optimized.yaml
 #   PYTHON_BIN    Python executable.
 #                 Default: python
 #   COPY          Set to "1" to copy image files instead of symlinking.
@@ -38,7 +37,7 @@ CAMERA_RAW="${CAMERA:-02}"
 CAMERA_NUM=$((10#$CAMERA_RAW))
 CAMERA=$(printf "%02d" "$CAMERA_NUM")
 OUT_ROOT="${OUT_ROOT:-prepared_inputs/kitti_odometry}"
-CONFIG_PATH="${CONFIG_PATH:-configs/longstream_infer_kitti08_optimized.yaml}"
+CONFIG_PATH="${CONFIG_PATH:-configs/longstream_infer_kitti_optimized.yaml}"
 COPY_FLAG="${COPY:-0}"
 
 # LiDAR 深度相关

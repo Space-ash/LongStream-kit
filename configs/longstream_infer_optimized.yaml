@@ -109,6 +109,18 @@ output:
   save_sky_mask: false        # 是否将天空遮罩 mask PNG 写入磁盘（不影响过滤）
   skyseg_path: model/skyseg.onnx
   skyseg_num_threads: 1       # onnxruntime skyseg 线程数，控制 CPU 占用
+
+  # SkySeg advanced runtime controls
+  skyseg_provider: auto          # auto | cuda | cpu
+  skyseg_cuda_min_free_gb: 4.0   # auto 模式下空闲显存低于该值则回退 CPU
+
+  skyseg_reuse_enabled: true
+  skyseg_stride: 4               # 每 N 帧实际运行一次 skyseg
+  skyseg_run_on_keyframes: true  # 关键帧强制刷新 mask
+  skyseg_max_stale_frames: 8     # 复用 mask 的最大帧距
+
+  skyseg_cache_enabled: true
+  skyseg_cache_dir: null         # null => <out_dir>/sky_masks_cache
   save_depth_vis: false       # 是否生成深度伪彩色 PNG（save_depth=true 时生效）
   global_compact_pending_points: 800000  # reservoir compact 触发默认 800k（降低周期性 CPU 尖峰）
   max_full_pointcloud_points: 2000000
