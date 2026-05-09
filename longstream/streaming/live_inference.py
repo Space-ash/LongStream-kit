@@ -302,13 +302,17 @@ def _worker_inference_loop(
 
     print("[LiveInferenceRunner/worker] 开始逐帧推理", flush=True)
 
-    # ── 逐帧 timing 统计（每 N 帧打印一次，默认 10 帧）─────────────────
-    _timing_interval: int = int(_out_cfg_merged.get("timing_log_interval", 10))
+    # ── 逐帧 timing 统计（timing_log_interval=0 表示关闭）─────────────────────
+    _timing_interval: int = int(_out_cfg_merged.get("timing_log_interval", 0))
+    _timing_enabled: bool = _timing_interval > 0
     _timing_acc = {
         "decode_infer": 0.0, "skyseg": 0.0, "filter": 0.0,
         "save": 0.0, "rerun_payload": 0.0, "queue_put": 0.0, "total": 0.0,
     }
     _timing_n: int = 0
+
+    # ── VRAM 日志开关（默认关闭，避免刷日志）────────────────────────────
+    _vram_log_enabled: bool = bool(_out_cfg_merged.get("vram_log_enabled", False))
 
     with torch.no_grad():
         for packet in feeder:
@@ -417,10 +421,12 @@ def _worker_inference_loop(
                     del outputs
                     outputs = None
                     torch.cuda.empty_cache()
-                    _log_cuda_memory("before_refresh_clear", g)
+                    if _vram_log_enabled:
+                        _log_cuda_memory("before_refresh_clear", g)
                     session.clear_cache_only()
                     torch.cuda.empty_cache()
-                    _log_cuda_memory("after_refresh_clear", g)
+                    if _vram_log_enabled:
+                        _log_cuda_memory("after_refresh_clear", g)
                     segment_start = g
                     if anchor_R is not None and anchor_t is not None:
                         seg_R_abs = {0: anchor_R.copy()}
@@ -442,7 +448,8 @@ def _worker_inference_loop(
                     del anchor_outputs
                     del anchor_frame
                     torch.cuda.empty_cache()
-                    _log_cuda_memory("after_anchor_refresh", g)
+                    if _vram_log_enabled:
+                        _log_cuda_memory("after_anchor_refresh", g)
 
             if outputs is not None:
                 del outputs
@@ -490,7 +497,7 @@ def _worker_inference_loop(
                 _pose_frame_ids.append(g)
 
             # ── 每 25 帧打印一次 VRAM 快照（方便定位长序列显存泵露）──
-            if g % 25 == 0:
+            if _vram_log_enabled and g % 25 == 0:
                 _log_cuda_memory("live", g)
 
             # ── 增量保存到磁盘（使用预计算的 filtered_points_np，严禁 GPU Tensor）──
@@ -648,7 +655,7 @@ def _worker_inference_loop(
             _t_frame_end = time.perf_counter()
             _timing_acc["total"] += _t_frame_end - _t_frame_start
             _timing_n += 1
-            if _timing_n > 0 and _timing_n % _timing_interval == 0:
+            if _timing_enabled and _timing_n > 0 and _timing_n % _timing_interval == 0:
                 _n = float(_timing_n)
                 print(
                     f"[LiveInferenceRunner/timing] frame={g}  "
@@ -938,21 +945,6 @@ def _write_ply(pts: np.ndarray, path: str, colors: np.ndarray = None) -> None:
     """将 [N, 3] float32 数组写出为二进制 PLY 文件（支持可选颜色）。"""
     from longstream.io.save_points import save_pointcloud
     save_pointcloud(path, pts, colors=colors)
-
-
-def _cleanup_sky_cache_dir(cache_dir: Optional[str], out_dir: str) -> None:
-    """当 cache_dir 属于 out_dir 子目录时，推理结束后自动删除。"""
-    if not cache_dir:
-        return
-    try:
-        cache_abs = _os.path.abspath(cache_dir)
-        out_abs = _os.path.abspath(out_dir)
-        if cache_abs.startswith(out_abs + _os.sep) and _os.path.isdir(cache_abs):
-            import shutil as _shutil
-            _shutil.rmtree(cache_abs)
-            print(f"[LiveInferenceRunner/worker] skyseg cache 已清理: {cache_abs}", flush=True)
-    except Exception as exc:
-        print(f"[LiveInferenceRunner/worker] skyseg cache 清理失败（忽略）: {exc}", flush=True)
 
 
 def _cleanup_sky_cache_dir(cache_dir: Optional[str], out_dir: str) -> None:

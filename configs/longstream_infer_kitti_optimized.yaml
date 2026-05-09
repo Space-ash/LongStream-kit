@@ -133,6 +133,8 @@ output:
   live_global_checkpoint_interval: 0
   torch_num_threads: 2
   opencv_num_threads: 1
+  timing_log_interval: 0     # 0=关闭 timing 日志；设为正整数 N 则每 N 帧打印一次
+  vram_log_enabled: false    # 是否每 25 帧打印 VRAM 快照
 
 evaluation:
   align_scale: false

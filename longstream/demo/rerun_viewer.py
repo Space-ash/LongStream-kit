@@ -43,10 +43,12 @@ except ImportError:
 _VIEW_COORD_DEFAULT = "RIGHT_HAND_Z_UP"
 
 
-def _make_spatial3d_view(name: str, origin: str):
-    """Create a Spatial3DView with default background."""
+def _make_spatial3d_view(name: str, origin: str, contents=None):
+    """Create a Spatial3DView with default background, optional explicit contents."""
     import rerun.blueprint as rrb
-    return rrb.Spatial3DView(name=name, origin=origin)
+    if contents is None:
+        return rrb.Spatial3DView(name=name, origin=origin)
+    return rrb.Spatial3DView(name=name, origin=origin, contents=contents)
 
 
 def _log_rerun_coordinate_system(view_coordinates: str) -> None:
@@ -73,7 +75,11 @@ def _make_blueprint():
         import rerun.blueprint as rrb
         blueprint = rrb.Blueprint(
             rrb.Grid(
-                _make_spatial3d_view("Current Frame",        "live/current/points"),
+                _make_spatial3d_view(
+                    "Current Frame",
+                    "live/current",
+                    contents=["/live/current/points", "/live/current/debug_marker"],
+                ),
                 _make_spatial3d_view("Global Reconstruction", "live/global"),
                 rrb.Spatial2DView(name="RGB",   origin="live/rgb"),
                 rrb.Spatial2DView(name="Depth", origin="live/depth"),
@@ -271,20 +277,46 @@ class RerunViewer:
                 f"current_colors={None if cur_cols is None else len(cur_cols)}",
                 flush=True,
             )
+            # debug marker: 帮助区分“blueprint 不匹配”和“点云坐标看不到”
+            rr.log(
+                "live/current/debug_marker",
+                rr.Points3D(
+                    np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                    colors=np.array([[255, 0, 0]], dtype=np.uint8),
+                    radii=np.array([0.05], dtype=np.float32),
+                ),
+            )
         if cur_pts is not None and cur_cols is not None and len(cur_pts) > 0:
             if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
                 rng = np.random.default_rng(seed=frame_idx)
                 keep = rng.choice(len(cur_pts), size=self.max_frame_points, replace=False)
                 cur_pts = cur_pts[keep]
                 cur_cols = cur_cols[keep]
-            rr.log(
-                "live/current/points",
-                rr.Points3D(
-                    cur_pts,
-                    colors=cur_cols,
-                    radii=np.full(len(cur_pts), 0.008, dtype=np.float32),
-                ),
-            )
+            if frame_idx < 3 or frame_idx % 50 == 0:
+                finite = np.isfinite(cur_pts).all(axis=1)
+                print(
+                    "[RerunViewer/current] "
+                    f"frame={frame_idx} path=/live/current/points "
+                    f"pts_shape={cur_pts.shape} pts_dtype={cur_pts.dtype} "
+                    f"finite={int(finite.sum())}/{len(cur_pts)} "
+                    f"xyz_min={np.nanmin(cur_pts, axis=0)} "
+                    f"xyz_max={np.nanmax(cur_pts, axis=0)} "
+                    f"cols_shape={cur_cols.shape} cols_dtype={cur_cols.dtype}",
+                    flush=True,
+                )
+            try:
+                rr.log(
+                    "live/current/points",
+                    rr.Points3D(
+                        cur_pts,
+                        colors=cur_cols,
+                        radii=np.full(len(cur_pts), 0.008, dtype=np.float32),
+                    ),
+                )
+                if frame_idx < 3 or frame_idx % 50 == 0:
+                    print(f"[RerunViewer/current] rr.log ok frame={frame_idx}", flush=True)
+            except Exception as exc:
+                print(f"[RerunViewer/current] rr.log failed frame={frame_idx}: {exc}", flush=True)
 
         # ── 右上：全局视图，每帧独立 entity 累积（恢复 889f81 策略，数据源换成 dpt_unproj）──
         if glb_pts is not None and glb_cols is not None and len(glb_pts) > 0:
