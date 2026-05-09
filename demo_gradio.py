@@ -481,7 +481,7 @@ def _start_runner(
                     rerun_global_update_interval=1,
                     image_update_interval=1,
                     depth_update_interval=1,
-                    view_coordinates=str(cfg.get("output", {}).get("rerun_view_coordinates", "RIGHT_HAND_Z_UP")),
+                    view_coordinates=str(cfg.get("output", {}).get("rerun_view_coordinates", "RIGHT_HAND_Y_DOWN")),
                     spawn=True,
                     use_blueprint=bool(cfg.get("output", {}).get("rerun_use_blueprint", True)),
                 )
@@ -856,6 +856,12 @@ def main():
         template_name.input(
             fn=update_ui_from_yaml,
             inputs=[template_name],
+            outputs=_template_sync_outputs,
+        )
+
+        demo.load(
+            fn=lambda: update_ui_from_yaml(_DEFAULT_TEMPLATE),
+            inputs=[],
             outputs=_template_sync_outputs,
         )
 

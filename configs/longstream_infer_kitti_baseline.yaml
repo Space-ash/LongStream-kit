@@ -105,9 +105,10 @@ output:
   global_compact_pending_points: 800000
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000
-  rerun_current_points: 8000
+  rerun_current_points: null    # null = 不限制当前帧推送点数
   rerun_global_points: 30000
-  rerun_view_coordinates: RIGHT_HAND_Z_UP
+  rerun_use_blueprint: true
+  rerun_view_coordinates: RIGHT_HAND_Y_DOWN
   live_global_checkpoint_interval: 0
   torch_num_threads: 2
   opencv_num_threads: 1

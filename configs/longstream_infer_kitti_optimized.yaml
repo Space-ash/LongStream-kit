@@ -126,12 +126,12 @@ output:
   global_compact_pending_points: 800000
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000
-  rerun_current_points: 8000
+  rerun_current_points: null    # null = 不限制当前帧推送点数
   rerun_global_points: 30000
   # rerun_global_ingest_points 已废弃（独立 viewer reservoir 已删除）
   rerun_current_centered: true  # 当前帧点云居中到相机中心，防止世界坐标漂出调试视野
-  rerun_use_blueprint: false     # false = 禁用自定义布局，Rerun 自动发现实体（用于排查 blueprint 兼容性问题）
-  rerun_view_coordinates: RIGHT_HAND_Z_UP
+  rerun_use_blueprint: true
+  rerun_view_coordinates: RIGHT_HAND_Y_DOWN
   live_global_checkpoint_interval: 0
   torch_num_threads: 2
   opencv_num_threads: 1
