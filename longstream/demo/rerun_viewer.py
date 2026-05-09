@@ -46,9 +46,10 @@ _VIEW_COORD_DEFAULT = "RIGHT_HAND_Z_UP"
 def _make_spatial3d_view(name: str, origin: str, contents=None):
     """Create a Spatial3DView with default background, optional explicit contents."""
     import rerun.blueprint as rrb
-    if contents is None:
-        return rrb.Spatial3DView(name=name, origin=origin)
-    return rrb.Spatial3DView(name=name, origin=origin, contents=contents)
+    kwargs = {"name": name, "origin": origin}
+    if contents is not None:
+        kwargs["contents"] = contents
+    return rrb.Spatial3DView(**kwargs)
 
 
 def _log_rerun_coordinate_system(view_coordinates: str) -> None:
@@ -283,9 +284,10 @@ class RerunViewer:
                 rr.Points3D(
                     np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
                     colors=np.array([[255, 0, 0]], dtype=np.uint8),
-                    radii=np.array([0.05], dtype=np.float32),
+                    radii=np.array([0.2], dtype=np.float32),
                 ),
             )
+            print("[RerunViewer/current] debug_marker logged at /live/current/debug_marker", flush=True)
         if cur_pts is not None and cur_cols is not None and len(cur_pts) > 0:
             if self.max_frame_points is not None and len(cur_pts) > self.max_frame_points:
                 rng = np.random.default_rng(seed=frame_idx)

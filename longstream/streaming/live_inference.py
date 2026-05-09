@@ -636,6 +636,7 @@ def _worker_inference_loop(
                     outputs_cpu, g,
                     int(_out_cfg_merged.get("rerun_current_points", _max_frame_pts)),
                     _gfp, _gfc,
+                    _out_cfg_merged,
                 )
                 _t5 = time.perf_counter()
                 _timing_acc["rerun_payload"] += _t5 - _t5_start
@@ -1376,43 +1377,69 @@ def _build_viewer_payload(
     max_frame_points: int,
     global_frame_pts: Optional[np.ndarray],
     global_frame_cols: Optional[np.ndarray],
+    out_cfg: Optional[dict] = None,
 ) -> dict:
     """
     构建瘦 payload 发送给 Rerun viewer 进程。
     仅包含可视化所需字段，避免跨进程 pickle 传输大型滤波数组。
 
-    current 字段：优先 dpt_unproj，颜色缺失时从 point_colors_np 兜底（同一 mask）。
+    current 字段：优先 point_head（filtered_points_np），回退 dpt_unproj，
+              可选居中到相机中心（rerun_current_centered=true）。
     global 字段：已由调用方按 rerun_global_frame_points 下采样的当前帧点。
     """
-    # ── 当前帧点云：优先 dpt_unproj，回退 point_head ──────────────────
-    cur_pts = outputs_cpu.get("filtered_dpu_pts_np")
-    cur_cols = outputs_cpu.get("filtered_dpu_cols_np")
+    if out_cfg is None:
+        out_cfg = {}
 
-    # 颜色兜底：dpt_unproj pts 存在但颜色为空时，从 point_colors_np 恢复
-    if cur_pts is not None and len(cur_pts) > 0 and cur_cols is None:
-        _raw_colors = outputs_cpu.get("point_colors_np")
-        _conf = outputs_cpu.get("depth_conf_np") or outputs_cpu.get("conf_np")
-        if _raw_colors is not None:
-            _rcf = _raw_colors.reshape(-1, 3).astype(np.uint8)
-            _rmask = np.ones(len(_rcf), dtype=bool)
-            if _conf is not None:
-                _cf_flat = _conf.reshape(-1)
-                if len(_cf_flat) == len(_rcf):
-                    _rmask &= _cf_flat >= 0.5
-            _sky = outputs_cpu.get("sky_valid_mask_np")
-            if _sky is not None:
-                _sv = _sky.reshape(-1) > 0
-                if len(_sv) == len(_rcf):
-                    _rmask &= _sv
-            _rcf = _rcf[_rmask]
-            if len(_rcf) == len(cur_pts):
-                cur_cols = _rcf
+    # ── 当前帧点云：优先 point_head，回退 dpt_unproj ──────────────────
+    cur_pts = outputs_cpu.get("filtered_points_np")
+    cur_cols = outputs_cpu.get("filtered_colors_np")
 
     if cur_pts is None or cur_cols is None:
-        cur_pts = outputs_cpu.get("filtered_points_np")
-        cur_cols = outputs_cpu.get("filtered_colors_np")
+        cur_pts = outputs_cpu.get("filtered_dpu_pts_np")
+        cur_cols = outputs_cpu.get("filtered_dpu_cols_np")
+
+        # 颜色兜底：dpt_unproj pts 存在但颜色为空时，从 point_colors_np 恢复
+        if cur_pts is not None and len(cur_pts) > 0 and cur_cols is None:
+            _raw_colors = outputs_cpu.get("point_colors_np")
+            _conf = outputs_cpu.get("depth_conf_np") or outputs_cpu.get("conf_np")
+            if _raw_colors is not None:
+                _rcf = _raw_colors.reshape(-1, 3).astype(np.uint8)
+                _rmask = np.ones(len(_rcf), dtype=bool)
+                if _conf is not None:
+                    _cf_flat = _conf.reshape(-1)
+                    if len(_cf_flat) == len(_rcf):
+                        _rmask &= _cf_flat >= 0.5
+                _sky = outputs_cpu.get("sky_valid_mask_np")
+                if _sky is not None:
+                    _sv = _sky.reshape(-1) > 0
+                    if len(_sv) == len(_rcf):
+                        _rmask &= _sv
+                _rcf = _rcf[_rmask]
+                if len(_rcf) == len(cur_pts):
+                    cur_cols = _rcf
+
+    # ── 居中：把当前帧点云平移到相机中心，防止世界坐标漂出调试视野 ──
+    _centered = bool(out_cfg.get("rerun_current_centered", True))
+    if _centered and cur_pts is not None and len(cur_pts) > 0:
+        center_np = outputs_cpu.get("center_np")
+        cur_pts = cur_pts.astype(np.float32, copy=True)
+        if center_np is not None:
+            cur_pts -= center_np.reshape(1, 3).astype(np.float32)
+        else:
+            cur_pts -= np.nanmedian(cur_pts, axis=0, keepdims=True).astype(np.float32)
 
     cur_pts, cur_cols = _sample_points_for_viewer(cur_pts, cur_cols, max_frame_points, frame_idx)
+
+    # ── 低频 debug 打印当前帧点云来源 ────────────────────────────────
+    if frame_idx < 3 or frame_idx % 50 == 0:
+        src = "point_head" if outputs_cpu.get("filtered_points_np") is not None else "dpt_unproj"
+        print(
+            f"[LiveInferenceRunner/viewer_payload] frame={frame_idx} current_source={src} "
+            f"current_n={0 if cur_pts is None else len(cur_pts)} "
+            f"centered={_centered}",
+            flush=True,
+        )
+
     return {
         "rgb_np":                        outputs_cpu.get("rgb_np"),
         "depth_np":                      outputs_cpu.get("depth_np"),
