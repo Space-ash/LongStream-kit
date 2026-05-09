@@ -76,11 +76,7 @@ def _make_blueprint():
         import rerun.blueprint as rrb
         blueprint = rrb.Blueprint(
             rrb.Grid(
-                _make_spatial3d_view(
-                    "Current Frame",
-                    "live/current",
-                    contents=["/live/current/points", "/live/current/debug_marker"],
-                ),
+                _make_spatial3d_view("Current Frame", "live/current"),
                 _make_spatial3d_view("Global Reconstruction", "live/global"),
                 rrb.Spatial2DView(name="RGB",   origin="live/rgb"),
                 rrb.Spatial2DView(name="Depth", origin="live/depth"),
@@ -134,6 +130,7 @@ class RerunViewer:
         depth_update_interval: int = 1,
         view_coordinates: str = _VIEW_COORD_DEFAULT,
         spawn: bool = True,
+        use_blueprint: bool = True,
     ) -> None:
         if not _RERUN_AVAILABLE:
             raise ImportError(
@@ -148,6 +145,7 @@ class RerunViewer:
         self.depth_update_interval = max(1, int(depth_update_interval))
         self.view_coordinates = str(view_coordinates) or _VIEW_COORD_DEFAULT
         self.spawn = spawn
+        self.use_blueprint = bool(use_blueprint)
         self._initialized = False
         # 轨迹缓冲（相机中心序列）
         self._centers: List[np.ndarray] = []
@@ -156,7 +154,7 @@ class RerunViewer:
 
     def init(self) -> None:
         """初始化 Rerun recording，可选 spawn Viewer 窗口。仅调用一次。"""
-        blueprint = _make_blueprint()
+        blueprint = _make_blueprint() if self.use_blueprint else None
         recording_id = str(uuid.uuid4())
         # 优先使用 send_blueprint(make_active=True)，确保新 recording 不继承旧视图
         if blueprint is not None and hasattr(rr, "send_blueprint"):
@@ -176,7 +174,11 @@ class RerunViewer:
             rr.init(self.app_name, recording_id=recording_id, spawn=self.spawn)
         self._initialized = True
         self._centers = []
-        print(f"[RerunViewer] 已初始化: app_name={self.app_name!r}, recording_id={recording_id}", flush=True)
+        print(
+            f"[RerunViewer] 已初始化: app_name={self.app_name!r}, "
+            f"recording_id={recording_id}, blueprint_enabled={self.use_blueprint}",
+            flush=True,
+        )
         _log_rerun_coordinate_system(self.view_coordinates)
 
     def log_frame(self, frame_idx: int, outputs_cpu: dict) -> None:

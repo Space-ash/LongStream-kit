@@ -102,6 +102,7 @@ output:
   rerun_global_points: 30000
   # rerun_global_ingest_points 已废弃（独立 viewer reservoir 已删除，viewer 直接采样 dpt_unproj 全局 reservoir）
   rerun_current_centered: true  # 当前帧点云居中到相机中心，防止世界坐标漂出调试视野
+  rerun_use_blueprint: false     # false = 禁用自定义布局，Rerun 自动发现实体（用于排查 blueprint 兼容性问题）
   rerun_view_coordinates: RIGHT_HAND_Z_UP  # 可选 RIGHT_HAND_Y_UP
   live_global_checkpoint_interval: 0
   torch_num_threads: 2

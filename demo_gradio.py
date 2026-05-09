@@ -483,6 +483,7 @@ def _start_runner(
                     depth_update_interval=1,
                     view_coordinates=str(cfg.get("output", {}).get("rerun_view_coordinates", "RIGHT_HAND_Z_UP")),
                     spawn=True,
+                    use_blueprint=bool(cfg.get("output", {}).get("rerun_use_blueprint", True)),
                 )
                 viewer.init()
                 with _runner_lock:
