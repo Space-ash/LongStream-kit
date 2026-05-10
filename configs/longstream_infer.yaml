@@ -130,7 +130,7 @@ optimizations:
     tto_steps_update: 4            # 后续触发 TTO 时的训练步数
     tto_update_interval_frames: 40 # 每隔多少帧再次触发 TTO
     tto_window_step: 40            # 每次 TTO 后滑动窗口的帧数
-  pose_post_correction:
+    pose_post_correction:
     enabled: false
     method: segment_se3
     source: gps

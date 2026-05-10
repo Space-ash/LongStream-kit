@@ -1,14 +1,5 @@
-﻿# LongStream 推理配置：KITTI Odometry Seq 05 (Optimized)
-#
-# 数据来源：KITTI Odometry sequence 05
-# 预处理：bash prepare_kitti_odometry.sh
-#
-# 注意：
-#   - 当前数据无 GT depth，depth/pointcloud GT 相关指标不可用
-#   - 可用指标：ATE、位姿轨迹误差（pose/ATE 系列）
-#
-# Smoke test（前 100 帧快速验证）：
-#   将 data.max_frames 设为 100，运行后查看 outputs/kitti_odometry_05/optimized/
+# KITTI Odometry 05, first 500 frames, non-streaming.
+# Variant F: lighter TTO only, no pose post-correction.
 
 device: cuda
 
@@ -68,16 +59,16 @@ data:
   format: generalizable
   data_roots_file: data_roots.txt
   img_path: prepared_inputs/kitti_odometry
-  seq_list: ["05"]       # 选择场景
+  seq_list: ["05"]
   camera: "02"
   stride: 1
-  max_frames: 200        # 改为 100 可进行 smoke test, null 则处理全部帧
+  max_frames: 500
   size: 518
   crop: false
   patch_size: 14
   gt_source: auto
   gt_poses_file: gt_poses.npy
-  depth_gt_type: auto   # auto: 自动读取 depth_meta.json；无文件时当 dense（vKITTI2 兼容）
+  depth_gt_type: auto
 
 optimizations:
   filter:
@@ -89,30 +80,29 @@ optimizations:
     save_frame_index_map: false
   correction:
     tto_enabled: true
-    tto_steps: 20
-    tto_lr: 1.0e-3
+    tto_steps: 14
+    tto_lr: 8.0e-4
     tto_weight_decay: 0.0
     tto_window_size: 40
     tto_min_gps_disp: 1.0
     tto_max_grad_norm: 1.0
-    tto_pair_stride: 8          # 向后兼容；有 tto_pair_strides 时被覆盖
+    tto_pair_stride: 8
     tto_pair_strides: [4, 8, 16, 32]
     tto_sampling: deterministic_coverage
-    tto_lambda_dir: 0.1
-    tto_lambda_endpoint: 0.2
+    tto_lambda_dir: 0.05
+    tto_lambda_endpoint: 0.1
     tto_early_stop_patience: 4
     tto_min_delta: 1.0e-3
     tto_batch_windows: 2
-    # 流式 TTO 降频控制（仅流式模式使用，非流式忽略）
-    tto_steps_initial: 12          # 首次触发 TTO 时的训练步数
-    tto_steps_update: 4            # 后续触发 TTO 时的训练步数
-    tto_update_interval_frames: 40 # 每隔多少帧再次触发 TTO
-    tto_window_step: 40            # 每次 TTO 后滑动窗口的帧数
-    pose_post_correction:
+    tto_steps_initial: 12
+    tto_steps_update: 4
+    tto_update_interval_frames: 40
+    tto_window_step: 40
+  pose_post_correction:
     enabled: false
     method: segment_se3
     source: gps
-    segment_size: 160
+    segment_size: 120
     overlap: 40
     min_points: 8
     blend: hann
@@ -121,7 +111,7 @@ optimizations:
     corrected_pose_name: abs_pose_corrected.txt
 
 output:
-  root: outputs/kitti_odometry_05/optimized
+  root: outputs/kitti_odometry_05_500/f_tto_light_no_post
   save_videos: false
   save_images: false
   save_depth: true
@@ -133,33 +123,28 @@ output:
   save_sky_mask: false
   skyseg_path: model/skyseg.onnx
   skyseg_num_threads: 1
-
-  # SkySeg advanced runtime controls
-  skyseg_provider: auto          # auto | cuda | cpu
-  skyseg_cuda_min_free_gb: 4.0   # auto 模式下空闲显存低于该值则回退 CPU
-
+  skyseg_provider: auto
+  skyseg_cuda_min_free_gb: 4.0
   skyseg_reuse_enabled: true
-  skyseg_stride: 4               # 每 N 帧实际运行一次 skyseg
-  skyseg_run_on_keyframes: true  # 关键帧强制刷新 mask
-  skyseg_max_stale_frames: 8     # 复用 mask 的最大帧距
-
+  skyseg_stride: 4
+  skyseg_run_on_keyframes: true
+  skyseg_max_stale_frames: 8
   skyseg_cache_enabled: true
-  skyseg_cache_dir: null         # null => <out_dir>/sky_masks_cache
+  skyseg_cache_dir: null
   save_depth_vis: false
   global_compact_pending_points: 800000
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000
-  rerun_current_points: null    # null = 不限制当前帧推送点数
+  rerun_current_points: null
   rerun_global_points: 30000
-  # rerun_global_ingest_points 已废弃（独立 viewer reservoir 已删除）
-  rerun_current_centered: true  # 当前帧点云居中到相机中心，防止世界坐标漂出调试视野
+  rerun_current_centered: true
   rerun_use_blueprint: true
   rerun_view_coordinates: RIGHT_HAND_Y_DOWN
   live_global_checkpoint_interval: 0
   torch_num_threads: 2
   opencv_num_threads: 1
-  timing_log_interval: 0     # 0=关闭 timing 日志；设为正整数 N 则每 N 帧打印一次
-  vram_log_enabled: false    # 是否每 25 帧打印 VRAM 快照
+  timing_log_interval: 0
+  vram_log_enabled: false
 
 evaluation:
   align_scale: false
@@ -168,11 +153,8 @@ evaluation:
   point_eval_max_points: 100000
   point_eval_voxel_size: null
   point_eval_oversample_factor: 4
-  # 稀疏 LiDAR GT 策略：仅计算 GT->pred 推断 recall，不计算对称 Chamfer/F1
   sparse_depth_pointcloud_policy: recall_only
-  # true 时复用对称 Chamfer/F1 并写入 warning（不建议）
   allow_sparse_chamfer_f1: false
-  # 少于此像素数时跳过深度指标
   min_valid_depth_pixels: 1
 
 monitoring:
