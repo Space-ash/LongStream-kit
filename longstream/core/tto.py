@@ -130,6 +130,14 @@ class TTOContext:
     tto_min_gps_disp: float
     tto_max_grad_norm: float
     rel_pose_num_iterations: int
+    # 新增配置项
+    tto_sampling: str
+    tto_pair_strides: List[int]
+    tto_lambda_dir: float
+    tto_lambda_endpoint: float
+    tto_early_stop_patience: int
+    tto_min_delta: float
+    tto_batch_windows: int
     # 初始 scale_token（用于序列间复位）
     initial_scale_token: torch.Tensor
     # 当前序列的优化器（每次 reset_tto 后重新创建）
@@ -160,6 +168,17 @@ def prepare_tto(model, corr_cfg: dict) -> TTOContext:
     model.longstream.scale_token.requires_grad = True
     initial_scale_token = model.longstream.scale_token.detach().clone()
 
+    # 解析 tto_pair_strides，兼容 int/list/tuple；保留旧 tto_pair_stride 回退
+    _raw_strides = corr_cfg.get("tto_pair_strides", None)
+    if _raw_strides is None:
+        _old_stride = corr_cfg.get("tto_pair_stride", None)
+        _raw_strides = [_old_stride] if _old_stride is not None else [8]
+    if isinstance(_raw_strides, (int, float)):
+        _raw_strides = [_raw_strides]
+    _pair_strides = [int(s) for s in _raw_strides if int(s) > 0]
+    if not _pair_strides:
+        _pair_strides = [8]
+
     ctx = TTOContext(
         model=model,
         tto_steps=int(corr_cfg.get("tto_steps", 20)),
@@ -169,6 +188,13 @@ def prepare_tto(model, corr_cfg: dict) -> TTOContext:
         tto_min_gps_disp=float(corr_cfg.get("tto_min_gps_disp", 1.0)),
         tto_max_grad_norm=float(corr_cfg.get("tto_max_grad_norm", 1.0)),
         rel_pose_num_iterations=int(corr_cfg.get("rel_pose_num_iterations", 4)),
+        tto_sampling=str(corr_cfg.get("tto_sampling", "random")),
+        tto_pair_strides=_pair_strides,
+        tto_lambda_dir=float(corr_cfg.get("tto_lambda_dir", 0.0)),
+        tto_lambda_endpoint=float(corr_cfg.get("tto_lambda_endpoint", 0.0)),
+        tto_early_stop_patience=int(corr_cfg.get("tto_early_stop_patience", 0)),
+        tto_min_delta=float(corr_cfg.get("tto_min_delta", 1.0e-3)),
+        tto_batch_windows=int(corr_cfg.get("tto_batch_windows", 1)),
         initial_scale_token=initial_scale_token,
     )
     return ctx
@@ -182,6 +208,127 @@ def reset_tto(ctx: TTOContext) -> None:
         lr=ctx.tto_lr,
         weight_decay=ctx.tto_weight_decay,
     )
+
+
+def _build_tto_window_starts(
+    min_len: int,
+    window_len: int,
+    window_step: int,
+    gps_tensor: torch.Tensor,
+    min_gps_disp: float,
+) -> List[int]:
+    """
+    构建覆盖优先的窗口起始索引列表，保证首尾端点被纳入。
+    """
+    last_start = max(0, min_len - window_len)
+    starts = list(range(0, last_start + 1, window_step))
+    if 0 not in starts:
+        starts.insert(0, 0)
+    if last_start not in starts:
+        starts.append(last_start)
+
+    valid: List[int] = []
+    for s in starts:
+        disp = torch.linalg.norm(gps_tensor[s + window_len - 1] - gps_tensor[s]).item()
+        if torch.isfinite(torch.tensor(disp)) and disp > min_gps_disp:
+            valid.append(s)
+
+    # deterministic_coverage 端点兼底：即使位移不足也保留，loss valid mask 会兜底
+    for s in (0, last_start):
+        if s not in valid:
+            valid.insert(0 if s == 0 else len(valid), s)
+
+    # 去重并保序
+    return list(dict.fromkeys(valid))
+
+
+def _select_tto_starts(
+    valid_starts: List[int],
+    step: int,
+    batch_windows: int,
+    sampling: str,
+) -> List[int]:
+    """
+    根据采样策略选出本步要使用的窗口起始列表（长度 = batch_windows）。
+    """
+    n = max(1, batch_windows)
+
+    if sampling == "deterministic_coverage":
+        if step < len(valid_starts):
+            base = valid_starts[step]
+        else:
+            base = random.choice(valid_starts)
+        starts = [base]
+        while len(starts) < n:
+            starts.append(random.choice(valid_starts))
+        return starts
+
+    if sampling == "endpoint_weighted":
+        weights = [
+            3.0 if s in (valid_starts[0], valid_starts[-1]) else 1.0
+            for s in valid_starts
+        ]
+        return random.choices(valid_starts, weights=weights, k=n)
+
+    # default: random
+    return random.choices(valid_starts, k=n)
+
+
+def _tto_multiscale_loss(
+    pred_centers: torch.Tensor,
+    gps_tto: torch.Tensor,
+    pair_strides: List[int],
+    min_gps_disp: float,
+    lambda_dir: float,
+    lambda_endpoint: float,
+) -> Optional[torch.Tensor]:
+    """
+    多尺度位移 loss（含可选方向项和端点项）。
+
+    pred_centers: [B, T, 3]
+    gps_tto:      [B, T, 3]
+    """
+    losses = []
+    eps = 1.0e-6
+
+    for stride in pair_strides:
+        stride = max(1, min(int(stride), pred_centers.shape[1] - 1))
+        pred_vec = pred_centers[:, stride:] - pred_centers[:, :-stride]
+        gps_vec = gps_tto[:, stride:] - gps_tto[:, :-stride]
+
+        pred_disp = torch.linalg.norm(pred_vec, dim=-1)
+        gps_disp = torch.linalg.norm(gps_vec, dim=-1)
+        valid = (
+            torch.isfinite(pred_disp)
+            & torch.isfinite(gps_disp)
+            & (gps_disp > min_gps_disp)
+        )
+        if valid.any():
+            losses.append(
+                torch.nn.functional.huber_loss(pred_disp[valid], gps_disp[valid])
+            )
+            if lambda_dir > 0:
+                pred_dir = pred_vec / pred_disp.clamp_min(eps).unsqueeze(-1)
+                gps_dir = gps_vec / gps_disp.clamp_min(eps).unsqueeze(-1)
+                losses.append(
+                    lambda_dir
+                    * torch.nn.functional.huber_loss(pred_dir[valid], gps_dir[valid])
+                )
+
+    if lambda_endpoint > 0:
+        pred_ep = pred_centers[:, -1] - pred_centers[:, 0]
+        gps_ep = gps_tto[:, -1] - gps_tto[:, 0]
+        ep_disp = torch.linalg.norm(gps_ep, dim=-1)
+        valid_ep = torch.isfinite(ep_disp) & (ep_disp > min_gps_disp)
+        if valid_ep.any():
+            losses.append(
+                lambda_endpoint
+                * torch.nn.functional.huber_loss(pred_ep[valid_ep], gps_ep[valid_ep])
+            )
+
+    if not losses:
+        return None
+    return torch.stack([x if x.ndim == 0 else x.mean() for x in losses]).sum()
 
 
 def run_tto_scale_optimization(
@@ -238,29 +385,29 @@ def run_tto_scale_optimization(
         )
         return False
 
-    _pair_stride = pair_stride if pair_stride is not None else max(1, window_len // 4)
-    _pair_stride = max(1, min(_pair_stride, window_len - 1))
+    # pair_strides：优先使用 ctx 里的，pair_stride 参数仅作向后兼容覆盖
+    pair_strides = ctx.tto_pair_strides
+    if pair_stride is not None:
+        pair_strides = [max(1, min(int(pair_stride), window_len - 1))]
+    pair_strides = [max(1, min(s, window_len - 1)) for s in pair_strides]
 
-    # 构建有效窗口池（50% 重叠滑动）
+    # 构建覆盖优先的窗口起始列表
     window_step = max(1, window_len // 2)
-    valid_start_indices: List[int] = []
-    for start_idx in range(0, min_len - window_len + 1, window_step):
-        disp = torch.linalg.norm(
-            gps_tensor[start_idx + window_len - 1] - gps_tensor[start_idx]
-        ).item()
-        if disp > ctx.tto_min_gps_disp:
-            valid_start_indices.append(start_idx)
+    valid_start_indices = _build_tto_window_starts(
+        min_len, window_len, window_step, gps_tensor, ctx.tto_min_gps_disp
+    )
 
     if not valid_start_indices:
         print(
-            f"[TTO] seq={seq_name} 没有 GPS 位移 > {ctx.tto_min_gps_disp} 的有效窗口，跳过 TTO",
+            f"[TTO] seq={seq_name} 没有有效窗口，跳过 TTO",
             flush=True,
         )
         return False
 
     print(
         f"[TTO] seq={seq_name} steps={ctx.tto_steps} lr={ctx.tto_lr}"
-        f" window_len={window_len} pair_stride={_pair_stride}"
+        f" window_len={window_len} pair_strides={pair_strides}"
+        f" sampling={ctx.tto_sampling} batch_windows={ctx.tto_batch_windows}"
         f" valid_windows={len(valid_start_indices)}",
         flush=True,
     )
@@ -272,17 +419,28 @@ def run_tto_scale_optimization(
     outputs_tto = None
     skipped = False
 
+    best_loss = float("inf")
+    bad_steps = 0
+
     with torch.enable_grad():
         for step in range(ctx.tto_steps):
             ctx.optimizer.zero_grad(set_to_none=True)
 
-            start_idx = random.choice(valid_start_indices)
-            end_idx = start_idx + window_len
-            images_tto = images[:, start_idx:end_idx].to(device)
-            gps_tto = gps_tensor[start_idx:end_idx]
+            starts = _select_tto_starts(
+                valid_start_indices, step, ctx.tto_batch_windows, ctx.tto_sampling
+            )
+
+            # 多窗口 batch
+            images_tto = torch.cat(
+                [images[:, s : s + window_len] for s in starts], dim=0
+            ).to(device)
+            gps_tto = torch.stack(
+                [gps_tensor[s : s + window_len] for s in starts], dim=0
+            )  # [B_tto, T, 3]
+            B_tto = images_tto.shape[0]
 
             is_keyframe_tto, keyframe_indices_tto = selector.select_keyframes(
-                window_len, B, images_tto.device
+                window_len, B_tto, images_tto.device
             )
 
             outputs_tto = _run_tto_pose_forward(
@@ -294,36 +452,44 @@ def run_tto_scale_optimization(
                 ctx.rel_pose_num_iterations,
             )
 
-            if "rel_pose_enc" in outputs_tto:
-                pred_centers = _compute_camera_centers_differentiable(
-                    outputs_tto["rel_pose_enc"][0],
-                    keyframe_indices_tto[0],
-                )
-            elif "pose_enc" in outputs_tto:
-                pred_centers = _compute_camera_centers_differentiable(
-                    outputs_tto["pose_enc"][0],
-                    keyframe_indices=None,
-                )
-            else:
-                print(f"[TTO] seq={seq_name} 无位姿输出，跳过 TTO", flush=True)
-                skipped = True
+            # 对 batch 维度循环求各窗口相机中心
+            centers = []
+            for b in range(B_tto):
+                if "rel_pose_enc" in outputs_tto:
+                    centers.append(
+                        _compute_camera_centers_differentiable(
+                            outputs_tto["rel_pose_enc"][b],
+                            keyframe_indices_tto[b],
+                        )
+                    )
+                elif "pose_enc" in outputs_tto:
+                    centers.append(
+                        _compute_camera_centers_differentiable(
+                            outputs_tto["pose_enc"][b],
+                            None,
+                        )
+                    )
+                else:
+                    print(f"[TTO] seq={seq_name} 无位姿输出，跳过 TTO", flush=True)
+                    skipped = True
+                    break
+
+            if skipped:
                 del outputs_tto, images_tto
                 break
 
-            pred_disp = torch.linalg.norm(
-                pred_centers[_pair_stride:] - pred_centers[:-_pair_stride],
-                dim=-1,
+            pred_centers = torch.stack(centers, dim=0)  # [B_tto, T, 3]
+
+            loss = _tto_multiscale_loss(
+                pred_centers,
+                gps_tto,
+                pair_strides,
+                ctx.tto_min_gps_disp,
+                ctx.tto_lambda_dir,
+                ctx.tto_lambda_endpoint,
             )
-            target_disp = torch.linalg.norm(
-                gps_tto[_pair_stride:] - gps_tto[:-_pair_stride],
-                dim=-1,
-            )
-            valid = (
-                torch.isfinite(target_disp)
-                & torch.isfinite(pred_disp)
-                & (target_disp > ctx.tto_min_gps_disp)
-            )
-            if not valid.any():
+
+            if loss is None:
                 if step == 0:
                     print(
                         f"[TTO] seq={seq_name} step=0 无有效 GPS 配对，跳过 TTO",
@@ -333,21 +499,37 @@ def run_tto_scale_optimization(
                 del outputs_tto, images_tto
                 break
 
-            loss = torch.nn.functional.huber_loss(
-                pred_disp[valid], target_disp[valid]
-            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 [ctx.model.longstream.scale_token], ctx.tto_max_grad_norm
             )
             ctx.optimizer.step()
 
+            loss_value = float(loss.detach().item())
+
             if step == 0 or (step + 1) % 5 == 0:
                 print(
                     f"[TTO] seq={seq_name} step={step + 1}/{ctx.tto_steps}"
-                    f" win=[{start_idx},{end_idx}) loss={loss.item():.6f}",
+                    f" wins={starts} loss={loss_value:.6f}",
                     flush=True,
                 )
+
+            # 早停
+            if loss_value < best_loss - ctx.tto_min_delta:
+                best_loss = loss_value
+                bad_steps = 0
+            else:
+                bad_steps += 1
+
+            if ctx.tto_early_stop_patience > 0 and bad_steps >= ctx.tto_early_stop_patience:
+                print(
+                    f"[TTO] seq={seq_name} early stop at step={step + 1},"
+                    f" best_loss={best_loss:.6f}",
+                    flush=True,
+                )
+                del outputs_tto, images_tto
+                outputs_tto = None
+                break
 
             del outputs_tto, images_tto
             outputs_tto = None

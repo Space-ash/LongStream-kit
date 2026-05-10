@@ -22,6 +22,7 @@ from longstream.io.save_points import save_pointcloud
 from longstream.io.save_poses_txt import save_w2c_txt, save_intri_txt, save_rel_pose_txt
 from longstream.io.save_images import save_image_sequence, save_video
 from longstream.io.frame_index_map import save_frame_index_map
+from longstream.core.pose_post_correction import correct_poses_with_gps_segment_se3
 
 
 def _to_uint8_rgb(images):
@@ -274,6 +275,78 @@ def _compute_camera_centers_differentiable(
     return -torch.einsum("sji,sj->si", abs_R, abs_t)
 
 
+def _tto_build_window_starts(min_len, window_len, window_step, gps_tensor, min_gps_disp):
+    """infer.py 内联 TTO 专用：构建覆盖优先的窗口起始列表。"""
+    last_start = max(0, min_len - window_len)
+    starts = list(range(0, last_start + 1, window_step))
+    if 0 not in starts:
+        starts.insert(0, 0)
+    if last_start not in starts:
+        starts.append(last_start)
+
+    valid = []
+    for s in starts:
+        disp = torch.linalg.norm(gps_tensor[s + window_len - 1] - gps_tensor[s]).item()
+        if torch.isfinite(torch.tensor(disp)) and disp > min_gps_disp:
+            valid.append(s)
+
+    for s in (0, last_start):
+        if s not in valid:
+            valid.insert(0 if s == 0 else len(valid), s)
+    return list(dict.fromkeys(valid))
+
+
+def _tto_select_starts(valid_starts, step, batch_windows, sampling):
+    """infer.py 内联 TTO 专用：按采样策略选出本步窗口起始列表。"""
+    n = max(1, batch_windows)
+    if sampling == "deterministic_coverage":
+        base = valid_starts[step] if step < len(valid_starts) else random.choice(valid_starts)
+        starts = [base]
+        while len(starts) < n:
+            starts.append(random.choice(valid_starts))
+        return starts
+    if sampling == "endpoint_weighted":
+        weights = [
+            3.0 if s in (valid_starts[0], valid_starts[-1]) else 1.0
+            for s in valid_starts
+        ]
+        return random.choices(valid_starts, weights=weights, k=n)
+    return random.choices(valid_starts, k=n)
+
+
+def _tto_multiscale_loss_inline(pred_centers, gps_tto, pair_strides, min_gps_disp, lambda_dir, lambda_endpoint):
+    """infer.py 内联 TTO 专用：多尺度位移 loss。"""
+    losses = []
+    eps = 1.0e-6
+    for stride in pair_strides:
+        stride = max(1, min(int(stride), pred_centers.shape[1] - 1))
+        pred_vec = pred_centers[:, stride:] - pred_centers[:, :-stride]
+        gps_vec = gps_tto[:, stride:] - gps_tto[:, :-stride]
+        pred_disp = torch.linalg.norm(pred_vec, dim=-1)
+        gps_disp = torch.linalg.norm(gps_vec, dim=-1)
+        valid = (
+            torch.isfinite(pred_disp)
+            & torch.isfinite(gps_disp)
+            & (gps_disp > min_gps_disp)
+        )
+        if valid.any():
+            losses.append(torch.nn.functional.huber_loss(pred_disp[valid], gps_disp[valid]))
+            if lambda_dir > 0:
+                pred_dir = pred_vec / pred_disp.clamp_min(eps).unsqueeze(-1)
+                gps_dir = gps_vec / gps_disp.clamp_min(eps).unsqueeze(-1)
+                losses.append(lambda_dir * torch.nn.functional.huber_loss(pred_dir[valid], gps_dir[valid]))
+    if lambda_endpoint > 0:
+        pred_ep = pred_centers[:, -1] - pred_centers[:, 0]
+        gps_ep = gps_tto[:, -1] - gps_tto[:, 0]
+        ep_disp = torch.linalg.norm(gps_ep, dim=-1)
+        valid_ep = torch.isfinite(ep_disp) & (ep_disp > min_gps_disp)
+        if valid_ep.any():
+            losses.append(lambda_endpoint * torch.nn.functional.huber_loss(pred_ep[valid_ep], gps_ep[valid_ep]))
+    if not losses:
+        return None
+    return torch.stack([x if x.ndim == 0 else x.mean() for x in losses]).sum()
+
+
 def run_inference_cfg(cfg: dict):
     device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     device_type = torch.device(device).type
@@ -286,6 +359,8 @@ def run_inference_cfg(cfg: dict):
     opt_cfg = cfg.get("optimizations", {})
     filter_cfg = opt_cfg.get("filter", {})
     corr_cfg = opt_cfg.get("correction", {})
+    pose_post_cfg = opt_cfg.get("pose_post_correction", {})
+    pose_post_enabled = bool(pose_post_cfg.get("enabled", False))
     frame_filter_enabled = bool(
         filter_cfg.get("frame_filter_enabled", filter_cfg.get("enabled", False))
     )
@@ -310,6 +385,20 @@ def run_inference_cfg(cfg: dict):
     tto_window_size = int(corr_cfg.get("tto_window_size", 40))
     tto_min_gps_disp = float(corr_cfg.get("tto_min_gps_disp", 1.0))
     tto_max_grad_norm = float(corr_cfg.get("tto_max_grad_norm", 1.0))
+    # 新增 TTO 配置项
+    tto_sampling = str(corr_cfg.get("tto_sampling", "random"))
+    _raw_strides = corr_cfg.get("tto_pair_strides", None)
+    if _raw_strides is None:
+        _old = corr_cfg.get("tto_pair_stride", None)
+        _raw_strides = [_old] if _old is not None else [8]
+    if isinstance(_raw_strides, (int, float)):
+        _raw_strides = [_raw_strides]
+    tto_pair_strides = [int(s) for s in _raw_strides if int(s) > 0] or [8]
+    tto_lambda_dir = float(corr_cfg.get("tto_lambda_dir", 0.0))
+    tto_lambda_endpoint = float(corr_cfg.get("tto_lambda_endpoint", 0.0))
+    tto_early_stop_patience = int(corr_cfg.get("tto_early_stop_patience", 0))
+    tto_min_delta = float(corr_cfg.get("tto_min_delta", 1.0e-3))
+    tto_batch_windows = int(corr_cfg.get("tto_batch_windows", 1))
     initial_scale_token = None
     if tto_enabled:
         if not hasattr(model.longstream, "scale_token"):
@@ -413,7 +502,6 @@ def run_inference_cfg(cfg: dict):
                     lr=tto_lr,
                     weight_decay=tto_weight_decay,
                 )
-                pair_stride = int(corr_cfg.get("tto_pair_stride", keyframe_stride))
                 gps_tensor = torch.as_tensor(
                     seq.gps_xyz, device=device, dtype=torch.float32
                 )
@@ -433,15 +521,10 @@ def run_inference_cfg(cfg: dict):
                     tto_skipped = True
 
                 if not tto_skipped:
-                    # 构建有效窗口池：50% overlap 滑动，头尾 GPS 列向位移 > tto_min_gps_disp
                     window_step = max(1, window_len // 2)
-                    valid_start_indices = []
-                    for start_idx in range(0, min_len - window_len + 1, window_step):
-                        disp = torch.linalg.norm(
-                            gps_tensor[start_idx + window_len - 1] - gps_tensor[start_idx]
-                        ).item()
-                        if disp > tto_min_gps_disp:
-                            valid_start_indices.append(start_idx)
+                    valid_start_indices = _tto_build_window_starts(
+                        min_len, window_len, window_step, gps_tensor, tto_min_gps_disp
+                    )
 
                     if not valid_start_indices:
                         print(
@@ -453,30 +536,38 @@ def run_inference_cfg(cfg: dict):
 
                 if not tto_skipped:
                     rel_pose_num_iters = rel_pose_cfg.get("num_iterations", 4)
-                    # pair_stride 必须在窗口内有效
-                    pair_stride = max(1, min(pair_stride, window_len - 1))
+                    _pair_strides = [max(1, min(s, window_len - 1)) for s in tto_pair_strides]
                     print(
                         f"[longstream][TTO] seq={seq.name} steps={tto_steps}"
                         f" lr={tto_lr} window_len={window_len}"
-                        f" pair_stride={pair_stride}"
+                        f" pair_strides={_pair_strides} sampling={tto_sampling}"
+                        f" batch_windows={tto_batch_windows}"
                         f" valid_windows={len(valid_start_indices)}",
                         flush=True,
                     )
                     model.eval()
+                    best_loss = float("inf")
+                    bad_steps = 0
                     with torch.enable_grad():
                         for step in range(tto_steps):
                             tto_seq_optimizer.zero_grad(set_to_none=True)
 
-                            # 随机采样一个有效窗口（mini-batch SGD 风格）
-                            start_idx = random.choice(valid_start_indices)
-                            end_idx = start_idx + window_len
-                            images_tto = images[:, start_idx:end_idx].to(device)
-                            gps_tto = gps_tensor[start_idx:end_idx]
+                            starts = _tto_select_starts(
+                                valid_start_indices, step, tto_batch_windows, tto_sampling
+                            )
 
-                            # 为局部窗口重新生成 keyframe 索引（内部索引 0 ~ window_len-1）
+                            # 多窗口 batch
+                            images_tto = torch.cat(
+                                [images[:, s : s + window_len] for s in starts], dim=0
+                            ).to(device)
+                            gps_tto = torch.stack(
+                                [gps_tensor[s : s + window_len] for s in starts], dim=0
+                            )  # [B_tto, T, 3]
+                            B_tto = images_tto.shape[0]
+
                             is_keyframe_tto, keyframe_indices_tto = (
                                 selector.select_keyframes(
-                                    window_len, B, images_tto.device
+                                    window_len, B_tto, images_tto.device
                                 )
                             )
 
@@ -489,38 +580,47 @@ def run_inference_cfg(cfg: dict):
                                 rel_pose_num_iters,
                             )
 
-                            if "rel_pose_enc" in outputs_tto:
-                                pred_centers = _compute_camera_centers_differentiable(
-                                    outputs_tto["rel_pose_enc"][0],
-                                    keyframe_indices_tto[0],
-                                )
-                            elif "pose_enc" in outputs_tto:
-                                pred_centers = _compute_camera_centers_differentiable(
-                                    outputs_tto["pose_enc"][0],
-                                    keyframe_indices=None,
-                                )
-                            else:
-                                print(
-                                    "[longstream][TTO] 无位姿输出，跳过 TTO",
-                                    flush=True,
-                                )
-                                tto_skipped = True
+                            centers = []
+                            for b in range(B_tto):
+                                if "rel_pose_enc" in outputs_tto:
+                                    centers.append(
+                                        _compute_camera_centers_differentiable(
+                                            outputs_tto["rel_pose_enc"][b],
+                                            keyframe_indices_tto[b],
+                                        )
+                                    )
+                                elif "pose_enc" in outputs_tto:
+                                    centers.append(
+                                        _compute_camera_centers_differentiable(
+                                            outputs_tto["pose_enc"][b],
+                                            keyframe_indices=None,
+                                        )
+                                    )
+                                else:
+                                    print(
+                                        "[longstream][TTO] 无位姿输出，跳过 TTO",
+                                        flush=True,
+                                    )
+                                    tto_skipped = True
+                                    break
+
+                            if tto_skipped:
+                                del outputs_tto, images_tto
+                                outputs_tto = None
                                 break
 
-                            pred_disp = torch.linalg.norm(
-                                pred_centers[pair_stride:] - pred_centers[:-pair_stride],
-                                dim=-1,
+                            pred_centers = torch.stack(centers, dim=0)  # [B_tto, T, 3]
+
+                            loss = _tto_multiscale_loss_inline(
+                                pred_centers,
+                                gps_tto,
+                                _pair_strides,
+                                tto_min_gps_disp,
+                                tto_lambda_dir,
+                                tto_lambda_endpoint,
                             )
-                            target_disp = torch.linalg.norm(
-                                gps_tto[pair_stride:] - gps_tto[:-pair_stride],
-                                dim=-1,
-                            )
-                            valid = (
-                                torch.isfinite(target_disp)
-                                & torch.isfinite(pred_disp)
-                                & (target_disp > tto_min_gps_disp)
-                            )
-                            if not valid.any():
+
+                            if loss is None:
                                 if step == 0:
                                     print(
                                         f"[longstream][TTO] seq={seq.name}"
@@ -528,27 +628,45 @@ def run_inference_cfg(cfg: dict):
                                         flush=True,
                                     )
                                     tto_skipped = True
+                                del outputs_tto, images_tto
+                                outputs_tto = None
                                 break
 
-                            loss = torch.nn.functional.huber_loss(
-                                pred_disp[valid], target_disp[valid]
-                            )
                             loss.backward()
                             torch.nn.utils.clip_grad_norm_(
                                 [model.longstream.scale_token], tto_max_grad_norm
                             )
                             tto_seq_optimizer.step()
 
+                            loss_value = float(loss.detach().item())
+
                             if step == 0 or (step + 1) % 5 == 0:
                                 print(
                                     f"[longstream][TTO] seq={seq.name}"
                                     f" step={step + 1}/{tto_steps}"
-                                    f" win=[{start_idx},{end_idx})"
-                                    f" loss={loss.item():.6f}",
+                                    f" wins={starts} loss={loss_value:.6f}",
                                     flush=True,
                                 )
 
-                            # 显式释放局部引用，避免图引用滤留
+                            # 早停
+                            if loss_value < best_loss - tto_min_delta:
+                                best_loss = loss_value
+                                bad_steps = 0
+                            else:
+                                bad_steps += 1
+
+                            if tto_early_stop_patience > 0 and bad_steps >= tto_early_stop_patience:
+                                print(
+                                    f"[longstream][TTO] seq={seq.name}"
+                                    f" early stop at step={step + 1},"
+                                    f" best_loss={best_loss:.6f}",
+                                    flush=True,
+                                )
+                                del outputs_tto, images_tto
+                                outputs_tto = None
+                                break
+
+                            # 显式释放局部引用，避免图引用滞留
                             del outputs_tto, images_tto
                             outputs_tto = None
 
@@ -608,12 +726,64 @@ def run_inference_cfg(cfg: dict):
                 outputs, keyframe_indices, H, W
             )
 
+            # ============================================================
+            # GPS 分段 SE3 后处理（可选，仅在 gps_source="file" 时生效）
+            # ============================================================
+            extri_raw_np = extri_np.copy() if extri_np is not None else None
+            extri_corrected_np = None
+            if pose_post_enabled and extri_np is not None:
+                gps_source = getattr(seq, "gps_source", "none")
+                if getattr(seq, "gps_xyz", None) is None:
+                    print("[pose_post] 跳过：序列没有 GPS 数据", flush=True)
+                elif gps_source != "file":
+                    print(
+                        f"[pose_post] 跳过：gps_source={gps_source!r}，"
+                        f"pose_post_correction 需要真实 GPS 文件 (source='file')",
+                        flush=True,
+                    )
+                else:
+                    extri_corrected_np, post_info = correct_poses_with_gps_segment_se3(
+                        extri_np,
+                        seq.gps_xyz,
+                        segment_size=int(pose_post_cfg.get("segment_size", 160)),
+                        overlap=int(pose_post_cfg.get("overlap", 40)),
+                        min_points=int(pose_post_cfg.get("min_points", 8)),
+                        blend=str(pose_post_cfg.get("blend", "hann")),
+                    )
+                    print(f"[pose_post] 已应用 segment_se3: {post_info}", flush=True)
+
+            # use_for_point_export 控制点云/评估使用哪套位姿
+            use_corrected = (
+                extri_corrected_np is not None
+                and bool(pose_post_cfg.get("use_for_point_export", True))
+            )
+            extri_for_export = extri_corrected_np if use_corrected else extri_raw_np
+            # extri_np 统一指向最终用于下游（点云/评估）的位姿
+            extri_np = extri_for_export
+
             if extri_np is not None:
                 pose_dir = os.path.join(seq_dir, "poses")
                 _ensure_dir(pose_dir)
+                # abs_pose.txt = 下游使用的主位姿（use_for_point_export 控制）
                 save_w2c_txt(
                     os.path.join(pose_dir, "abs_pose.txt"), extri_np, frame_ids
                 )
+                # 若后处理生效，分别保存 raw 和 corrected
+                if extri_corrected_np is not None:
+                    corrected_name = str(
+                        pose_post_cfg.get("corrected_pose_name", "abs_pose_corrected.txt")
+                    )
+                    save_w2c_txt(
+                        os.path.join(pose_dir, corrected_name),
+                        extri_corrected_np,
+                        frame_ids,
+                    )
+                    if bool(pose_post_cfg.get("save_raw_pose", True)):
+                        save_w2c_txt(
+                            os.path.join(pose_dir, "abs_pose_raw.txt"),
+                            extri_raw_np,
+                            frame_ids,
+                        )
                 save_intri_txt(os.path.join(pose_dir, "intri.txt"), intri_np, frame_ids)
                 if rel_pose_enc is not None:
                     save_rel_pose_txt(

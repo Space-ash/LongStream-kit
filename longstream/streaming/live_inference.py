@@ -133,10 +133,18 @@ def _worker_inference_loop(
     # TTO 相关：reset_tto 仅在流开始时执行一次（不在每个 window 执行）
     if tto_ctx is not None:
         reset_tto(tto_ctx)
-    pair_stride_tto = int(corr_cfg.get("tto_pair_stride", keyframe_stride))
+    # 当 YAML 中已配置 tto_pair_strides（多尺度）时，不传 pair_stride（否则会覆盖 ctx.tto_pair_strides）
+    _has_pair_strides = "tto_pair_strides" in corr_cfg
+    pair_stride_tto = None if _has_pair_strides else int(corr_cfg.get("tto_pair_stride", keyframe_stride))
     tto_window_size = int(corr_cfg.get("tto_window_size", 40))
+    tto_steps_initial = int(corr_cfg.get("tto_steps_initial", corr_cfg.get("tto_steps", 12)))
+    tto_steps_update = int(corr_cfg.get("tto_steps_update", 4))
+    tto_update_interval_frames = int(corr_cfg.get("tto_update_interval_frames", 40))
+    tto_window_step = int(corr_cfg.get("tto_window_step", tto_window_size))
     _tto_frame_buffer: list = []
     _tto_gps_buffer: list = []
+    _last_tto_frame: int = -(10 ** 9)
+    _tto_run_count: int = 0
 
     # ── 分段追踪（对齐 run_streaming_refresh 逻辑）────────────────────────
     segment_start: int = 0
@@ -342,18 +350,27 @@ def _worker_inference_loop(
             if tto_ctx is not None and packet.gps_xyz is not None:
                 _tto_frame_buffer.append(packet)
                 _tto_gps_buffer.append(packet.gps_xyz)
-                if len(_tto_frame_buffer) >= tto_window_size and is_kf:
-                    _run_tto_window(
-                        tto_ctx=tto_ctx,
-                        frame_buffer=_tto_frame_buffer[-tto_window_size:],
-                        gps_buffer=_tto_gps_buffer[-tto_window_size:],
-                        selector=selector,
-                        streaming_mode=streaming_mode,
-                        device=device_str,
-                        frame_idx=g,
-                        pair_stride=pair_stride_tto,
-                    )
-                    slide = tto_window_size // 2
+                ready = len(_tto_frame_buffer) >= tto_window_size
+                due = (_tto_run_count == 0) or ((g - _last_tto_frame) >= tto_update_interval_frames)
+                if ready and is_kf and due:
+                    old_steps = tto_ctx.tto_steps
+                    tto_ctx.tto_steps = tto_steps_initial if _tto_run_count == 0 else tto_steps_update
+                    try:
+                        _run_tto_window(
+                            tto_ctx=tto_ctx,
+                            frame_buffer=_tto_frame_buffer[-tto_window_size:],
+                            gps_buffer=_tto_gps_buffer[-tto_window_size:],
+                            selector=selector,
+                            streaming_mode=streaming_mode,
+                            device=device_str,
+                            frame_idx=g,
+                            pair_stride=pair_stride_tto,
+                        )
+                    finally:
+                        tto_ctx.tto_steps = old_steps
+                    _last_tto_frame = g
+                    _tto_run_count += 1
+                    slide = max(1, min(tto_window_step, len(_tto_frame_buffer)))
                     _tto_frame_buffer = _tto_frame_buffer[slide:]
                     _tto_gps_buffer = _tto_gps_buffer[slide:]
 
@@ -2077,7 +2094,7 @@ def _run_tto_window(
     streaming_mode: str,
     device: str,
     frame_idx: int,
-    pair_stride: int = 1,
+    pair_stride: Optional[int] = None,
 ) -> None:
     """
     在滑动窗口上运行一次 TTO（不影响 session 的 KV cache）。

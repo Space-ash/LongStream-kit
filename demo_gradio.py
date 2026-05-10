@@ -134,6 +134,7 @@ def _merge_basic_into_cfg(
     streaming_mode: str = "causal",
     max_frames: int = 0,
     enable_monitoring: bool = True,
+    enable_pose_post_correction: bool = False,
 ) -> dict:
     """Apply UI leaf-values onto base cfg. Never modifies model/checkpoint keys."""
     cfg = copy.deepcopy(cfg)
@@ -141,6 +142,7 @@ def _merge_basic_into_cfg(
     cfg.setdefault("optimizations", {})
     cfg["optimizations"].setdefault("filter", {})
     cfg["optimizations"].setdefault("correction", {})
+    cfg["optimizations"].setdefault("pose_post_correction", {})
     cfg.setdefault("output", {})
     cfg.setdefault("data", {})
     cfg.setdefault("runtime", {})
@@ -164,6 +166,9 @@ def _merge_basic_into_cfg(
     cfg["optimizations"]["filter"]["confidence_filter_enabled"] = bool(enable_conf_filter)
     cfg["optimizations"]["filter"]["confidence_threshold"]      = float(confidence_threshold)
     cfg["optimizations"]["correction"]["tto_enabled"]           = bool(enable_tto)
+    cfg["optimizations"]["pose_post_correction"]["enabled"]      = bool(enable_pose_post_correction)
+    cfg["optimizations"]["pose_post_correction"].setdefault("method", "segment_se3")
+    cfg["optimizations"]["pose_post_correction"].setdefault("source", "gps")
 
     selected_keys = {
         _SAVE_LABEL_TO_KEY[label]
@@ -244,7 +249,7 @@ _ADVANCED_YAML_PLACEHOLDER = (
 def update_ui_from_yaml(template_name: str) -> tuple:
     """
     Load template YAML and refresh bound UI components.
-    Returns 27 values:
+    Returns 28 values:
       window_size, refresh, keyframe_stride, confidence_threshold,
       max_frame_points, max_full_points,
       enable_tto, enable_filter, enable_conf_filter,
@@ -253,7 +258,8 @@ def update_ui_from_yaml(template_name: str) -> tuple:
       output_root, source_path, data_roots_file, seq_list, camera,
       source_type (dropdown label), generalizable_row (visibility update),
       streaming_mode, streaming_mode_warning (visibility),
-      max_frames, enable_monitoring, enable_sky_mask
+      max_frames, enable_monitoring, enable_sky_mask,
+      enable_pose_post_correction
     advanced_yaml is NOT updated here — it remains the user's override box.
     """
     if template_name == "Custom":
@@ -261,7 +267,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         # 文件不存在时 no-op（用户手动改参数后自动切到 Custom，保持当前值）
         custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
         if not os.path.isfile(custom_path):
-            return tuple(gr.update() for _ in range(27))
+            return tuple(gr.update() for _ in range(28))
         # fall through: load custom_infer.yaml like any other template
 
     cfg   = _load_template(template_name)
@@ -314,6 +320,7 @@ def update_ui_from_yaml(template_name: str) -> tuple:
         gr.update(value=0 if mf is None else int(mf)),       # 25 max_frames
         gr.update(value=monitoring_val),                     # 26 enable_monitoring
         gr.update(value=bool(out.get("enable_sky_mask", out.get("mask_sky", False)))),  # 27 enable_sky_mask
+        gr.update(value=bool(opt.get("pose_post_correction", {}).get("enabled", False))),  # 28 enable_pose_post_correction
     )
 
 
@@ -347,6 +354,7 @@ def _build_cfg_from_ui(
     streaming_mode: str = "causal",
     max_frames: int = 0,
     enable_monitoring: bool = True,
+    enable_pose_post_correction: bool = False,
 ) -> dict:
     """Build complete cfg from UI values using base_cfg (from cfg_state) as the foundation.
 
@@ -373,6 +381,7 @@ def _build_cfg_from_ui(
         streaming_mode=streaming_mode,
         max_frames=max_frames,
         enable_monitoring=enable_monitoring,
+        enable_pose_post_correction=enable_pose_post_correction,
     )
     # 3. UI 可见路径字段最终优先（覆盖 advanced 里可能有的 data.*）
     cfg.setdefault("data", {})
@@ -437,6 +446,7 @@ def _start_runner(
     streaming_mode: str = "causal",
     max_frames: int = 0,
     enable_monitoring: bool = True,
+    enable_pose_post_correction: bool = False,
 ) -> tuple:
     global _active_runner, _rerun_viewer, _resource_monitor
 
@@ -462,6 +472,7 @@ def _start_runner(
         streaming_mode=streaming_mode,
         max_frames=max_frames,
         enable_monitoring=enable_monitoring,
+        enable_pose_post_correction=enable_pose_post_correction,
     )
 
     if simulate_streaming:
@@ -593,6 +604,7 @@ def save_custom_config(
     streaming_mode: str = "causal",
     max_frames: int = 0,
     enable_monitoring: bool = True,
+    enable_pose_post_correction: bool = False,
 ) -> tuple:
     """Save current UI params to custom_infer.yaml. Returns (path, Custom dropdown update, new cfg_state)."""
     cfg = _build_cfg_from_ui(
@@ -610,6 +622,7 @@ def save_custom_config(
         streaming_mode=streaming_mode,
         max_frames=max_frames,
         enable_monitoring=enable_monitoring,
+        enable_pose_post_correction=enable_pose_post_correction,
     )
     custom_path = os.path.join(_CONFIGS_DIR, "custom_infer.yaml")
     os.makedirs(_CONFIGS_DIR, exist_ok=True)
@@ -761,6 +774,10 @@ def main():
                     label="启用 CPU/GPU 资源监控 (monitoring.enabled)",
                     value=bool(_initial_cfg.get("monitoring", {}).get("enabled", True)),
                 )
+                enable_pose_post_correction = gr.Checkbox(
+                    label="启用 GPS 分段 SE3 轨迹校正 (optimizations.pose_post_correction.enabled)",
+                    value=bool(_initial_cfg.get("optimizations", {}).get("pose_post_correction", {}).get("enabled", False)),
+                )
 
             save_outputs = gr.CheckboxGroup(
                 label="保存输出 (output.*)",
@@ -848,6 +865,7 @@ def main():
             max_frames,                                  # 25
             enable_monitoring,                           # 26
             enable_sky_mask,                             # 27
+            enable_pose_post_correction,                 # 28
         ]
         # 使用 .input() 而非 .change()：
         # .input() 仅在用户直接点击 Dropdown 时触发；
@@ -899,7 +917,8 @@ def main():
 
         # Checkboxes / CheckboxGroup: use .input()
         for _comp in [simulate_streaming, enable_tto, enable_filter,
-                      enable_conf_filter, enable_sky_mask, enable_rerun, save_outputs, enable_monitoring]:
+                      enable_conf_filter, enable_sky_mask, enable_rerun, save_outputs, enable_monitoring,
+                      enable_pose_post_correction]:
             _comp.input(fn=_mark_custom, inputs=[], outputs=[template_name])
 
         # Textbox / Dropdown / Code / Radio / Number: use .input()
@@ -919,6 +938,7 @@ def main():
             output_root, data_roots_file, seq_list, camera,
             streaming_mode, max_frames,
             enable_monitoring,
+            enable_pose_post_correction,
         ]
 
         # ─── Button events ─────────────────────────────────────────────

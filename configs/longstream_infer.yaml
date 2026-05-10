@@ -117,7 +117,30 @@ optimizations:
     tto_window_size: 40
     tto_min_gps_disp: 1.0
     tto_max_grad_norm: 1.0
-    tto_pair_stride: 8
+    tto_pair_stride: 8          # 向后兼容；有 tto_pair_strides 时被覆盖
+    tto_pair_strides: [4, 8, 16, 32]
+    tto_sampling: deterministic_coverage   # deterministic_coverage | random | endpoint_weighted
+    tto_lambda_dir: 0.1
+    tto_lambda_endpoint: 0.2
+    tto_early_stop_patience: 4
+    tto_min_delta: 1.0e-3
+    tto_batch_windows: 2
+    # 流式 TTO 降频控制（仅流式模式使用，非流式忽略）
+    tto_steps_initial: 12          # 首次触发 TTO 时的训练步数
+    tto_steps_update: 4            # 后续触发 TTO 时的训练步数
+    tto_update_interval_frames: 40 # 每隔多少帧再次触发 TTO
+    tto_window_step: 40            # 每次 TTO 后滑动窗口的帧数
+  pose_post_correction:
+    enabled: false
+    method: segment_se3
+    source: gps
+    segment_size: 160
+    overlap: 40
+    min_points: 8
+    blend: hann
+    use_for_point_export: true
+    save_raw_pose: true
+    corrected_pose_name: abs_pose_corrected.txt
 
 # -------------------------
 # Output controls

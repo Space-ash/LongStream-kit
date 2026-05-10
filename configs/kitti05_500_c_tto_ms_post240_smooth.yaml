@@ -1,7 +1,5 @@
-# LongStream 重建模板：Ablation
-# 用途：
-# - 做单模块消融时使用
-# - 默认关闭运行时增强，按需要逐项打开
+# KITTI Odometry 05, first 500 frames, non-streaming.
+# Variant C: multi-scale TTO + smoother, longer GPS segment SE3 correction.
 
 device: cuda
 
@@ -60,56 +58,110 @@ inference:
 data:
   format: generalizable
   data_roots_file: data_roots.txt
-  img_path: prepared_inputs/preprocess/final_ablation
-  seq_list: [zhan_1_1fps]
-  camera: "00"
+  img_path: prepared_inputs/kitti_odometry
+  seq_list: ["05"]
+  camera: "02"
   stride: 1
-  max_frames: null
+  max_frames: 500
   size: 518
   crop: false
   patch_size: 14
   gt_source: auto
   gt_poses_file: gt_poses.npy
+  depth_gt_type: auto
 
 optimizations:
   filter:
     frame_filter_enabled: false
-    confidence_filter_enabled: false
+    confidence_filter_enabled: true
     blur_threshold: 100.0
     motion_threshold: 0.02
     confidence_threshold: 0.5
-    save_frame_index_map: true
+    save_frame_index_map: false
   correction:
-    tto_enabled: false
+    tto_enabled: true
+    tto_steps: 20
+    tto_lr: 1.0e-3
+    tto_weight_decay: 0.0
+    tto_window_size: 40
+    tto_min_gps_disp: 1.0
+    tto_max_grad_norm: 1.0
+    tto_pair_stride: 8
+    tto_pair_strides: [4, 8, 16, 32]
+    tto_sampling: deterministic_coverage
+    tto_lambda_dir: 0.1
+    tto_lambda_endpoint: 0.2
+    tto_early_stop_patience: 4
+    tto_min_delta: 1.0e-3
+    tto_batch_windows: 2
+    tto_steps_initial: 12
+    tto_steps_update: 4
+    tto_update_interval_frames: 40
+    tto_window_step: 40
   pose_post_correction:
-    enabled: false
+    enabled: true
     method: segment_se3
     source: gps
-    segment_size: 160
-    overlap: 40
-    min_points: 8
+    segment_size: 240
+    overlap: 80
+    min_points: 12
     blend: hann
     use_for_point_export: true
     save_raw_pose: true
     corrected_pose_name: abs_pose_corrected.txt
 
 output:
-  root: outputs/ablation
+  root: outputs/kitti_odometry_05_500/c_tto_ms_post240_smooth
   save_videos: false
-  save_images: true
+  save_images: false
   save_depth: true
   save_points: true
   save_frame_points: false
-  enable_sky_mask: false   # 平消组关闭天空过滤
+  save_point_head: false
+  save_dpt_unproj: true
+  enable_sky_mask: true
   save_sky_mask: false
   skyseg_path: model/skyseg.onnx
+  skyseg_num_threads: 1
+  skyseg_provider: auto
+  skyseg_cuda_min_free_gb: 4.0
+  skyseg_reuse_enabled: true
+  skyseg_stride: 4
+  skyseg_run_on_keyframes: true
+  skyseg_max_stale_frames: 8
+  skyseg_cache_enabled: true
+  skyseg_cache_dir: null
+  save_depth_vis: false
+  global_compact_pending_points: 800000
   max_full_pointcloud_points: 2000000
   max_frame_pointcloud_points: 200000
+  rerun_current_points: null
+  rerun_global_points: 30000
+  rerun_current_centered: true
+  rerun_use_blueprint: true
+  rerun_view_coordinates: RIGHT_HAND_Y_DOWN
+  live_global_checkpoint_interval: 0
+  torch_num_threads: 2
+  opencv_num_threads: 1
+  timing_log_interval: 0
+  vram_log_enabled: false
 
 evaluation:
-  align_scale: true
+  align_scale: false
   depth_rel_delta_threshold: 1.25
   point_f1_threshold: 0.25
   point_eval_max_points: 100000
   point_eval_voxel_size: null
   point_eval_oversample_factor: 4
+  sparse_depth_pointcloud_policy: recall_only
+  allow_sparse_chamfer_f1: false
+  min_valid_depth_pixels: 1
+
+monitoring:
+  enabled: true
+  interval_sec: 2.0
+  top_process_count: 10
+  write_process_top: true
+  write_cpu_timeseries: true
+  write_gpu_timeseries: true
+

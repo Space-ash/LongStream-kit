@@ -81,6 +81,17 @@ optimizations:
     save_frame_index_map: false
   correction:
     tto_enabled: false
+  pose_post_correction:
+    enabled: false
+    method: segment_se3
+    source: gps
+    segment_size: 160
+    overlap: 40
+    min_points: 8
+    blend: hann
+    use_for_point_export: true
+    save_raw_pose: true
+    corrected_pose_name: abs_pose_corrected.txt
 
 output:
   root: outputs/vkitti2_scene01_clone/baseline

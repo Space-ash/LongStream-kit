@@ -167,6 +167,7 @@ class LongStreamSequence:
         original_frame_indices: Optional[List[int]] = None,
         gt_poses_source: str = "none",
         gps_xyz: Optional[np.ndarray] = None,
+        gps_source: str = "none",
     ):
         self.name = name
         self.images = images
@@ -183,6 +184,9 @@ class LongStreamSequence:
         # 从 GT w2c 位姿提取的相机中心 [S, 3]（世界坐标系），作为虚拟 GPS 信号。
         # 计算方式: center = -R^T @ t，严格禁止直接使用 [:3, 3]。
         self.gps_xyz: Optional[np.ndarray] = gps_xyz
+        # GPS 数据来源标记: "file"（真实 GPS 文件）| "gt_virtual"（从 GT 位姿派生）| "none"
+        # 用于防止 GT 泄漏：pose_post_correction 仅在 gps_source="file" 时生效。
+        self.gps_source: str = gps_source
 
 
 def _read_list_file(path: str) -> List[str]:
@@ -518,6 +522,56 @@ class LongStreamDataLoader:
         )
         return poses, source_tag
 
+    def _resolve_gps_xyz(
+        self,
+        scene_root: Optional[str],
+        camera: Optional[str],
+        kept_indices: Optional[List[int]],
+    ) -> Tuple[Optional[np.ndarray], str]:
+        """
+        优先从场景目录下的真实 GPS 文件加载相机中心坐标。
+
+        搜索优先级：
+          1. <scene_root>/gps_xyz.npy
+          2. <scene_root>/gps_xyz/<camera>.npy
+          3. <scene_root>/cameras/<camera>/gps_xyz.npy
+
+        Returns:
+            (gps_xyz [N,3] float32, source_tag)
+            source_tag == "file"  表示来自真实 GPS 文件（可用于 pose_post_correction）
+            source_tag == "none"  表示未找到
+        """
+        if scene_root is None:
+            return None, "none"
+
+        candidates = [os.path.join(scene_root, "gps_xyz.npy")]
+        if camera:
+            candidates.append(os.path.join(scene_root, "gps_xyz", f"{camera}.npy"))
+            candidates.append(os.path.join(scene_root, "cameras", camera, "gps_xyz.npy"))
+
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    gps = np.load(path).astype(np.float32)
+                except Exception as exc:
+                    print(f"[longstream][gps] 读取 {path} 失败: {exc}", flush=True)
+                    continue
+                if gps.ndim == 2 and gps.shape[1] == 3:
+                    if kept_indices is not None:
+                        gps = gps[kept_indices]
+                    print(
+                        f"[longstream][gps] 已从文件加载 {len(gps)} 帧真实 GPS (path={path})",
+                        flush=True,
+                    )
+                    return gps, "file"
+                else:
+                    print(
+                        f"[longstream][gps] 忽略 {path}：shape={gps.shape}，需为 [N,3]",
+                        flush=True,
+                    )
+
+        return None, "none"
+
     def __iter__(self) -> Iterator[LongStreamSequence]:
         for info in self.iter_sequence_infos():
             print(
@@ -537,17 +591,27 @@ class LongStreamDataLoader:
                 flush=True,
             )
 
-            # 从 GT w2c 位姿提取虚拟 GPS 相机中心坐标 [S, 3]。
-            # 数学推导：w2c 满足 p_cam = R @ p_world + t，
-            # 故相机中心 = -R^T @ t（严禁直接取 [:3, 3]）。
+            # ── GPS 加载（优先真实文件，回退到 GT 派生）────────────────────
+            # 真实 GPS (gps_source="file")：可用于 pose_post_correction 后处理。
+            # 派生 GPS (gps_source="gt_virtual")：仅用于 TTO 标度监督，禁止用于后处理。
             gps_xyz: Optional[np.ndarray] = None
-            if gt_poses is not None and len(gt_poses) > 0:
+            gps_source: str = "none"
+
+            # 优先尝试从真实 GPS 文件加载
+            gps_xyz, gps_source = self._resolve_gps_xyz(
+                info.scene_root, info.camera, kept_indices
+            )
+
+            # 若无真实 GPS 文件，从 GT w2c 位姿派生（仅供 TTO 使用）
+            if gps_xyz is None and gt_poses is not None and len(gt_poses) > 0:
                 R = gt_poses[:, :3, :3].astype(np.float64)  # [S, 3, 3]
                 t = gt_poses[:, :3, 3].astype(np.float64)   # [S, 3]
-                # center_i = -(R_i^T @ t_i)，向量化实现
+                # center_i = -(R_i^T @ t_i)，严禁直接取 extri[:3, 3]
                 gps_xyz = -np.einsum('nji,nj->ni', R, t).astype(np.float32)
+                gps_source = "gt_virtual"
                 print(
-                    f"[longstream][gps] 已从 GT 位姿提取 {len(gps_xyz)} 帧相机中心",
+                    f"[longstream][gps] 已从 GT 位姿派生 {len(gps_xyz)} 帧相机中心"
+                    f"（gps_source=gt_virtual，不可用于 pose_post_correction）",
                     flush=True,
                 )
 
@@ -562,4 +626,5 @@ class LongStreamDataLoader:
                 original_frame_indices=kept_indices,
                 gt_poses_source=gt_source,
                 gps_xyz=gps_xyz,
+                gps_source=gps_source,
             )

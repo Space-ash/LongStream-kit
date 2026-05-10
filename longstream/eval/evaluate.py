@@ -434,7 +434,7 @@ def _extract_pose_pairs(seq_info, pred_pose_path, gt_extri, frame_mapping=None):
     return np.asarray(pred_xyz, dtype=np.float64), np.asarray(gt_xyz, dtype=np.float64)
 
 
-def _save_traj_plot_3d(path, pred_xyz, gt_xyz):
+def _save_traj_plot_3d(path, pred_xyz, gt_xyz, align_scale=True):
     _ensure_dir(os.path.dirname(path))
     pred_plot = _world_xyz_to_plot_xyz(pred_xyz)
     gt_plot = _world_xyz_to_plot_xyz(gt_xyz)
@@ -467,7 +467,8 @@ def _save_traj_plot_3d(path, pred_xyz, gt_xyz):
     ax.set_ylabel("z_forward")
     ax.set_zlabel("y_up")
     ax.legend(loc="best")
-    ax.set_title("Trajectory 3D (Sim3-aligned view)")
+    align_name = "Sim3-aligned view" if align_scale else "SE3-aligned view"
+    ax.set_title(f"Trajectory 3D ({align_name})")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -548,8 +549,9 @@ def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg, cfg=None):
         pairs = _extract_pose_pairs(seq_info, pred_pose_path, gt_extri, frame_mapping)
         if pairs is not None:
             pred_xyz, gt_xyz = pairs
+            align_scale = bool(eval_cfg.get("align_scale", True))
             pose_metrics = ate_rmse(
-                pred_xyz, gt_xyz, align_scale=bool(eval_cfg.get("align_scale", True))
+                pred_xyz, gt_xyz, align_scale=align_scale
             )
             sim3_scale = float(pose_metrics.get("sim3_scale", 1.0))
             pred_xyz_aligned = transform_points(
@@ -564,7 +566,7 @@ def evaluate_sequence(seq_info, output_root, eval_cfg, data_cfg, cfg=None):
                 np.asarray(pose_metrics["sim3_translation"], dtype=np.float64),
             )
             plot_path = _sequence_plot_path(output_root, seq_info.name)
-            _save_traj_plot_3d(plot_path, pred_xyz_aligned, gt_xyz)
+            _save_traj_plot_3d(plot_path, pred_xyz_aligned, gt_xyz, align_scale=align_scale)
             pose_metrics.pop("sim3_scale", None)
             pose_metrics["traj_3d_plot"] = plot_path
             result["pose"] = pose_metrics
