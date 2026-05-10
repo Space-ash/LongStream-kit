@@ -1,5 +1,6 @@
 # KITTI Odometry 05, first 500 frames, non-streaming.
-# Variant I: middle-strength TTO + best-so-far GPS segment SE3 correction.
+# Variant H: optimized-strength TTO + smoother GPS segment SE3 correction.
+# Purpose: test whether a longer, more-overlapped segment reduces sharp correction bends.
 
 device: cuda
 
@@ -80,8 +81,8 @@ optimizations:
     save_frame_index_map: false
   correction:
     tto_enabled: true
-    tto_steps: 18
-    tto_lr: 9.0e-4
+    tto_steps: 20
+    tto_lr: 1.0e-3
     tto_weight_decay: 0.0
     tto_window_size: 40
     tto_min_gps_disp: 1.0
@@ -89,9 +90,9 @@ optimizations:
     tto_pair_stride: 8
     tto_pair_strides: [4, 8, 16, 32]
     tto_sampling: deterministic_coverage
-    tto_lambda_dir: 0.08
-    tto_lambda_endpoint: 0.16
-    tto_early_stop_patience: 5
+    tto_lambda_dir: 0.1
+    tto_lambda_endpoint: 0.2
+    tto_early_stop_patience: 4
     tto_min_delta: 1.0e-3
     tto_batch_windows: 2
     tto_steps_initial: 12
@@ -102,16 +103,27 @@ optimizations:
     enabled: true
     method: segment_se3
     source: gps
-    segment_size: 120
-    overlap: 40
+    segment_size: 140
+    overlap: 60
     min_points: 8
     blend: hann
     use_for_point_export: true
     save_raw_pose: true
     corrected_pose_name: abs_pose_corrected.txt
+    gps_filter:
+      enabled: false
+      method: none
+      median_kernel: 5
+      savgol_window: 21
+      savgol_polyorder: 2
+      moving_average_window: 9
+      max_step_m: null
+      kalman_process_noise: 1.0
+      kalman_measurement_noise: 4.0
+      kalman_dt: 1.0
 
 output:
-  root: outputs/kitti_odometry_05_500/i_tto_mid_post120
+  root: outputs/kitti_odometry_05_500/h_opt_tto_post140_overlap60
   save_videos: false
   save_images: false
   save_depth: true

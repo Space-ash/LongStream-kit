@@ -109,6 +109,17 @@ optimizations:
     use_for_point_export: true
     save_raw_pose: true
     corrected_pose_name: abs_pose_corrected.txt
+    gps_filter:
+      enabled: false
+      method: none
+      median_kernel: 5
+      savgol_window: 21
+      savgol_polyorder: 2
+      moving_average_window: 9
+      max_step_m: null
+      kalman_process_noise: 1.0
+      kalman_measurement_noise: 4.0
+      kalman_dt: 1.0
 
 output:
   root: outputs/kitti_odometry_05_500/d_tto_strong_post160

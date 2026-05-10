@@ -5,6 +5,7 @@ GPS 分段 SE3 后处理：在非流式完整序列推理后，对 TTO 后模型
 
 公开 API
 --------
+filter_gps_xyz(gps_xyz, *, enabled, method, ...) -> (np.ndarray, dict)
 correct_poses_with_gps_segment_se3(extri_np, gps_xyz, ...) -> (np.ndarray, dict)
 """
 
@@ -53,6 +54,236 @@ def _ensure_4x4(extri: np.ndarray) -> np.ndarray:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  GPS 滤波工具函数
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_odd(value: int, max_value: int) -> int:
+    """将 value 限制在 [1, max_value] 并强制为奇数。"""
+    value = int(value)
+    value = max(1, min(value, max_value))
+    if value % 2 == 0:
+        value -= 1
+    return max(1, value)
+
+
+def _interp_invalid_xyz(xyz: np.ndarray):
+    """
+    对坐标序列中的 NaN/Inf 帧做线性插值修复。
+
+    Returns (xyz_repaired, num_invalid)
+    """
+    xyz = np.asarray(xyz, dtype=np.float64).copy()
+    valid = np.isfinite(xyz).all(axis=1)
+    num_invalid = int((~valid).sum())
+
+    if valid.all():
+        return xyz, 0
+    if valid.sum() == 0:
+        return np.zeros_like(xyz), num_invalid
+
+    idx = np.arange(len(xyz))
+    for d in range(3):
+        xyz[~valid, d] = np.interp(idx[~valid], idx[valid], xyz[valid, d])
+    return xyz, num_invalid
+
+
+def _repair_step_outliers(xyz: np.ndarray, max_step_m):
+    """
+    移除单帧异常大跳跃（阶跃异常值），用线性插值填回。
+
+    Returns (xyz_repaired, num_outliers)
+    """
+    if max_step_m is None or max_step_m <= 0 or len(xyz) < 3:
+        return xyz, 0
+
+    xyz = xyz.copy()
+    step = np.linalg.norm(xyz[1:] - xyz[:-1], axis=1)
+    outlier = np.zeros(len(xyz), dtype=bool)
+    outlier[1:] = step > float(max_step_m)
+    outlier[0] = False  # 首帧不判离群
+
+    num_outliers = int(outlier.sum())
+    if num_outliers == 0:
+        return xyz, 0
+
+    valid = ~outlier
+    idx = np.arange(len(xyz))
+    for d in range(3):
+        xyz[outlier, d] = np.interp(idx[outlier], idx[valid], xyz[valid, d])
+    return xyz, num_outliers
+
+
+def _moving_average_xyz(xyz: np.ndarray, window: int) -> np.ndarray:
+    """对 [N, 3] 轨迹逐维做滑动平均。"""
+    window = max(1, int(window))
+    if window <= 1:
+        return xyz.copy()
+    pad = window // 2
+    padded = np.pad(xyz, ((pad, pad), (0, 0)), mode="edge")
+    kernel = np.ones(window, dtype=np.float64) / window
+    return np.stack([
+        np.convolve(padded[:, d], kernel, mode="valid")[: len(xyz)]
+        for d in range(3)
+    ], axis=1)
+
+
+def _kalman_cv_xyz(
+    z: np.ndarray,
+    *,
+    process_noise: float = 1.0,
+    measurement_noise: float = 4.0,
+    dt: float = 1.0,
+) -> np.ndarray:
+    """
+    匀速运动 Kalman 滤波（constant-velocity 模型）。
+
+    状态向量 x = [px, py, pz, vx, vy, vz]^T。
+    """
+    n = len(z)
+    if n == 0:
+        return z.copy()
+
+    x = np.zeros(6, dtype=np.float64)
+    x[:3] = z[0]
+    if n > 1:
+        x[3:] = (z[1] - z[0]) / max(float(dt), 1e-6)
+
+    F = np.eye(6, dtype=np.float64)
+    F[0, 3] = dt
+    F[1, 4] = dt
+    F[2, 5] = dt
+
+    H = np.zeros((3, 6), dtype=np.float64)
+    H[:3, :3] = np.eye(3)
+
+    Q = float(process_noise) * np.eye(6, dtype=np.float64)
+    R = float(measurement_noise) * np.eye(3, dtype=np.float64)
+    P = 100.0 * np.eye(6, dtype=np.float64)
+    I6 = np.eye(6, dtype=np.float64)
+
+    out = np.zeros((n, 3), dtype=np.float64)
+    for i in range(n):
+        # 预测
+        x = F @ x
+        P = F @ P @ F.T + Q
+        # 更新
+        y = z[i] - H @ x
+        S = H @ P @ H.T + R
+        K = P @ H.T @ np.linalg.inv(S)
+        x = x + K @ y
+        P = (I6 - K @ H) @ P
+        out[i] = x[:3]
+
+    return out
+
+
+def filter_gps_xyz(
+    gps_xyz: np.ndarray,
+    *,
+    enabled: bool = False,
+    method: str = "none",
+    median_kernel: int = 5,
+    savgol_window: int = 21,
+    savgol_polyorder: int = 2,
+    moving_average_window: int = 9,
+    max_step_m = None,
+    kalman_process_noise: float = 1.0,
+    kalman_measurement_noise: float = 4.0,
+    kalman_dt: float = 1.0,
+):
+    """
+    可选 GPS 轨迹滤波。
+
+    Parameters
+    ----------
+    gps_xyz : np.ndarray
+        [N, 3] GPS 相机中心坐标。
+    enabled : bool
+        False 时直接返回原始数据副本（无任何修改）。
+    method : str
+        滤波方法：``"none"`` | ``"median"`` | ``"median_savgol"``
+        | ``"moving_average"`` | ``"kalman_cv"``。
+
+    Returns
+    -------
+    (filtered_gps, info_dict)
+    """
+    gps = np.asarray(gps_xyz, dtype=np.float64)
+    info = {
+        "enabled": bool(enabled),
+        "method": method,
+        "num_invalid_repaired": 0,
+        "num_step_outliers_repaired": 0,
+    }
+
+    if not enabled or method in ("none", "", None):
+        return gps.copy(), info
+
+    # ── 预处理：插值 NaN/Inf，修复阶跃异常 ──────────────────────────────
+    gps, n_invalid = _interp_invalid_xyz(gps)
+    gps, n_outliers = _repair_step_outliers(gps, max_step_m)
+    info["num_invalid_repaired"] = n_invalid
+    info["num_step_outliers_repaired"] = n_outliers
+
+    N = len(gps)
+    out = gps.copy()
+
+    if method == "median":
+        try:
+            from scipy.signal import medfilt
+            k = _make_odd(median_kernel, N)
+            out = np.stack([medfilt(gps[:, d], kernel_size=k) for d in range(3)], axis=1)
+        except Exception:
+            out = gps
+
+    elif method == "median_savgol":
+        # 先 median，再 Savitzky-Golay
+        try:
+            from scipy.signal import medfilt
+            k = _make_odd(median_kernel, N)
+            tmp = np.stack([medfilt(gps[:, d], kernel_size=k) for d in range(3)], axis=1)
+        except Exception:
+            tmp = gps
+        try:
+            from scipy.signal import savgol_filter
+            w = _make_odd(savgol_window, N)
+            p = min(int(savgol_polyorder), max(0, w - 2))
+            if w >= p + 2 and w >= 3:
+                out = savgol_filter(tmp, window_length=w, polyorder=p, axis=0, mode="interp")
+            else:
+                out = _moving_average_xyz(tmp, moving_average_window)
+        except Exception:
+            out = _moving_average_xyz(tmp, moving_average_window)
+
+    elif method == "moving_average":
+        out = _moving_average_xyz(gps, moving_average_window)
+
+    elif method == "kalman_cv":
+        out = _kalman_cv_xyz(
+            gps,
+            process_noise=kalman_process_noise,
+            measurement_noise=kalman_measurement_noise,
+            dt=kalman_dt,
+        )
+
+    else:
+        print(f"[gps_filter] 未知方法 {method!r}，跳过滤波", flush=True)
+        out = gps
+
+    info.update({
+        "median_kernel": median_kernel,
+        "savgol_window": savgol_window,
+        "savgol_polyorder": savgol_polyorder,
+        "moving_average_window": moving_average_window,
+        "max_step_m": max_step_m,
+        "kalman_process_noise": kalman_process_noise,
+        "kalman_measurement_noise": kalman_measurement_noise,
+        "kalman_dt": kalman_dt,
+    })
+    return out, info
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  核心函数
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -64,6 +295,7 @@ def correct_poses_with_gps_segment_se3(
     overlap: int = 40,
     min_points: int = 8,
     blend: str = "hann",
+    gps_filter_cfg = None,
 ) -> tuple:
     """
     GPS 分段 SE3 后处理。
@@ -85,6 +317,9 @@ def correct_poses_with_gps_segment_se3(
         每段最少有效帧数，不足则跳过该段。
     blend : str
         混合权重策略：``"hann"`` 或 ``"linear"``。
+    gps_filter_cfg : dict | None
+        GPS 滤波配置，对应 YAML 中的 ``pose_post_correction.gps_filter``。
+        None 或 {} 时等效于 enabled=false（不做滤波）。
 
     Returns
     -------
@@ -92,7 +327,7 @@ def correct_poses_with_gps_segment_se3(
         [S, 4, 4] float32，校正后的 w2c 位姿。
     metadata : dict
         包含 num_segments, num_valid_frames, mean_residual_before,
-        mean_residual_after, segment_size, overlap, method 等字段。
+        mean_residual_after, segment_size, overlap, method, gps_filter 等字段。
     """
     from longstream.eval.metrics import similarity_align
 
@@ -110,8 +345,12 @@ def correct_poses_with_gps_segment_se3(
     S_ext = extri_full.shape[0]
     S_gps = gps_xyz.shape[0]
     S = min(S_ext, S_gps)
-    extri_np = extri_full[:S]   # 只在此局部副本上截断， extri_full 保持完整
+    extri_np = extri_full[:S]   # 只在此局部副本上截断，extri_full 保持完整
     gps_xyz = gps_xyz[:S]
+
+    # ── GPS 滤波（可选）──────────────────────────────────────────────────
+    gps_filter_cfg = gps_filter_cfg or {}
+    gps_used, gps_filter_info = filter_gps_xyz(gps_xyz, **gps_filter_cfg)
 
     # ── 提取预测相机中心 [S, 3] ──────────────────────────────────────────
     Rcw = extri_np[:, :3, :3]   # [S, 3, 3]
@@ -120,7 +359,7 @@ def correct_poses_with_gps_segment_se3(
     C_pred = -np.einsum("nij,nj->ni", np.transpose(Rcw, (0, 2, 1)), tcw)  # [S, 3]
 
     # ── 有效帧掩码（用于残差统计）────────────────────────────────────────
-    valid_mask = np.isfinite(C_pred).all(axis=1) & np.isfinite(gps_xyz).all(axis=1)
+    valid_mask = np.isfinite(C_pred).all(axis=1) & np.isfinite(gps_used).all(axis=1)
     n_valid_total = int(valid_mask.sum())
 
     _skip_meta = {
@@ -131,6 +370,7 @@ def correct_poses_with_gps_segment_se3(
         "segment_size": segment_size,
         "overlap": overlap,
         "method": "segment_se3",
+        "gps_filter": gps_filter_info,
     }
 
     if n_valid_total < min_points:
@@ -139,7 +379,7 @@ def correct_poses_with_gps_segment_se3(
         return extri_out, _skip_meta
 
     resid_before = float(
-        np.mean(np.linalg.norm(C_pred[valid_mask] - gps_xyz[valid_mask], axis=1))
+        np.mean(np.linalg.norm(C_pred[valid_mask] - gps_used[valid_mask], axis=1))
     )
 
     # ── 分段索引 ─────────────────────────────────────────────────────────
@@ -162,8 +402,8 @@ def correct_poses_with_gps_segment_se3(
         if seg_len < min_points:
             continue
 
-        src = C_pred[start:end]   # 预测中心
-        dst = gps_xyz[start:end]  # GPS 参考
+        src = C_pred[start:end]        # 预测中心
+        dst = gps_used[start:end]      # GPS 参考（已滤波）
         seg_valid = (
             np.isfinite(src).all(axis=1) & np.isfinite(dst).all(axis=1)
         )
@@ -217,7 +457,7 @@ def correct_poses_with_gps_segment_se3(
 
     # ── 校正后残差 ───────────────────────────────────────────────────────
     resid_after = float(
-        np.mean(np.linalg.norm(C_corr[valid_mask] - gps_xyz[valid_mask], axis=1))
+        np.mean(np.linalg.norm(C_corr[valid_mask] - gps_used[valid_mask], axis=1))
     ) if corrected_count > 0 else resid_before
 
     # ── 构建输出 [S, 4, 4] ───────────────────────────────────────────────
@@ -239,4 +479,5 @@ def correct_poses_with_gps_segment_se3(
         "segment_size": segment_size,
         "overlap": overlap,
         "method": "segment_se3",
+        "gps_filter": gps_filter_info,
     }

@@ -1,5 +1,6 @@
 # KITTI Odometry 05, first 500 frames, non-streaming.
-# Variant F: lighter TTO only, no pose post-correction.
+# Variant I: soft-direction TTO + best-so-far GPS segment SE3 correction.
+# Purpose: test whether keeping optimized step/lr but softer direction/endpoint losses helps depth.
 
 device: cuda
 
@@ -80,8 +81,8 @@ optimizations:
     save_frame_index_map: false
   correction:
     tto_enabled: true
-    tto_steps: 14
-    tto_lr: 8.0e-4
+    tto_steps: 20
+    tto_lr: 1.0e-3
     tto_weight_decay: 0.0
     tto_window_size: 40
     tto_min_gps_disp: 1.0
@@ -99,7 +100,7 @@ optimizations:
     tto_update_interval_frames: 40
     tto_window_step: 40
   pose_post_correction:
-    enabled: false
+    enabled: true
     method: segment_se3
     source: gps
     segment_size: 120
@@ -109,9 +110,20 @@ optimizations:
     use_for_point_export: true
     save_raw_pose: true
     corrected_pose_name: abs_pose_corrected.txt
+    gps_filter:
+      enabled: false
+      method: none
+      median_kernel: 5
+      savgol_window: 21
+      savgol_polyorder: 2
+      moving_average_window: 9
+      max_step_m: null
+      kalman_process_noise: 1.0
+      kalman_measurement_noise: 4.0
+      kalman_dt: 1.0
 
 output:
-  root: outputs/kitti_odometry_05_500/f_tto_light_no_post
+  root: outputs/kitti_odometry_05_500/i_opt_tto_soft_post120
   save_videos: false
   save_images: false
   save_depth: true

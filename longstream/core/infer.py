@@ -742,6 +742,7 @@ def run_inference_cfg(cfg: dict):
                         flush=True,
                     )
                 else:
+                    gps_filter_cfg = pose_post_cfg.get("gps_filter", {})
                     extri_corrected_np, post_info = correct_poses_with_gps_segment_se3(
                         extri_np,
                         seq.gps_xyz,
@@ -749,6 +750,7 @@ def run_inference_cfg(cfg: dict):
                         overlap=int(pose_post_cfg.get("overlap", 40)),
                         min_points=int(pose_post_cfg.get("min_points", 8)),
                         blend=str(pose_post_cfg.get("blend", "hann")),
+                        gps_filter_cfg=gps_filter_cfg,
                     )
                     print(f"[pose_post] 已应用 segment_se3: {post_info}", flush=True)
 
