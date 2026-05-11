@@ -1,5 +1,6 @@
 # KITTI Odometry 05, first 500 frames, non-streaming.
-# Variant B: multi-scale TTO + moderate GPS segment SE3 correction.
+# Variant H: optimized-strength TTO + smoother GPS segment SE3 correction.
+# Purpose: test whether a longer, more-overlapped segment reduces sharp correction bends.
 
 device: cuda
 
@@ -102,8 +103,8 @@ optimizations:
     enabled: true
     method: segment_se3
     source: gps
-    segment_size: 160
-    overlap: 40
+    segment_size: 140
+    overlap: 60
     min_points: 8
     blend: hann
     use_for_point_export: true
@@ -122,7 +123,7 @@ optimizations:
       kalman_dt: 1.0
 
 output:
-  root: outputs/kitti_odometry_05_500/b_tto_ms_post160
+  root: outputs/kitti_odometry_05_500/g_tto_ms_post140_overlap60
   save_videos: false
   save_images: false
   save_depth: true
@@ -175,4 +176,3 @@ monitoring:
   write_process_top: true
   write_cpu_timeseries: true
   write_gpu_timeseries: true
-

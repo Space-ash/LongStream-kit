@@ -1,5 +1,6 @@
 # KITTI Odometry 05, first 500 frames, non-streaming.
-# Variant C: multi-scale TTO + smoother, longer GPS segment SE3 correction.
+# Variant G: optimized-strength TTO + best-so-far GPS segment SE3 correction.
+# Purpose: recover optimized-style depth metrics while keeping post-corrected pose export.
 
 device: cuda
 
@@ -102,9 +103,9 @@ optimizations:
     enabled: true
     method: segment_se3
     source: gps
-    segment_size: 240
-    overlap: 80
-    min_points: 12
+    segment_size: 120
+    overlap: 40
+    min_points: 8
     blend: hann
     use_for_point_export: true
     save_raw_pose: true
@@ -122,7 +123,7 @@ optimizations:
       kalman_dt: 1.0
 
 output:
-  root: outputs/kitti_odometry_05_500/c_tto_ms_post240_smooth
+  root: outputs/kitti_odometry_05_500/b_tto_ms_post120
   save_videos: false
   save_images: false
   save_depth: true
@@ -175,4 +176,3 @@ monitoring:
   write_process_top: true
   write_cpu_timeseries: true
   write_gpu_timeseries: true
-

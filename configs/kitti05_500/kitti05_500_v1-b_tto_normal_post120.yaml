@@ -1,5 +1,6 @@
 # KITTI Odometry 05, first 500 frames, non-streaming.
-# Variant D: stronger TTO losses + moderate GPS segment SE3 correction.
+# Variant G: optimized-strength TTO + best-so-far GPS segment SE3 correction.
+# Purpose: recover optimized-style depth metrics while keeping post-corrected pose export.
 
 device: cuda
 
@@ -80,19 +81,18 @@ optimizations:
     save_frame_index_map: false
   correction:
     tto_enabled: true
-    tto_steps: 28
+    tto_steps: 20
     tto_lr: 1.0e-3
     tto_weight_decay: 0.0
-    tto_window_size: 48
+    tto_window_size: 40
     tto_min_gps_disp: 1.0
     tto_max_grad_norm: 1.0
     tto_pair_stride: 8
-    tto_pair_strides: [4, 8, 16, 32]
     tto_sampling: deterministic_coverage
-    tto_lambda_dir: 0.2
-    tto_lambda_endpoint: 0.4
-    tto_early_stop_patience: 6
-    tto_min_delta: 5.0e-4
+    tto_lambda_dir: 0.1
+    tto_lambda_endpoint: 0.2
+    tto_early_stop_patience: 4
+    tto_min_delta: 1.0e-3
     tto_batch_windows: 2
     tto_steps_initial: 12
     tto_steps_update: 4
@@ -102,7 +102,7 @@ optimizations:
     enabled: true
     method: segment_se3
     source: gps
-    segment_size: 160
+    segment_size: 120
     overlap: 40
     min_points: 8
     blend: hann
@@ -122,7 +122,7 @@ optimizations:
       kalman_dt: 1.0
 
 output:
-  root: outputs/kitti_odometry_05_500/d_tto_strong_post160
+  root: outputs/kitti_odometry_05_500/b_tto_ms_post120
   save_videos: false
   save_images: false
   save_depth: true
@@ -175,4 +175,3 @@ monitoring:
   write_process_top: true
   write_cpu_timeseries: true
   write_gpu_timeseries: true
-
