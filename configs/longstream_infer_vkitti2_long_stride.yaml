@@ -1,0 +1,181 @@
+# LongStream 重建模板：Optimized
+# 用途：
+# - 打开输入预筛选和 GT 周期校正
+# - 作为推荐主实验配置
+
+device: cuda
+
+model:
+  checkpoint: checkpoints/50_longstream.pt
+  strict_load: false
+  hf:
+    repo_id: null
+    filename: null
+    revision: null
+    local_dir: checkpoints
+  longstream_cfg:
+    img_size: 518
+    patch_size: 14
+    embed_dim: 1024
+    window_size: 48
+    use_role_embedding: false
+    enable_scale_token: true
+    disable_keyframe_distinction: true
+    use_segment_mask: false
+    enable_camera_head: false
+    use_rel_pose_head: true
+    freeze: none
+    rel_pose_head_cfg:
+      enabled: true
+      keyframe_mode: fixed
+      keyframe_stride: 16
+      reference_source: pred
+      detach_reference: false
+      trunk_depth: 4
+      pose_mode: SE3
+      num_heads: 16
+      mlp_ratio: 4
+      init_values: 0.01
+      trans_act: linear
+      quat_act: linear
+      use_pair_cross_attn: false
+      xattn_temperature: 1.0
+      use_precat: false
+      use_kf_role_embed: false
+      kf_role_embed_init_std: 0.02
+      fl_act: relu
+      use_global_scale: false
+      reinit_camera_head: false
+
+inference:
+  mode: batch_refresh
+  streaming_mode: causal
+  window_size: 48
+  keyframe_mode: fixed
+  keyframe_stride: 16
+  refresh: 4
+  rel_pose_head_cfg:
+    num_iterations: 4
+
+data:
+  format: generalizable
+  data_roots_file: data_roots.txt
+  img_path: prepared_inputs/vkitti2
+  seq_list: [Scene01/clone]
+  camera: "00"
+  stride: 1
+  max_frames: null
+  size: 518
+  crop: false
+  patch_size: 14
+  gt_source: auto
+  gt_poses_file: gt_poses.npy
+
+optimizations:
+  filter:
+    frame_filter_enabled: false
+    confidence_filter_enabled: true
+    blur_threshold: 100.0
+    motion_threshold: 0.02
+    confidence_threshold: 0.5
+    save_frame_index_map: false
+  correction:
+    tto_enabled: true
+    tto_steps: 20
+    tto_lr: 1.0e-3
+    tto_weight_decay: 0.0
+    tto_window_size: 40
+    tto_min_gps_disp: 1.0
+    tto_max_grad_norm: 1.0
+    tto_pair_stride: 8          # 向后兼容；有 tto_pair_strides 时被覆盖
+    tto_pair_strides: [4, 8, 16, 32]
+    tto_sampling: deterministic_coverage
+    tto_lambda_dir: 0.1
+    tto_lambda_endpoint: 0.2
+    tto_early_stop_patience: 4
+    tto_min_delta: 1.0e-3
+    tto_batch_windows: 2
+    # 流式 TTO 降频控制（仅流式模式使用，非流式忽略）
+    tto_steps_initial: 12          # 首次触发 TTO 时的训练步数
+    tto_steps_update: 4            # 后续触发 TTO 时的训练步数
+    tto_update_interval_frames: 40 # 每隔多少帧再次触发 TTO
+    tto_window_step: 40            # 每次 TTO 后滑动窗口的帧数
+  pose_post_correction:
+    enabled: true
+    method: segment_se3
+    source: gps
+    segment_size: 120
+    overlap: 40
+    min_points: 8
+    blend: hann
+    use_for_point_export: true
+    save_raw_pose: true
+    corrected_pose_name: abs_pose_corrected.txt
+    gps_filter:
+      enabled: false
+      method: none
+      median_kernel: 5
+      savgol_window: 21
+      savgol_polyorder: 2
+      moving_average_window: 9
+      max_step_m: null
+      kalman_process_noise: 1.0
+      kalman_measurement_noise: 4.0
+      kalman_dt: 1.0
+
+output:
+  root: outputs/vkitti2/long_stride
+  save_videos: false
+  save_images: false
+  save_depth: false
+  save_points: true
+  save_frame_points: false
+  save_point_head: false
+  save_dpt_unproj: true
+  rerun_current_points: null    # null = 不限制当前帧推送点数
+  rerun_global_points: 30000
+  # rerun_global_ingest_points 已废弃（独立 viewer reservoir 已删除，viewer 直接采样 dpt_unproj 全局 reservoir）
+  rerun_current_centered: true  # 当前帧点云居中到相机中心，防止世界坐标漂出调试视野
+  rerun_use_blueprint: true
+  rerun_view_coordinates: RIGHT_HAND_Y_DOWN  # 可选 RIGHT_HAND_Y_UP
+  live_global_checkpoint_interval: 0
+  torch_num_threads: 2
+  opencv_num_threads: 1
+  timing_log_interval: 0     # 0=关闭 timing 日志；设为正整数 N 则每 N 帧打印一次
+  vram_log_enabled: false    # 是否每 25 帧打印 VRAM 快照
+  enable_sky_mask: true      # 启用 sky segmentation 过滤点云中的天空区域
+  save_sky_mask: false        # 是否将天空遮罩 mask PNG 写入磁盘（不影响过滤）
+  skyseg_path: model/skyseg.onnx
+  skyseg_num_threads: 1       # onnxruntime skyseg 线程数，控制 CPU 占用
+
+  # SkySeg advanced runtime controls
+  skyseg_provider: auto          # auto | cuda | cpu
+  skyseg_cuda_min_free_gb: 4.0   # auto 模式下空闲显存低于该值则回退 CPU
+
+  skyseg_reuse_enabled: true
+  skyseg_stride: 4               # 每 N 帧实际运行一次 skyseg
+  skyseg_run_on_keyframes: true  # 关键帧强制刷新 mask
+  skyseg_max_stale_frames: 8     # 复用 mask 的最大帧距
+
+  skyseg_cache_enabled: true
+  skyseg_cache_dir: null         # null => <out_dir>/sky_masks_cache
+  save_depth_vis: false       # 是否生成深度伪彩色 PNG（save_depth=true 时生效）
+  global_compact_pending_points: 800000  # reservoir compact 触发默认 800k（降低周期性 CPU 尖峰）
+  max_full_pointcloud_points: 2000000
+  max_frame_pointcloud_points: 200000
+
+evaluation:
+  align_scale: false
+  depth_rel_delta_threshold: 1.25
+  point_f1_threshold: 0.25
+  point_eval_max_points: 100000
+  point_eval_voxel_size: null
+  point_eval_oversample_factor: 4
+
+monitoring:
+  enabled: true             # 设为 true 启动后台资源采样（需要 psutil）
+  interval_sec: 2.0
+  top_process_count: 10
+  write_process_top: true    # cpu_process_top.csv（debug 用）
+  write_cpu_timeseries: true # cpu_timeseries.csv（论文绘图用）
+  write_gpu_timeseries: true # gpu_timeseries.csv（需要 nvidia-smi）
