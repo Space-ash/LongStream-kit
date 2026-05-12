@@ -263,8 +263,10 @@ def _compute_camera_centers_differentiable(
         S = pose_enc.shape[0]
         R_list = [rel_R[0]]
         t_list = [rel_t[0]]
+        # 优化：一次性将索引拷贝至 CPU 列表，避免循环内逐帧调用 .item() 强行同步 GPU。
+        kf_indices_cpu = keyframe_indices.detach().cpu().to(torch.int32).tolist()
         for s in range(1, S):
-            ref_idx = int(keyframe_indices[s].item())
+            ref_idx = kf_indices_cpu[s]
             R_s = rel_R[s] @ R_list[ref_idx]
             t_s = rel_t[s] + rel_R[s] @ t_list[ref_idx]
             R_list.append(R_s)
@@ -316,7 +318,8 @@ def _tto_select_starts(valid_starts, step, batch_windows, sampling):
 
 
 def _tto_multiscale_loss_inline(pred_centers, gps_tto, pair_strides, min_gps_disp, lambda_dir, lambda_endpoint):
-    """infer.py 内联 TTO 专用：多尺度位移 loss。"""
+    """infer.py 内联 TTO 专用：多尺度位移 loss。
+    优化版：以浮点掩码代替 .any() 控制流，彻底消除 GPU-CPU 同步阻断。"""
     losses = []
     eps = 1.0e-6
     for stride in pair_strides:
@@ -325,27 +328,53 @@ def _tto_multiscale_loss_inline(pred_centers, gps_tto, pair_strides, min_gps_dis
         gps_vec = gps_tto[:, stride:] - gps_tto[:, :-stride]
         pred_disp = torch.linalg.norm(pred_vec, dim=-1)
         gps_disp = torch.linalg.norm(gps_vec, dim=-1)
-        valid = (
+
+        # 以浮点掩码代替布尔索引，避免 valid.any() 触发 CPU/GPU 同步
+        valid_mask = (
             torch.isfinite(pred_disp)
             & torch.isfinite(gps_disp)
             & (gps_disp > min_gps_disp)
+        ).float()
+        valid_sum = valid_mask.sum()
+        has_valid = (valid_sum > 0).float()
+
+        huber_disp = torch.nn.functional.huber_loss(
+            pred_disp, gps_disp, reduction="none"
         )
-        if valid.any():
-            losses.append(torch.nn.functional.huber_loss(pred_disp[valid], gps_disp[valid]))
-            if lambda_dir > 0:
-                pred_dir = pred_vec / pred_disp.clamp_min(eps).unsqueeze(-1)
-                gps_dir = gps_vec / gps_disp.clamp_min(eps).unsqueeze(-1)
-                losses.append(lambda_dir * torch.nn.functional.huber_loss(pred_dir[valid], gps_dir[valid]))
+        loss_disp = (huber_disp * valid_mask).sum() / valid_sum.clamp(min=1.0)
+        losses.append(loss_disp * has_valid)
+
+        if lambda_dir > 0:
+            pred_dir = pred_vec / pred_disp.clamp_min(eps).unsqueeze(-1)
+            gps_dir = gps_vec / gps_disp.clamp_min(eps).unsqueeze(-1)
+            huber_dir = torch.nn.functional.huber_loss(
+                pred_dir, gps_dir, reduction="none"
+            )
+            valid_dir_mask = valid_mask.unsqueeze(-1)
+            loss_dir = (
+                (huber_dir * valid_dir_mask).sum()
+                / (valid_sum.clamp(min=1.0) * 3.0)
+            )
+            losses.append(lambda_dir * loss_dir * has_valid)
+
     if lambda_endpoint > 0:
         pred_ep = pred_centers[:, -1] - pred_centers[:, 0]
         gps_ep = gps_tto[:, -1] - gps_tto[:, 0]
         ep_disp = torch.linalg.norm(gps_ep, dim=-1)
-        valid_ep = torch.isfinite(ep_disp) & (ep_disp > min_gps_disp)
-        if valid_ep.any():
-            losses.append(lambda_endpoint * torch.nn.functional.huber_loss(pred_ep[valid_ep], gps_ep[valid_ep]))
+        valid_ep_mask = (
+            torch.isfinite(ep_disp) & (ep_disp > min_gps_disp)
+        ).float()
+        valid_ep_sum = valid_ep_mask.sum()
+        has_valid_ep = (valid_ep_sum > 0).float()
+        huber_ep = torch.nn.functional.huber_loss(
+            pred_ep, gps_ep, reduction="none"
+        )
+        loss_ep = (huber_ep * valid_ep_mask).sum() / valid_ep_sum.clamp(min=1.0)
+        losses.append(lambda_endpoint * loss_ep * has_valid_ep)
+
     if not losses:
         return None
-    return torch.stack([x if x.ndim == 0 else x.mean() for x in losses]).sum()
+    return torch.stack(losses).sum()
 
 
 def run_inference_cfg(cfg: dict):
