@@ -369,7 +369,7 @@ def _tto_multiscale_loss_inline(pred_centers, gps_tto, pair_strides, min_gps_dis
         huber_ep = torch.nn.functional.huber_loss(
             pred_ep, gps_ep, reduction="none"
         )
-        loss_ep = (huber_ep * valid_ep_mask).sum() / valid_ep_sum.clamp(min=1.0)
+        loss_ep = (huber_ep * valid_ep_mask.unsqueeze(-1)).sum() / (valid_ep_sum.clamp(min=1.0) * 3.0)
         losses.append(lambda_endpoint * loss_ep * has_valid_ep)
 
     if not losses:
