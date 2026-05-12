@@ -23,6 +23,7 @@ from longstream.io.save_poses_txt import save_w2c_txt, save_intri_txt, save_rel_
 from longstream.io.save_images import save_image_sequence, save_video
 from longstream.io.frame_index_map import save_frame_index_map
 from longstream.core.pose_post_correction import correct_poses_with_gps_segment_se3
+from longstream.utils.resource_monitor import CriticalOperationProfiler
 
 
 def _to_uint8_rgb(images):
@@ -571,14 +572,15 @@ def run_inference_cfg(cfg: dict):
                                 )
                             )
 
-                            outputs_tto = _run_tto_pose_forward(
-                                model,
-                                images_tto,
-                                is_keyframe_tto,
-                                keyframe_indices_tto,
-                                streaming_mode,
-                                rel_pose_num_iters,
-                            )
+                            with CriticalOperationProfiler(f"TTO_forward_seq_{seq.name}_step_{step}"):
+                                outputs_tto = _run_tto_pose_forward(
+                                    model,
+                                    images_tto,
+                                    is_keyframe_tto,
+                                    keyframe_indices_tto,
+                                    streaming_mode,
+                                    rel_pose_num_iters,
+                                )
 
                             centers = []
                             for b in range(B_tto):
@@ -632,11 +634,12 @@ def run_inference_cfg(cfg: dict):
                                 outputs_tto = None
                                 break
 
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(
-                                [model.longstream.scale_token], tto_max_grad_norm
-                            )
-                            tto_seq_optimizer.step()
+                            with CriticalOperationProfiler(f"TTO_backward_seq_{seq.name}_step_{step}"):
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(
+                                    [model.longstream.scale_token], tto_max_grad_norm
+                                )
+                                tto_seq_optimizer.step()
 
                             loss_value = float(loss.detach().item())
 
@@ -683,27 +686,29 @@ def run_inference_cfg(cfg: dict):
                     outputs_tto = None
 
             if mode == "batch_refresh":
-                outputs = run_batch_refresh(
-                    model,
-                    images,
-                    is_keyframe,
-                    keyframe_indices,
-                    streaming_mode,
-                    keyframe_stride,
-                    refresh,
-                    rel_pose_cfg,
-                )
+                with CriticalOperationProfiler(f"refresh_batch_refresh_seq_{seq.name}"):
+                    outputs = run_batch_refresh(
+                        model,
+                        images,
+                        is_keyframe,
+                        keyframe_indices,
+                        streaming_mode,
+                        keyframe_stride,
+                        refresh,
+                        rel_pose_cfg,
+                    )
             elif mode == "streaming_refresh":
-                outputs = run_streaming_refresh(
-                    model,
-                    images,
-                    is_keyframe,
-                    keyframe_indices,
-                    streaming_mode,
-                    window_size,
-                    refresh,
-                    rel_pose_cfg,
-                )
+                with CriticalOperationProfiler(f"refresh_streaming_refresh_seq_{seq.name}"):
+                    outputs = run_streaming_refresh(
+                        model,
+                        images,
+                        is_keyframe,
+                        keyframe_indices,
+                        streaming_mode,
+                        window_size,
+                        refresh,
+                        rel_pose_cfg,
+                    )
             else:
                 raise ValueError(f"Unsupported inference mode: {mode}")
             print(f"[longstream] sequence {seq.name}: inference done", flush=True)
@@ -743,15 +748,16 @@ def run_inference_cfg(cfg: dict):
                     )
                 else:
                     gps_filter_cfg = pose_post_cfg.get("gps_filter", {})
-                    extri_corrected_np, post_info = correct_poses_with_gps_segment_se3(
-                        extri_np,
-                        seq.gps_xyz,
-                        segment_size=int(pose_post_cfg.get("segment_size", 160)),
-                        overlap=int(pose_post_cfg.get("overlap", 40)),
-                        min_points=int(pose_post_cfg.get("min_points", 8)),
-                        blend=str(pose_post_cfg.get("blend", "hann")),
-                        gps_filter_cfg=gps_filter_cfg,
-                    )
+                    with CriticalOperationProfiler(f"gps_post_correction_seq_{seq.name}"):
+                        extri_corrected_np, post_info = correct_poses_with_gps_segment_se3(
+                            extri_np,
+                            seq.gps_xyz,
+                            segment_size=int(pose_post_cfg.get("segment_size", 160)),
+                            overlap=int(pose_post_cfg.get("overlap", 40)),
+                            min_points=int(pose_post_cfg.get("min_points", 8)),
+                            blend=str(pose_post_cfg.get("blend", "hann")),
+                            gps_filter_cfg=gps_filter_cfg,
+                        )
                     print(f"[pose_post] 已应用 segment_se3: {post_info}", flush=True)
 
             # use_for_point_export 控制点云/评估使用哪套位姿
@@ -926,13 +932,14 @@ def run_inference_cfg(cfg: dict):
                             full_pts.append(pts_i)
                             full_cols.append(cols_i)
                     if save_point_head:
-                        _save_full_pointcloud(
-                            os.path.join(seq_dir, "points", "point_head_full.ply"),
-                            full_pts,
-                            full_cols,
-                            max_points=max_full_pointcloud_points,
-                            seed=0,
-                        )
+                        with CriticalOperationProfiler(f"save_full_pointcloud_point_head_seq_{seq.name}"):
+                            _save_full_pointcloud(
+                                os.path.join(seq_dir, "points", "point_head_full.ply"),
+                                full_pts,
+                                full_cols,
+                                max_points=max_full_pointcloud_points,
+                                seed=0,
+                            )
 
                 # --- dpt_unproj 分支 ---
                 if save_dpt_unproj and (
@@ -993,13 +1000,14 @@ def run_inference_cfg(cfg: dict):
                             full_pts.append(pts_i)
                             full_cols.append(cols_i)
                     if save_dpt_unproj:
-                        _save_full_pointcloud(
-                            os.path.join(seq_dir, "points", "dpt_unproj_full.ply"),
-                            full_pts,
-                            full_cols,
-                            max_points=max_full_pointcloud_points,
-                            seed=1,
-                        )
+                        with CriticalOperationProfiler(f"save_full_pointcloud_dpt_unproj_seq_{seq.name}"):
+                            _save_full_pointcloud(
+                                os.path.join(seq_dir, "points", "dpt_unproj_full.ply"),
+                                full_pts,
+                                full_cols,
+                                max_points=max_full_pointcloud_points,
+                                seed=1,
+                            )
             del outputs
             if device_type == "cuda":
                 torch.cuda.empty_cache()

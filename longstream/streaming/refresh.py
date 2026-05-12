@@ -2,6 +2,7 @@ import torch
 from typing import Dict, Any, List
 
 from longstream.streaming.stream_session import StreamSession
+from longstream.utils.resource_monitor import CriticalOperationProfiler
 
 _SEQUENCE_OUTPUT_KEYS = {
     "pose_enc",
@@ -131,12 +132,13 @@ def run_batch_refresh(
         elif batch_is_keyframe is not None:
             batch_is_keyframe = batch_is_keyframe.to(device, non_blocking=True)
 
-        batch_output = model(
-            images=batch_images,
-            mode=mode,
-            rel_pose_inputs=batch_rel_pose_inputs,
-            is_keyframe=batch_is_keyframe,
-        )
+        with CriticalOperationProfiler(f"batch_refresh_model_forward_batch_{batch_idx}"):
+            batch_output = model(
+                images=batch_images,
+                mode=mode,
+                rel_pose_inputs=batch_rel_pose_inputs,
+                is_keyframe=batch_is_keyframe,
+            )
 
         _append_batch_output(
             stitched_tensors,
@@ -182,12 +184,13 @@ def run_streaming_refresh(
             keyframe_indices_s = keyframe_indices_s.to(device, non_blocking=True)
         else:
             keyframe_indices_s = None
-        session.forward_stream(
-            frame_images,
-            is_keyframe=is_keyframe_s,
-            keyframe_indices=keyframe_indices_s,
-            record=True,
-        )
+        with CriticalOperationProfiler(f"streaming_forward_stream_frame_{s}"):
+            session.forward_stream(
+                frame_images,
+                is_keyframe=is_keyframe_s,
+                keyframe_indices=keyframe_indices_s,
+                record=True,
+            )
         if is_keyframe_s is None or not bool(is_keyframe_s.item()) or s <= 0:
             del frame_images
             if is_keyframe_s is not None:

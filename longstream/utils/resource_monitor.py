@@ -336,3 +336,89 @@ def from_cfg(monitoring_cfg: dict) -> "ResourceMonitor | None":
         write_cpu_timeseries=bool(monitoring_cfg.get("write_cpu_timeseries", True)),
         write_gpu_timeseries=bool(monitoring_cfg.get("write_gpu_timeseries", True)),
     )
+
+
+# ------------------------------------------------------------------ #
+#  critical operation profiler                                         #
+# ------------------------------------------------------------------ #
+
+class CriticalOperationProfiler:
+    """
+    轻量级上下文管理器，记录代码块的挂钟时间（Wall Time）及进程级 CPU 时间。
+
+    结果追加写入 <output_dir>/resource_monitor/critical_ops.csv，
+    与 ResourceMonitor 的时序 CSV 共用同一目录，便于对齐分析。
+
+    用法::
+
+        CriticalOperationProfiler.initialize(output_root)
+        with CriticalOperationProfiler("run_inference_cfg"):
+            run_inference_cfg(cfg)
+    """
+
+    _output_path: "str | None" = None
+    _lock = threading.Lock()
+    _is_initialized = False
+
+    @classmethod
+    def initialize(cls, output_dir: str) -> None:
+        """初始化 CSV 文件（写入表头）。应在推理开始前调用一次。"""
+        os.makedirs(os.path.join(output_dir, "resource_monitor"), exist_ok=True)
+        cls._output_path = os.path.join(
+            output_dir, "resource_monitor", "critical_ops.csv"
+        )
+        with cls._lock:
+            if not cls._is_initialized:
+                with open(cls._output_path, "w", newline="", buffering=1) as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        ["operation", "duration_sec", "cpu_user_sec", "cpu_sys_sec"]
+                    )
+                cls._is_initialized = True
+
+    def __init__(self, operation_name: str):
+        self.operation_name = operation_name
+        self.start_time = 0.0
+        self.start_cpu = None
+
+    def __enter__(self) -> "CriticalOperationProfiler":
+        self.start_time = time.perf_counter()
+        if _PSUTIL_AVAILABLE:
+            try:
+                self.start_cpu = psutil.Process().cpu_times()
+            except Exception:
+                self.start_cpu = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        duration = time.perf_counter() - self.start_time
+        cpu_user: "float | str" = ""
+        cpu_sys: "float | str" = ""
+        if self.start_cpu is not None and _PSUTIL_AVAILABLE:
+            try:
+                end_cpu = psutil.Process().cpu_times()
+                cpu_user = round(end_cpu.user - self.start_cpu.user, 4)
+                cpu_sys = round(end_cpu.system - self.start_cpu.system, 4)
+            except Exception:
+                pass
+
+        if self._output_path is not None:
+            with self._lock:
+                try:
+                    with open(self._output_path, "a", newline="", buffering=1) as f:
+                        writer = csv.writer(f)
+                        writer.writerow(
+                            [
+                                self.operation_name,
+                                round(duration, 4),
+                                cpu_user,
+                                cpu_sys,
+                            ]
+                        )
+                except Exception:
+                    pass
+        print(
+            f"[Profiler] {self.operation_name} took {duration:.4f}s"
+            f" (CPU: user {cpu_user}s, sys {cpu_sys}s)",
+            flush=True,
+        )

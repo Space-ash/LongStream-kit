@@ -127,7 +127,7 @@ output:
   root: outputs/vkitti2/long_stride
   save_videos: false
   save_images: false
-  save_depth: false
+  save_depth: true
   save_points: true
   save_frame_points: false
   save_point_head: false
