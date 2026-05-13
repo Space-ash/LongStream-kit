@@ -1,0 +1,169 @@
+digraph GPS_TTO_Flowchart {
+	bgcolor="#FFFFFF" compound=true dpi=300 fontname="Microsoft YaHei" fontsize=14 nodesep=0.6 pad=0.5 rankdir=TB ranksep=0.7 splines=ortho
+	node [fontcolor="#FFFFFF" fontname="Microsoft YaHei" fontsize=11 height=0.5 margin="0.15,0.08" penwidth=0 shape=box style="filled,rounded"]
+	edge [arrowsize=0.8 fontname="Microsoft YaHei" fontsize=9]
+	sidebar_input [label="数据
+输入" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_encoder [label="视觉
+编码" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_geometry [label="几何
+预测" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_output [label="融合
+输出" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_gps [label="GPS
+先验" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_tto [label="尺度
+TTO" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	subgraph cluster_input {
+		bgcolor="#EDE7F6" color="#7E57C2" fontcolor="#7E57C2" fontname="Microsoft YaHei Bold" fontsize=12 label="数据输入层" margin=16 penwidth=2.0 style="dashed,rounded"
+		rgb_seq [label="RGB 图像序列
+[B, S, C, H, W]" fillcolor="#5E35B1"]
+		keyframe [label="关键帧选择
+(KeyframeSelector)" fillcolor="#5E35B1"]
+		kv_cache [label="KV 缓存管理
+(Streaming Cache)" fillcolor="#5E35B1"]
+	}
+	subgraph cluster_encoder {
+		bgcolor="#E3F2FD" color="#42A5F5" fontcolor="#42A5F5" fontname="Microsoft YaHei Bold" fontsize=12 label="视觉编码层" margin=16 penwidth=2.0 style="dashed,rounded"
+		vit_backbone [label="DINOv2 ViT-L 视觉编码器
+(patch_embed)  ❄ Frozen" fillcolor="#78909C"]
+		scale_token [label="尺度表征向量
+(Scale Token)  ✎ 可训练" color="#E65100" fillcolor="#FF6F00" fontcolor="#FFFFFF" penwidth=3 style="filled,rounded,bold"]
+		aggregator [label="STreamAggregator 聚合器
+(Transformer Blocks)  ❄ Frozen" fillcolor="#78909C"]
+	}
+	subgraph cluster_geometry {
+		bgcolor="#FFF8E1" color="#FFB300" fontcolor="#FFB300" fontname="Microsoft YaHei Bold" fontsize=12 label="几何预测层" margin=16 penwidth=2.0 style="dashed,rounded"
+		rel_pose_head [label="相对位姿估计头
+(RelPoseHead)  ❄ Frozen" fillcolor="#78909C"]
+		scale_head [label="尺度回归头
+(Scale Head → exp(logit))" fillcolor="#F9A825"]
+		depth_head [label="深度预测头
+(DPTHead)  ❄ Frozen" fillcolor="#78909C"]
+		point_head [label="点云预测头
+(DPTHead)  ❄ Frozen" fillcolor="#78909C"]
+	}
+	subgraph cluster_output {
+		bgcolor="#F3E5F5" color="#AB47BC" fontcolor="#AB47BC" fontname="Microsoft YaHei Bold" fontsize=12 label="尺度融合输出" margin=16 penwidth=2.0 style="dashed,rounded"
+		scale_multiply [label="全局尺度乘法融合
+pose.t × s, pts3d × s, depth × s" fillcolor="#8E24AA"]
+		output_pose [label="校准位姿输出
+(Scaled Pose)" fillcolor="#8E24AA"]
+		output_3d [label="校准三维重建
+(3DGS / NeRF 点云)" fillcolor="#8E24AA"]
+	}
+	subgraph cluster_gps {
+		bgcolor="#E8F5E9" color="#66BB6A" fontcolor="#66BB6A" fontname="Microsoft YaHei Bold" fontsize=12 label="GPS 位移先验" margin=16 penwidth=2.0 style="dashed,rounded"
+		gps_input [label="GPS 坐标序列
+[S, 3] 世界坐标" fillcolor="#43A047"]
+		gps_disp [label="GPS 帧间位移约束
+多尺度步长 (stride)" fillcolor="#43A047"]
+	}
+	subgraph cluster_tto {
+		bgcolor="#FBE9E7" color="#EF5350" fontcolor="#EF5350" fontname="Microsoft YaHei Bold" fontsize=12 label="流形约束尺度 TTO
+(Manifold-Constrained Scale TTO)" margin=16 penwidth=2.0 style="dashed,rounded"
+		camera_center [label="可微分相机中心恢复
+C = -R^T·t (quat_to_mat)" fillcolor="#E53935"]
+		pred_disp [label="预测帧间位移
+||C_i - C_j||" fillcolor="#E53935"]
+		scale_loss [label="多尺度位移损失
+Huber Loss + 方向/端点约束" fillcolor="#E53935"]
+		optimizer [label="AdamW 优化器
+梯度裁剪 + 早停策略" fillcolor="#E53935"]
+	}
+	rgb_seq -> vit_backbone [label="  图像输入" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	rgb_seq -> keyframe [arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	keyframe -> aggregator [label="  is_keyframe
+  keyframe_idx" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	kv_cache -> aggregator [label="  缓存复用" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	vit_backbone -> aggregator [label="  patch tokens" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	scale_token -> aggregator [label="  拼接注入" arrowsize=0.9 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.5 style=solid]
+	aggregator -> rel_pose_head [label="  聚合特征" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	aggregator -> scale_head [label="  scale_token
+  输出特征" arrowsize=0.9 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.5 style=solid]
+	aggregator -> depth_head [arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	aggregator -> point_head [arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	rel_pose_head -> scale_multiply [label="  pose_enc" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	scale_head -> scale_multiply [label="  scale_factor
+  = exp(logit)" arrowsize=0.9 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.5 style=solid]
+	depth_head -> scale_multiply [label="  depth" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	point_head -> scale_multiply [label="  pts3d" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	scale_multiply -> output_pose [arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	scale_multiply -> output_3d [arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	gps_input -> gps_disp [label="  位移计算" arrowsize=0.9 color="#2E7D32" fontcolor="#2E7D32" penwidth=2.0 style=solid]
+	rel_pose_head -> camera_center [label="  pose_enc
+  (保留计算图)" arrowsize=0.9 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.0 style=solid]
+	camera_center -> pred_disp [label="  预测位移" arrowsize=0.9 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.0 style=solid]
+	pred_disp -> scale_loss [label="  pred_disp" arrowsize=0.9 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.0 style=solid]
+	gps_disp -> scale_loss [label="  GPS 真值位移" arrowsize=0.9 color="#2E7D32" fontcolor="#2E7D32" penwidth=2.0 style=solid]
+	scale_loss -> optimizer [label="  ∂L/∂θ 反传" arrowsize=1.0 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.5 style=dashed]
+	optimizer -> scale_token [label="  ⚡ 仅更新 Scale Token
+  (Manifold-Constrained)" arrowsize=1.2 color="#D32F2F" fontcolor="#D32F2F" penwidth=3.0 style="dashed,bold"]
+	scale_loss -> pred_disp [label="  ∇ 梯度回传" arrowsize=1.0 color="#D32F2F" dir=back fontcolor="#D32F2F" penwidth=2.5 style=dashed]
+	pred_disp -> camera_center [label="  ∇ 可微分路径" arrowsize=1.0 color="#D32F2F" dir=back fontcolor="#D32F2F" penwidth=2.5 style=dashed]
+	camera_center -> rel_pose_head [label="  ∇ 穿越 (Frozen)" arrowsize=0.8 color="#D32F2F" dir=back fontcolor="#78909C" penwidth=2.0 style=dashed]
+	rel_pose_head -> aggregator [label="  ∇ 穿越 (Frozen)" arrowsize=0.8 color="#D32F2F" dir=back fontcolor="#78909C" penwidth=2.0 style=dashed]
+	aggregator -> scale_token [label="  ∇ 梯度终点 → Scale Token" arrowsize=1.0 color="#D32F2F" dir=back fontcolor="#D32F2F" penwidth=3.0 style="dashed,bold"]
+	sidebar_input -> sidebar_encoder [style=invis weight=10]
+	sidebar_encoder -> sidebar_geometry [style=invis weight=10]
+	sidebar_geometry -> sidebar_output [style=invis weight=10]
+	sidebar_output -> sidebar_gps [style=invis weight=10]
+	sidebar_gps -> sidebar_tto [style=invis weight=10]
+	subgraph rank_input {
+		rank=same
+		sidebar_input
+		rgb_seq
+		keyframe
+		kv_cache
+	}
+	subgraph rank_encoder {
+		rank=same
+		sidebar_encoder
+		vit_backbone
+		scale_token
+		aggregator
+	}
+	subgraph rank_geometry {
+		rank=same
+		sidebar_geometry
+		rel_pose_head
+		scale_head
+		depth_head
+		point_head
+	}
+	subgraph rank_output {
+		rank=same
+		sidebar_output
+		scale_multiply
+		output_pose
+		output_3d
+	}
+	subgraph rank_gps {
+		rank=same
+		sidebar_gps
+		gps_input
+		gps_disp
+		camera_center
+		pred_disp
+	}
+	subgraph rank_tto {
+		rank=same
+		sidebar_tto
+		scale_loss
+		optimizer
+	}
+	subgraph cluster_legend {
+		bgcolor="#FAFAFA" color="#BDBDBD" fontcolor="#757575" fontname="Microsoft YaHei Bold" fontsize=11 label="图例 (Legend)" margin=12 penwidth=1.5 style="dashed,rounded"
+		leg_frozen [label="❄ Frozen 参数
+(requires_grad=False)" fillcolor="#78909C" fontsize=9]
+		leg_trainable [label="✎ 可训练参数
+(requires_grad=True)" fillcolor="#FF6F00" fontsize=9]
+		leg_forward [label="━━ 前向数据流
+(实线粗箭头)" fillcolor="#37474F" fontsize=9]
+		leg_grad [label="╌╌ 梯度反传流
+(红色虚线箭头)" fillcolor="#D32F2F" fontsize=9]
+		leg_frozen -> leg_trainable [style=invis]
+		leg_trainable -> leg_forward [style=invis]
+		leg_forward -> leg_grad [style=invis]
+	}
+}

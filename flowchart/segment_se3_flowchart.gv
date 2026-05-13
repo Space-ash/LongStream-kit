@@ -1,0 +1,130 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  分段 SE(3) 后处理示意图 — Segmented SE(3) Post-processing
+//  配色体系与 gps_tto_flowchart.gv 完全一致
+// ═══════════════════════════════════════════════════════════════════════════
+digraph Segment_SE3_Postprocessing {
+	bgcolor="#FFFFFF" compound=true dpi=300 fontname="Microsoft YaHei" fontsize=14 nodesep=0.6 pad=0.5 rankdir=TB ranksep=0.8 splines=ortho
+	node [fontcolor="#FFFFFF" fontname="Microsoft YaHei" fontsize=11 height=0.5 margin="0.15,0.08" penwidth=0 shape=box style="filled,rounded"]
+	edge [arrowsize=0.8 fontname="Microsoft YaHei" fontsize=9]
+
+	// ─── 侧边栏标注（左侧红色无边框文本） ────────────────────────────────
+	sidebar_input [label="输入\n先验" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_fusion [label="分段\n融合" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_output [label="位姿\n输出" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 1：输入与先验模块 — 极浅紫背景 + 深紫/深绿节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_input {
+		bgcolor="#EDE7F6" color="#7E57C2" fontcolor="#7E57C2" fontname="Microsoft YaHei Bold" fontsize=12 label="输入与先验 (Inputs & Priors)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		pred_center [label="预测相机中心\nC = -R^T·t  [S, 3]" fillcolor="#5E35B1"]
+		tto_pose [label="TTO 后模型输出位姿\nw2c 矩阵 [S, 4, 4]" fillcolor="#5E35B1"]
+		gps_prior [label="轨迹先验\n(GPS / RTK)  [S, 3]" fillcolor="#43A047"]
+		gps_filter [label="GPS 轨迹滤波\n(Kalman / 中值 / Savgol)" fillcolor="#43A047"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 2：核心滑动与融合模块 — 极浅蓝背景 + 深蓝节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_fusion {
+		bgcolor="#E3F2FD" color="#42A5F5" fontcolor="#42A5F5" fontname="Microsoft YaHei Bold" fontsize=12 label="分段对齐与融合 (Sliding & Fusion)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		sliding_seg [label="滑动窗口片段划分\nsegment_size / overlap / step" fillcolor="#1E88E5"]
+		local_se3 [label="局部 SE(3) 对齐\nsimilarity_align(with_scale=False)" fillcolor="#1E88E5"]
+		hann_weight [label="Hann 窗权重生成\n两端低·中间高·下限 1e-3" fillcolor="#1565C0"]
+		overlap_blend [label="重叠区域加权融合\n消除分段拼接边界伪影" fillcolor="#1565C0"]
+		rot_select [label="旋转矩阵选择\n取权重最大段的 Q 修正" fillcolor="#1565C0"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 3：输出与重建模块 — 极浅黄背景 + 深琥珀/土黄节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_output {
+		bgcolor="#FFF8E1" color="#FFB300" fontcolor="#FFB300" fontname="Microsoft YaHei Bold" fontsize=12 label="校正输出与重建 (Output & Reconstruction)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		rebuild_tcw [label="重建平移向量\nt_cw = -R_cw · C_corr" fillcolor="#F9A825"]
+		corrected_pose [label="校正后 w2c 位姿\n[S, 4, 4] float32" fillcolor="#F9A825"]
+		residual_stat [label="残差统计\n校正前/后平均残差" fillcolor="#F9A825"]
+		point_cloud [label="点云导出\n3DGS / NeRF 高精度重建" fillcolor="#8E24AA"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  前向数据流 — 深灰实线粗箭头
+	// ═════════════════════════════════════════════════════════════════════
+
+	// 输入模块内部连线
+	tto_pose -> pred_center [label="  提取相机中心\n  C = -R^T·t" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	gps_prior -> gps_filter [label="  可选滤波" arrowsize=0.9 color="#2E7D32" fontcolor="#2E7D32" penwidth=2.0 style=solid]
+
+	// 输入 → 分段融合
+	pred_center -> sliding_seg [label="  预测中心序列\n  src [S, 3]" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	gps_filter -> sliding_seg [label="  滤波后 GPS\n  dst [S, 3]" arrowsize=0.9 color="#2E7D32" fontcolor="#2E7D32" penwidth=2.0 style=solid]
+
+	// 分段融合内部连线
+	sliding_seg -> local_se3 [label="  各片段帧对\n  (src_k, dst_k)" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	local_se3 -> hann_weight [label="  SE(3) 参数\n  (Q_k, u_k)" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	hann_weight -> overlap_blend [label="  加权校正值\n  (w_i, Q_k, u_k)" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	local_se3 -> rot_select [label="  旋转矩阵 Q_k" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// 融合 → 输出
+	overlap_blend -> rebuild_tcw [label="  融合相机中心\n  C_corr [S, 3]" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	rot_select -> rebuild_tcw [label="  校正旋转\n  R_cw_corr" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	rebuild_tcw -> corrected_pose [label="  组装 4x4 矩阵" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	corrected_pose -> residual_stat [arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	corrected_pose -> point_cloud [label="  高精度位姿输入\n  下游 3D 重建" arrowsize=0.9 color="#8E24AA" fontcolor="#8E24AA" penwidth=2.5 style=solid]
+
+	// GPS 参考 → 残差统计（用于对比校正效果）
+	gps_filter -> residual_stat [label="  GPS 参考\n  (对比基准)" arrowsize=0.8 color="#2E7D32" fontcolor="#2E7D32" penwidth=1.5 style=dashed]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  特殊标注边 — 平滑过渡效果（橙色标注）
+	// ═════════════════════════════════════════════════════════════════════
+	overlap_blend -> overlap_blend [label="Smooth\nTransition" color="#FF6F00" fontcolor="#FF6F00" fontsize=9 penwidth=2.0 style=dashed]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  侧边栏对齐
+	// ═════════════════════════════════════════════════════════════════════
+	sidebar_input -> sidebar_fusion [style=invis weight=10]
+	sidebar_fusion -> sidebar_output [style=invis weight=10]
+
+	// 侧边栏与主图行对齐
+	subgraph rank_input {
+		rank=same
+		sidebar_input
+		tto_pose
+		pred_center
+		gps_prior
+		gps_filter
+	}
+
+	subgraph rank_fusion {
+		rank=same
+		sidebar_fusion
+		sliding_seg
+		local_se3
+	}
+
+	subgraph rank_output {
+		rank=same
+		sidebar_output
+		corrected_pose
+		point_cloud
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  图例 — 与上一张图一致的视觉语言
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_legend {
+		bgcolor="#FAFAFA" color="#BDBDBD" fontcolor="#757575" fontname="Microsoft YaHei Bold" fontsize=11 label="图例 (Legend)" margin=12 penwidth=1.5 style="dashed,rounded"
+
+		leg_model [label="模型输出数据\n(TTO 后位姿)" fillcolor="#5E35B1" fontsize=9]
+		leg_gps [label="GPS/RTK 先验\n(外部传感器)" fillcolor="#43A047" fontsize=9]
+		leg_algo [label="核心算法步骤\n(SE3 对齐 / 融合)" fillcolor="#1E88E5" fontsize=9]
+		leg_output [label="最终校正输出\n(位姿 / 点云)" fillcolor="#F9A825" fontsize=9]
+
+		leg_model -> leg_gps [style=invis]
+		leg_gps -> leg_algo [style=invis]
+		leg_algo -> leg_output [style=invis]
+	}
+}

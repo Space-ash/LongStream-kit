@@ -22,6 +22,9 @@
 #                 Default: python
 #   COPY          Set to "1" to copy image files instead of symlinking.
 #                 Default: 0 (symlink)
+#   MAX_FRAMES    Uniformly sample at most this many frames from each sequence.
+#                 When set, appends _<MAX_FRAMES> suffix to OUT_ROOT.
+#                 Default: (empty, process all frames)
 #
 # After preprocessing, run inference with:
 #   python run.py --config "$CONFIG_PATH"
@@ -37,6 +40,11 @@ CAMERA_RAW="${CAMERA:-02}"
 CAMERA_NUM=$((10#$CAMERA_RAW))
 CAMERA=$(printf "%02d" "$CAMERA_NUM")
 OUT_ROOT="${OUT_ROOT:-prepared_inputs/kitti_odometry}"
+MAX_FRAMES="${MAX_FRAMES:-}"
+# 若指定了抽帧数，在输出目录添加 _<max_frames> 后缀
+if [[ -n "$MAX_FRAMES" ]]; then
+  OUT_ROOT="${OUT_ROOT}_${MAX_FRAMES}"
+fi
 CONFIG_PATH="${CONFIG_PATH:-configs/longstream_infer_kitti_optimized.yaml}"
 COPY_FLAG="${COPY:-0}"
 
@@ -56,6 +64,7 @@ echo "[prepare-kitti-odometry] camera=$CAMERA"
 echo "[prepare-kitti-odometry] out_root=$OUT_ROOT"
 echo "[prepare-kitti-odometry] config=$CONFIG_PATH"
 echo "[prepare-kitti-odometry] depth_mode=$DEPTH_MODE  min_depth=$MIN_DEPTH  max_depth=$MAX_DEPTH  num_workers=$NUM_WORKERS"
+[[ -n "$MAX_FRAMES" ]] && echo "[prepare-kitti-odometry] max_frames=$MAX_FRAMES  (output suffix: _${MAX_FRAMES})"
 
 # ------------------------------------------------------------------
 # Validation
@@ -119,6 +128,11 @@ if [[ "$COPY_FLAG" == "1" ]]; then
   COPY_ARG="--copy"
 fi
 
+MAX_FRAMES_ARG=""
+if [[ -n "$MAX_FRAMES" ]]; then
+  MAX_FRAMES_ARG="--max_frames $MAX_FRAMES"
+fi
+
 DEPTH_EXTRA_ARGS=""
 if [[ "$SAVE_DEPTH_MASK" == "1" ]]; then
   DEPTH_EXTRA_ARGS="$DEPTH_EXTRA_ARGS --save_depth_mask"
@@ -141,6 +155,7 @@ fi
   --max_depth  "$MAX_DEPTH" \
   --num_workers "$NUM_WORKERS" \
   $COPY_ARG \
+  $MAX_FRAMES_ARG \
   $DEPTH_EXTRA_ARGS
 
 # ------------------------------------------------------------------

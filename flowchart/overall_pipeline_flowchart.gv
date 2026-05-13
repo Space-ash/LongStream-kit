@@ -1,0 +1,156 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  总体算法结构图 — Overall Algorithm Pipeline
+//  配色体系与前四张流程图完全一致
+//
+//  全流程概览:
+//  RGB Sequence → Keyframe Selection → LongStream Relative Pose + Scale Token
+//  → GPS-TTO Differentiable Forward → Streaming Cache Refresh (循环)
+//  → Segmented SE(3) Post-processing → Pose / Depth / Point Cloud Export
+// ═══════════════════════════════════════════════════════════════════════════
+digraph Overall_Algorithm_Pipeline {
+	bgcolor="#FFFFFF" compound=true dpi=300 fontname="Microsoft YaHei" fontsize=14 nodesep=0.6 pad=0.5 rankdir=TB ranksep=0.9 splines=ortho
+	node [fontcolor="#FFFFFF" fontname="Microsoft YaHei" fontsize=11 height=0.55 margin="0.15,0.08" penwidth=0 shape=box style="filled,rounded"]
+	edge [arrowsize=0.8 fontname="Microsoft YaHei" fontsize=9]
+
+	// ─── 侧边栏标注（左侧红色无边框文本） ────────────────────────────────
+	sidebar_frontend [label="输入\n前端" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_core [label="流式核心\n与优化" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_post [label="全局\n后处理" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_export [label="多模态\n输出" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 1: 前端输入与关键帧 — 极浅紫 + 深紫节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_frontend {
+		bgcolor="#EDE7F6" color="#7E57C2" fontcolor="#7E57C2" fontname="Microsoft YaHei Bold" fontsize=12 label="前端输入与关键帧 (Frontend & Keyframing)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		rgb_seq [label="RGB 图像序列\n连续视频帧流输入" fillcolor="#5E35B1"]
+		keyframe_sel [label="关键帧选择\n(KeyframeSelector)\n固定/自适应步长筛选" fillcolor="#5E35B1"]
+		gps_input [label="GPS/RTK 先验\n帧级世界坐标 [S, 3]" fillcolor="#43A047"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 2: 核心位姿与流式优化 — 极浅蓝 + 深蓝/橙节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_core {
+		bgcolor="#E3F2FD" color="#42A5F5" fontcolor="#42A5F5" fontname="Microsoft YaHei Bold" fontsize=12 label="核心位姿预测与流式优化 (Core Pose & Streaming Optimization)" margin=16 penwidth=2.5 style="dashed,rounded"
+
+		rel_pose [label="LongStream 相对位姿预测\nViT + Aggregator + RelPoseHead\n输出 pose_enc [B, S, D]" fillcolor="#1E88E5"]
+		scale_token [label="尺度表征向量\n(Scale Token)\nnn.Parameter → Scale Head\n→ scale_factor = exp(logit)" fillcolor="#FF6F00" color="#E65100" fontcolor="#FFFFFF" penwidth=3 style="filled,rounded,bold"]
+		gps_tto [label="GPS-TTO 可微前向\n可微分相机中心恢复\n多尺度 Huber Loss\n仅优化 Scale Token" fillcolor="#1565C0"]
+		cache_refresh [label="Batch/Streaming 缓存刷新\nKV Cache 管理\n分段 anchor 重置\n显存释放 + 状态延续" fillcolor="#1E88E5"]
+		depth_pred [label="深度与点云预测\nDPTHead (depth/pts3d)\n× scale_factor 全局对齐" fillcolor="#1565C0"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 3: 后处理对齐 — 极浅黄 + 土黄节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_post {
+		bgcolor="#FFF8E1" color="#FFB300" fontcolor="#FFB300" fontname="Microsoft YaHei Bold" fontsize=12 label="全局后处理对齐 (Post-processing Alignment)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		seg_se3 [label="分段 SE(3) 后处理\n滑动窗口局部对齐\nHann 窗重叠融合\n消除大尺度轨迹漂移" fillcolor="#F9A825"]
+		gps_ref [label="GPS 轨迹参考\n(可选 Kalman/中值滤波)" fillcolor="#43A047"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 4: 多模态导出 — 极浅薰衣草 + 深紫罗兰节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_export {
+		bgcolor="#F3E5F5" color="#AB47BC" fontcolor="#AB47BC" fontname="Microsoft YaHei Bold" fontsize=12 label="多模态导出 (Multimodal Export)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		pose_export [label="位姿导出\nw2c 矩阵 [S, 4, 4]\nabs_pose.txt" fillcolor="#8E24AA"]
+		depth_export [label="深度导出\n稠密深度 .npy\n伪彩色可视化 .png" fillcolor="#8E24AA"]
+		pointcloud_export [label="点云导出\n全局 PLY / GLB\n3DGS / NeRF 初始化" fillcolor="#8E24AA"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  主干数据流 — 加粗深灰实线 (penwidth=2.5)
+	// ═════════════════════════════════════════════════════════════════════
+
+	// 前端内部
+	rgb_seq -> keyframe_sel [label="  连续帧流" arrowsize=1.0 color="#37474F" penwidth=2.5 style=solid]
+
+	// 前端 → 核心
+	keyframe_sel -> rel_pose [label="  关键帧 + 非关键帧\n  is_keyframe / indices" arrowsize=1.0 color="#37474F" penwidth=2.5 style=solid]
+
+	// 核心内部 — 主干
+	rel_pose -> depth_pred [label="  聚合特征" arrowsize=1.0 color="#37474F" penwidth=2.5 style=solid]
+
+	// Scale Token 注入 (橙色)
+	scale_token -> rel_pose [label="  拼接注入\n  Aggregator" arrowsize=0.9 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.5 style=solid]
+	scale_token -> depth_pred [label="  ×s 尺度融合" arrowsize=0.9 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.0 style=solid]
+
+	// GPS-TTO 分支
+	rel_pose -> gps_tto [label="  pose_enc\n  (保留计算图)" arrowsize=0.9 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.0 style=solid]
+	gps_input -> gps_tto [label="  GPS 位移约束" arrowsize=0.9 color="#2E7D32" fontcolor="#2E7D32" penwidth=2.0 style=solid]
+	gps_tto -> scale_token [label="  梯度仅更新\n  Scale Token" arrowsize=1.0 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.5 style=dashed]
+
+	// 缓存刷新双向
+	rel_pose -> cache_refresh [label="  写入 KV Cache" arrowsize=0.8 color="#1565C0" fontcolor="#1565C0" penwidth=2.0 style=solid]
+	cache_refresh -> rel_pose [label="  历史状态复用\n  时序依赖" arrowsize=0.8 color="#1565C0" fontcolor="#1565C0" penwidth=2.0 style=solid]
+
+	// 核心 → 后处理（主干）
+	depth_pred -> seg_se3 [label="  TTO 后位姿\n  w2c [S, 4, 4]" arrowsize=1.0 color="#37474F" penwidth=2.5 style=solid]
+	gps_input -> gps_ref [label="  GPS 参考轨迹" arrowsize=0.8 color="#2E7D32" fontcolor="#2E7D32" penwidth=1.5 style=solid]
+	gps_ref -> seg_se3 [label="  对齐目标 dst" arrowsize=0.9 color="#2E7D32" fontcolor="#2E7D32" penwidth=2.0 style=solid]
+
+	// 后处理 → 导出（主干）
+	seg_se3 -> pose_export [label="  校正后位姿" arrowsize=1.0 color="#37474F" penwidth=2.5 style=solid]
+	depth_pred -> depth_export [label="  稠密深度图" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	seg_se3 -> pointcloud_export [label="  高精度位姿\n  + 几何数据" arrowsize=1.0 color="#37474F" penwidth=2.5 style=solid]
+	depth_pred -> pointcloud_export [label="  pts3d / dpt_unproj" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  侧边栏对齐
+	// ═════════════════════════════════════════════════════════════════════
+	sidebar_frontend -> sidebar_core [style=invis weight=10]
+	sidebar_core -> sidebar_post [style=invis weight=10]
+	sidebar_post -> sidebar_export [style=invis weight=10]
+
+	subgraph rank_frontend {
+		rank=same
+		sidebar_frontend
+		rgb_seq
+		keyframe_sel
+		gps_input
+	}
+
+	subgraph rank_core {
+		rank=same
+		sidebar_core
+		rel_pose
+		scale_token
+		cache_refresh
+	}
+
+	subgraph rank_post {
+		rank=same
+		sidebar_post
+		seg_se3
+		gps_ref
+	}
+
+	subgraph rank_export {
+		rank=same
+		sidebar_export
+		pose_export
+		depth_export
+		pointcloud_export
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  图例
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_legend {
+		bgcolor="#FAFAFA" color="#BDBDBD" fontcolor="#757575" fontname="Microsoft YaHei Bold" fontsize=11 label="图例 (Legend)" margin=12 penwidth=1.5 style="dashed,rounded"
+
+		leg_main [label="━━ 主干数据流\n(加粗实线)" fillcolor="#37474F" fontsize=9]
+		leg_scale [label="━━ Scale Token 路径\n(橙色实线)" fillcolor="#FF6F00" fontsize=9]
+		leg_grad [label="╌╌ TTO 梯度反传\n(红色虚线)" fillcolor="#D32F2F" fontsize=9]
+		leg_gps [label="━━ GPS 先验流\n(绿色实线)" fillcolor="#43A047" fontsize=9]
+
+		leg_main -> leg_scale [style=invis]
+		leg_scale -> leg_grad [style=invis]
+		leg_grad -> leg_gps [style=invis]
+	}
+}

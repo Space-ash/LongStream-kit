@@ -1,0 +1,162 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  可视化流式重建系统架构 — Visual Streaming Reconstruction Architecture
+//  配色体系与 gps_tto_flowchart.gv / segment_se3_flowchart.gv 完全一致
+//
+//  架构要点（from live_inference.py）:
+//  - 主进程: Gradio UI 前端 + Rerun 可视化 + 轮询线程 (_poll_results)
+//  - 子进程: mp.Process(_worker_main) 独立推理，通过 mp.Queue 传结果
+//  - IPC:    mp.Queue (result_queue, maxsize=5), mp.Event (stop_flag)
+//  - 缓存:   StreamSession KV cache + refresh (clear_cache_only)
+//  - 监控:   resource_monitor 旁路监听 CPU/GPU 占用
+// ═══════════════════════════════════════════════════════════════════════════
+digraph Streaming_System_Architecture {
+	bgcolor="#FFFFFF" compound=true dpi=300 fontname="Microsoft YaHei" fontsize=14 nodesep=0.5 pad=0.5 rankdir=LR ranksep=1.0 splines=polyline
+	node [fontcolor="#FFFFFF" fontname="Microsoft YaHei" fontsize=11 height=0.55 margin="0.15,0.08" penwidth=0 shape=box style="filled,rounded"]
+	edge [arrowsize=0.8 fontname="Microsoft YaHei" fontsize=9]
+
+	// ─── 侧边栏标注（顶部红色无边框文本，LR 布局中放在上方） ──────────────
+	sidebar_input [label="输入与\n交互" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_infer [label="流式\n推理核心" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_output [label="渲染与\n持久化" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 1: 数据与配置前端 (主进程)  — 极浅紫 + 深紫节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_frontend {
+		bgcolor="#EDE7F6" color="#7E57C2" fontcolor="#7E57C2" fontname="Microsoft YaHei Bold" fontsize=12 label="可视化交互前端\n(Vis-Frontend Main Process)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		data_source [label="数据源\nKITTI / vKITTI2 / NPZ\n图像序列 + GPS" fillcolor="#5E35B1"]
+		config_tmpl [label="配置模板\nYAML + CLI 参数覆盖" fillcolor="#5E35B1"]
+		gradio_ui [label="Gradio 交互界面\n参数调节 / 启停控制" fillcolor="#7E57C2"]
+		poll_thread [label="轮询线程\n(_poll_results)\n接收子进程结果" fillcolor="#7E57C2"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 2: 核心推理子进程 — 极浅蓝 + 深蓝节点
+	//  label 明确标注「独立推理子进程」边界
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_inference {
+		bgcolor="#E3F2FD" color="#42A5F5" fontcolor="#42A5F5" fontname="Microsoft YaHei Bold" fontsize=12 label="独立推理子进程\n(mp.Process: _worker_main)" margin=16 penwidth=2.5 style="dashed,rounded"
+
+		feeder [label="数据馈送模块\n(StreamFeeder)\n逐帧读取 + 预处理" fillcolor="#1E88E5"]
+		core_ctrl [label="流式推理核心控制器\n(StreamSession)\n逐帧 forward_stream" fillcolor="#1565C0"]
+		kv_cache [label="KV 缓存管理\n(Aggregator/Camera\nHead KV Cache)" fillcolor="#1E88E5"]
+		refresh [label="状态缓存刷新机制\n(clear_cache_only)\n分段 anchor 重置" fillcolor="#1E88E5"]
+		tto_live [label="在线 TTO 优化\n(滑动窗口 scale_token)" fillcolor="#1565C0"]
+		decode [label="输出解码\n位姿累积 / 点云过滤\n天空分割 (SkySeg)" fillcolor="#1565C0"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 3: 输出与监控 — 极浅黄 + 土黄/紫罗兰节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_output {
+		bgcolor="#FFF8E1" color="#FFB300" fontcolor="#FFB300" fontname="Microsoft YaHei Bold" fontsize=12 label="渲染输出与持久化\n(Render & Export)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		rerun_viewer [label="实时渲染流前端\n(Rerun Viewer)\n轨迹 + 点云 + 深度" fillcolor="#F9A825"]
+		disk_export [label="磁盘导出\nPLY / 位姿 / 深度 / 视频\nGLB 3D 模型" fillcolor="#F9A825"]
+		res_monitor [label="资源监控模块\n(ResourceMonitor)\nCPU / GPU / 内存" fillcolor="#43A047"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  前端内部连线 — 深灰实线
+	// ═════════════════════════════════════════════════════════════════════
+	data_source -> gradio_ui [label="  数据路径" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	config_tmpl -> gradio_ui [label="  配置参数" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  跨进程边界: 前端 → 推理子进程 (IPC)
+	// ═════════════════════════════════════════════════════════════════════
+	gradio_ui -> feeder [label="  IPC: mp.Process(cfg)\n  序列化配置传入子进程" arrowsize=1.0 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.5 style="dashed"]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  推理子进程内部连线
+	// ═════════════════════════════════════════════════════════════════════
+	feeder -> core_ctrl [label="  FramePacket\n  (逐帧)" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// 核心控制器 ⟷ KV 缓存 (双向)
+	core_ctrl -> kv_cache [label="  写入新 KV" arrowsize=0.8 color="#1565C0" fontcolor="#1565C0" penwidth=2.0 style=solid]
+	kv_cache -> core_ctrl [label="  读取历史 KV\n  (时序依赖)" arrowsize=0.8 color="#1565C0" fontcolor="#1565C0" penwidth=2.0 style=solid]
+
+	// 核心控制器 ⟷ 刷新机制 (双向)
+	core_ctrl -> refresh [label="  触发刷新\n  (每 N 关键帧)" arrowsize=0.8 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.0 style=solid]
+	refresh -> core_ctrl [label="  重置 anchor\n  段起点位姿" arrowsize=0.8 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.0 style=solid]
+
+	// 刷新 → KV 缓存
+	refresh -> kv_cache [label="  清空缓存\n  释放显存" arrowsize=0.8 color="#FF6F00" fontcolor="#FF6F00" penwidth=1.5 style=dashed]
+
+	// TTO 在线优化
+	feeder -> tto_live [label="  GPS 缓冲" arrowsize=0.8 color="#2E7D32" fontcolor="#2E7D32" penwidth=1.5 style=solid]
+	tto_live -> core_ctrl [label="  优化后\n  scale_token" arrowsize=0.8 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.0 style=solid]
+
+	// 解码输出
+	core_ctrl -> decode [label="  模型输出\n  (GPU Tensor)" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  跨进程边界: 推理子进程 → 输出模块 (IPC)
+	// ═════════════════════════════════════════════════════════════════════
+	decode -> rerun_viewer [label="  IPC: mp.Queue\n  (viewer_payload)" arrowsize=1.0 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.5 style="dashed"]
+
+	// 推理子进程 → 结果队列 → 轮询线程
+	decode -> poll_thread [label="  IPC: result_queue\n  (frame_idx, outputs)" arrowsize=0.9 color="#D32F2F" fontcolor="#D32F2F" penwidth=2.0 style=dashed]
+
+	// 解码 → 磁盘导出 (子进程内直接写磁盘)
+	decode -> disk_export [label="  逐帧落盘\n  PLY / PNG / NPY" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  资源监控 — 旁路监听 (虚线)
+	// ═════════════════════════════════════════════════════════════════════
+	res_monitor -> core_ctrl [label="  旁路监听\n  VRAM / CPU %" arrowsize=0.7 color="#43A047" fontcolor="#43A047" penwidth=1.5 style=dotted dir=back]
+
+	// 轮询线程 → Rerun 渲染 (主进程内)
+	poll_thread -> rerun_viewer [label="  on_frame()\n  回调渲染" arrowsize=0.9 color="#8E24AA" fontcolor="#8E24AA" penwidth=2.0 style=solid]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  停止信号 (mp.Event)
+	// ═════════════════════════════════════════════════════════════════════
+	gradio_ui -> core_ctrl [label="  mp.Event\n  (stop_flag)" arrowsize=0.8 color="#78909C" fontcolor="#78909C" penwidth=1.5 style=dotted]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  侧边栏对齐
+	// ═════════════════════════════════════════════════════════════════════
+	sidebar_input -> sidebar_infer [style=invis weight=10]
+	sidebar_infer -> sidebar_output [style=invis weight=10]
+
+	// LR 布局: 侧边栏与对应子图列对齐
+	subgraph rank_sidebar {
+		rank=same
+		sidebar_input
+		data_source
+		config_tmpl
+	}
+
+	subgraph rank_core {
+		rank=same
+		sidebar_infer
+		core_ctrl
+	}
+
+	subgraph rank_out {
+		rank=same
+		sidebar_output
+		rerun_viewer
+		disk_export
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  图例 — 统一视觉语言
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_legend {
+		bgcolor="#FAFAFA" color="#BDBDBD" fontcolor="#757575" fontname="Microsoft YaHei Bold" fontsize=11 label="图例 (Legend)" margin=12 penwidth=1.5 style="dashed,rounded"
+
+		leg_main [label="主进程模块\n(Gradio + Rerun)" fillcolor="#7E57C2" fontsize=9]
+		leg_sub [label="推理子进程模块\n(mp.Process)" fillcolor="#1565C0" fontsize=9]
+		leg_ipc [label="--- IPC 通信 ---\n(mp.Queue / mp.Event)" fillcolor="#D32F2F" fontsize=9]
+		leg_cache [label="缓存双向交互\n(KV Cache R/W)" fillcolor="#1E88E5" fontsize=9]
+		leg_monitor [label="... 旁路监控 ...\n(ResourceMonitor)" fillcolor="#43A047" fontsize=9]
+
+		leg_main -> leg_sub [style=invis]
+		leg_sub -> leg_ipc [style=invis]
+		leg_ipc -> leg_cache [style=invis]
+		leg_cache -> leg_monitor [style=invis]
+	}
+}

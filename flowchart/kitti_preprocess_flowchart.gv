@@ -1,0 +1,149 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  KITTI Odometry 数据适配与稀疏 LiDAR 预处理流程图
+//  Data Adaptation and Sparse LiDAR Preprocessing Pipeline
+//  配色体系与前三张流程图完全一致
+//
+//  代码来源 (from kitti_odometry_to_generalizable.py + prepare_kitti_odometry.sh):
+//  - Step 1: 解析 calib.txt / calib_velo_to_cam.txt → Tr_velo_to_cam + R0_rect + P2
+//  - Step 2: 读取 velodyne .bin → LiDAR→cam0 坐标变换 → R_rect 校正 → P2 投影
+//  - Step 3: 视锥裁剪 (z>0, 0≤u<W, 0≤v<H) + 深度范围过滤 [min_depth, max_depth]
+//  - Step 4: 生成稀疏深度图 .npy + depth_meta.json
+//  - Step 5: 图像符号链接/复制 + extri.yml/intri.yml + gt_poses.npy → 统一泛化布局
+//  - Step 6: 评估时自动根据 depth_meta.json 选择深度评估分支
+// ═══════════════════════════════════════════════════════════════════════════
+digraph KITTI_Data_Preprocessing {
+	bgcolor="#FFFFFF" compound=true dpi=300 fontname="Microsoft YaHei" fontsize=14 nodesep=0.6 pad=0.5 rankdir=TB ranksep=0.8 splines=ortho
+	node [fontcolor="#FFFFFF" fontname="Microsoft YaHei" fontsize=11 height=0.5 margin="0.15,0.08" penwidth=0 shape=box style="filled,rounded"]
+	edge [arrowsize=0.8 fontname="Microsoft YaHei" fontsize=9]
+
+	// ─── 侧边栏标注（左侧红色无边框文本） ────────────────────────────────
+	sidebar_raw [label="原始\n数据源" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_depth [label="深度\n预处理" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+	sidebar_layout [label="泛化\n布局" fontcolor="#C62828" fontname="Microsoft YaHei Bold" fontsize=13 height=0 shape=plaintext style=bold width=0]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 1: 原始数据源 (Raw Data Ingestion) — 极浅紫 + 深紫节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_raw {
+		bgcolor="#EDE7F6" color="#7E57C2" fontcolor="#7E57C2" fontname="Microsoft YaHei Bold" fontsize=12 label="原始数据输入 (Raw Data Ingestion)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		raw_images [label="原始图像序列\nimage_2/ (*.png)\n左目彩色相机" fillcolor="#5E35B1"]
+		calib_files [label="标定文件\ncalib.txt (P0-P3)\ncalib_velo_to_cam.txt (R, T)" fillcolor="#5E35B1"]
+		lidar_bin [label="LiDAR 点云\nvelodyne/*.bin\n[N, 4] (x, y, z, r)" fillcolor="#5E35B1"]
+		gt_poses [label="GT 位姿\nposes/<seq>.txt\n[N, 3, 4] w2c" fillcolor="#5E35B1"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 2: 核心投影计算 (Sparse Depth Projection)
+	//  — 极浅蓝 + 深蓝节点; 标题标注 Offline
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_projection {
+		bgcolor="#E3F2FD" color="#42A5F5" fontcolor="#42A5F5" fontname="Microsoft YaHei Bold" fontsize=12 label="稀疏深度投影计算 (Offline Preprocessing)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		parse_calib [label="标定参数解析\nTr_velo_to_cam [3,4]\nR0_rect [3,3] / P2 [3,4]" fillcolor="#1E88E5"]
+		coord_transform [label="LiDAR→相机坐标变换\nX_cam = R_rect · Tr · X_lidar" fillcolor="#1E88E5"]
+		frustum_proj [label="视锥投影与滤波\nP2 投影 → (u, v, z)\nz>0, 0<=u<W, 0<=v<H" fillcolor="#1565C0"]
+		depth_filter [label="深度范围过滤\n[min_depth, max_depth]\n默认 [0.1m, 80.0m]" fillcolor="#1565C0"]
+		sparse_depth [label="稀疏深度图生成\ndepths/<cam>/*.npy\n[H, W] float32 离线存储" fillcolor="#1E88E5"]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  子图 3: 泛化布局与分发 (Generalization & Dispatch)
+	//  — 极浅黄 + 土黄/紫罗兰节点
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_layout {
+		bgcolor="#FFF8E1" color="#FFB300" fontcolor="#FFB300" fontname="Microsoft YaHei Bold" fontsize=12 label="统一泛化数据布局 (Generalizable Layout)" margin=16 penwidth=2.0 style="dashed,rounded"
+
+		unified_layout [label="统一泛化数据布局\nimages/ + cameras/ + depths/\nextri.yml / intri.yml / gt_poses.npy" fillcolor="#F9A825"]
+		depth_meta [label="深度元数据生成\ndepth_meta.json\nmin/max/count/source" fillcolor="#F9A825"]
+		data_roots [label="场景注册\ndata_roots.txt\n自动扫描序列列表" fillcolor="#F9A825"]
+		eval_branch [label="评估分支自动选择\n(Eval Branch Auto-selection)" fillcolor="#8E24AA"]
+		eval_depth [label="深度评估分支\n(有 LiDAR GT)" fillcolor="#43A047" fontsize=10]
+		eval_rgb [label="纯 RGB 评估分支\n(无深度先验)" fillcolor="#43A047" fontsize=10]
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  数据流连线 — 子图 1 内部
+	// ═════════════════════════════════════════════════════════════════════
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  数据流连线 — 子图 1 → 子图 2
+	// ═════════════════════════════════════════════════════════════════════
+	calib_files -> parse_calib [label="  解析外参/内参\n  P2, Tr, R_rect" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	lidar_bin -> coord_transform [label="  原始 3D 点\n  [N, 4] 齐次坐标" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// 子图 2 内部
+	parse_calib -> coord_transform [label="  Tr_velo_to_cam\n  R0_rect" arrowsize=0.9 color="#1565C0" fontcolor="#1565C0" penwidth=2.0 style=solid]
+	coord_transform -> frustum_proj [label="  X_cam [N, 3]" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	parse_calib -> frustum_proj [label="  P2 内参矩阵" arrowsize=0.9 color="#1565C0" fontcolor="#1565C0" penwidth=2.0 style=solid]
+	raw_images -> frustum_proj [label="  图像尺寸\n  (H, W) 边界" arrowsize=0.8 color="#78909C" fontcolor="#78909C" penwidth=1.5 style=dashed]
+	frustum_proj -> depth_filter [label="  有效像素点\n  去除图像外无效点" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	depth_filter -> sparse_depth [label="  稀疏深度值\n  按像素写入" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  数据流连线 — 子图 1/2 → 子图 3
+	// ═════════════════════════════════════════════════════════════════════
+	raw_images -> unified_layout [label="  符号链接/复制" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	gt_poses -> unified_layout [label="  gt_poses.npy\n  gt_poses_02.npy" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	parse_calib -> unified_layout [label="  extri.yml\n  intri.yml" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	sparse_depth -> unified_layout [label="  depths/<cam>/*.npy" arrowsize=0.9 color="#FF6F00" fontcolor="#FF6F00" penwidth=2.5 style=solid]
+
+	// 子图 3 内部
+	unified_layout -> depth_meta [label="  统计深度覆盖\n  min/max/count" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	unified_layout -> data_roots [label="  自动扫描注册" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	depth_meta -> eval_branch [label="  判断深度可用性" arrowsize=0.9 color="#37474F" penwidth=2.0 style=solid]
+	eval_branch -> eval_depth [label="  有深度" arrowsize=0.8 color="#43A047" fontcolor="#43A047" penwidth=2.0 style=solid]
+	eval_branch -> eval_rgb [label="  无深度" arrowsize=0.8 color="#78909C" fontcolor="#78909C" penwidth=1.5 style=dashed]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  Offline 标注 — 橙色虚线标注离线处理性质
+	// ═════════════════════════════════════════════════════════════════════
+	offline_label [label="Offline\nPreprocessing\n(不增加运行时负担)" fontcolor="#FF6F00" fontname="Microsoft YaHei Bold" fontsize=10 height=0 shape=plaintext style=bold width=0]
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  侧边栏对齐
+	// ═════════════════════════════════════════════════════════════════════
+	sidebar_raw -> sidebar_depth [style=invis weight=10]
+	sidebar_depth -> sidebar_layout [style=invis weight=10]
+
+	subgraph rank_raw {
+		rank=same
+		sidebar_raw
+		raw_images
+		calib_files
+		lidar_bin
+		gt_poses
+	}
+
+	subgraph rank_proj {
+		rank=same
+		sidebar_depth
+		coord_transform
+		frustum_proj
+		offline_label
+	}
+
+	subgraph rank_layout {
+		rank=same
+		sidebar_layout
+		unified_layout
+		depth_meta
+		data_roots
+	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  图例
+	// ═════════════════════════════════════════════════════════════════════
+	subgraph cluster_legend {
+		bgcolor="#FAFAFA" color="#BDBDBD" fontcolor="#757575" fontname="Microsoft YaHei Bold" fontsize=11 label="图例 (Legend)" margin=12 penwidth=1.5 style="dashed,rounded"
+
+		leg_raw [label="原始数据输入\n(KITTI 原始格式)" fillcolor="#5E35B1" fontsize=9]
+		leg_proj [label="投影计算步骤\n(离线预处理)" fillcolor="#1E88E5" fontsize=9]
+		leg_layout [label="泛化布局输出\n(标准化格式)" fillcolor="#F9A825" fontsize=9]
+		leg_eval [label="评估分支\n(自动选择)" fillcolor="#43A047" fontsize=9]
+
+		leg_raw -> leg_proj [style=invis]
+		leg_proj -> leg_layout [style=invis]
+		leg_layout -> leg_eval [style=invis]
+	}
+}

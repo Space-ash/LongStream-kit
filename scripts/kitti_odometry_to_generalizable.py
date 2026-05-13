@@ -492,6 +492,7 @@ def _process_lidar_depths(
     save_depth_mask: bool,
     overwrite_depths: bool,
     num_workers: int,
+    out_stems: Optional[List[str]] = None,
     calib_sources: Optional[Dict[str, str]] = None,
     allow_missing_lidar_calib: bool = False,
 ) -> None:
@@ -533,12 +534,17 @@ def _process_lidar_depths(
         mask_out_dir = os.path.join(scene_out, "depth_masks", camera_out)
         os.makedirs(mask_out_dir, exist_ok=True)
 
-    def _process_one(fname: str) -> Optional[str]:
-        stem = Path(fname).stem
-        exr_path = os.path.join(depth_out_dir, f"{stem}.exr")
+    # 构建 (src_fname, out_stem) 对：src_fname 用于查找 velodyne bin，out_stem 用于命名输出 EXR
+    _resolved_out_stems = out_stems if out_stems is not None else [Path(f).stem for f in img_files]
+    file_pairs: List[Tuple[str, str]] = list(zip(img_files, _resolved_out_stems))
+
+    def _process_one(pair: Tuple[str, str]) -> Optional[str]:
+        fname, out_stem = pair
+        in_stem = Path(fname).stem
+        exr_path = os.path.join(depth_out_dir, f"{out_stem}.exr")
         if not overwrite_depths and os.path.exists(exr_path):
             return None  # 已存在，跳过
-        bin_path = os.path.join(velo_dir, f"{stem}.bin")
+        bin_path = os.path.join(velo_dir, f"{in_stem}.bin")
         if not os.path.isfile(bin_path):
             return f"[kitti_odometry] WARN: velodyne bin 不存在: {bin_path}"
         depth = project_velodyne_to_sparse_depth(
@@ -555,7 +561,7 @@ def _process_lidar_depths(
         if save_depth_mask and mask_out_dir is not None:
             mask = (depth > 0).astype(np.uint8) * 255
             _, buf = cv2.imencode(".png", mask)
-            np.array(buf).tofile(os.path.join(mask_out_dir, f"{stem}.png"))
+            np.array(buf).tofile(os.path.join(mask_out_dir, f"{out_stem}.png"))
         return None
 
     N = len(img_files)
@@ -566,7 +572,7 @@ def _process_lidar_depths(
 
     if num_workers > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
-            futures = {pool.submit(_process_one, fname): fname for fname in img_files}
+            futures = {pool.submit(_process_one, pair): pair for pair in file_pairs}
             done = 0
             for fut in concurrent.futures.as_completed(futures):
                 warn = fut.result()
@@ -576,8 +582,8 @@ def _process_lidar_depths(
                 if done % 500 == 0:
                     log(f"[kitti_odometry] seq {seq}: depth {done}/{N}")
     else:
-        for i, fname in enumerate(img_files):
-            warn = _process_one(fname)
+        for i, pair in enumerate(file_pairs):
+            warn = _process_one(pair)
             if warn:
                 log(warn)
             if (i + 1) % 500 == 0:
@@ -620,6 +626,7 @@ def process_sequence(
     overwrite_depths: bool = False,
     num_workers: int = 1,
     allow_missing_lidar_calib: bool = False,
+    max_frames: Optional[int] = None,
 ) -> None:
     """
     将 KITTI Odometry 中的一个 sequence 转换为 generalizable 格式。
@@ -727,6 +734,17 @@ def process_sequence(
     img_files = img_files[:N]
     w2c_seq_raw = w2c_seq_raw[:N]
 
+    # ------ 均匀抽帧（可选）------
+    if max_frames is not None and max_frames < N:
+        indices = np.unique(np.round(np.linspace(0, N - 1, max_frames)).astype(int))
+        img_files = [img_files[i] for i in indices]
+        w2c_seq_raw = w2c_seq_raw[indices]
+        N = len(img_files)
+        log(f"[kitti_odometry] seq {seq}: 均匀抽帧 {N} 帧（max_frames={max_frames}，原始 {N_poses} 帧）")
+
+    # 生成输出文件名：抽帧后按 0..N-1 重新顺序编号
+    new_stems = [f"{i:06d}" for i in range(N)]
+
     # ------ 读取一张图以获取 H / W ------
     sample_img = _imread_unicode(os.path.join(img_src_dir, img_files[0]))
     if sample_img is None:
@@ -738,9 +756,8 @@ def process_sequence(
     img_out_dir = os.path.join(scene_out, "images", camera_out)
     os.makedirs(img_out_dir, exist_ok=True)
     for tidx, fname in enumerate(img_files):
-        # 输出名称：6 位零填充，去掉原扩展名再加上 .png
-        stem = Path(fname).stem
-        dst_name = f"{stem}.png"
+        # 输出名称：抽帧后按序重新编号，6 位零填充
+        dst_name = f"{new_stems[tidx]}.png"
         src_path = os.path.join(img_src_dir, fname)
         dst_path = os.path.join(img_out_dir, dst_name)
         _link_or_copy(src_path, dst_path, copy=copy)
@@ -756,7 +773,7 @@ def process_sequence(
 
     camera_dict: Dict[str, dict] = {}
     for tidx, fname in enumerate(img_files):
-        name = Path(fname).stem          # e.g. "000000"
+        name = new_stems[tidx]           # e.g. "000000"（抽帧后重新顺序编号）
         w2c = w2c_anchored[tidx]         # (4, 4)
         R = w2c[:3, :3].copy()           # (3, 3)
         T = w2c[:3, 3:].copy()           # (3, 1)
@@ -800,6 +817,7 @@ def process_sequence(
             K=K,
             T_cam_i_cam0=T_cam_i_cam0,
             img_files=img_files,
+            out_stems=new_stems,
             camera_out=camera_out,
             H=H,
             W=W,
@@ -901,6 +919,16 @@ def main() -> None:
             "不中断预处理。默认为严格模式（fail fast）。"
         ),
     )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=None,
+        help=(
+            "从每个序列中均匀抽取至多 max_frames 帧进行预处理。"
+            "输出文件按抽取顺序重新编号为 000000.png, 000001.png, ...。"
+            "不指定时处理全部帧（默认行为）。"
+        ),
+    )
     args = parser.parse_args()
 
     kitti_root = os.path.abspath(args.kitti_root)
@@ -921,6 +949,7 @@ def main() -> None:
             overwrite_depths=args.overwrite_depths,
             num_workers=args.num_workers,
             allow_missing_lidar_calib=args.allow_missing_lidar_calib,
+            max_frames=args.max_frames,
         )
 
     # 写 data_roots.txt（扫描 out_root，包含所有已生成序列）
