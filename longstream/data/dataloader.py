@@ -152,6 +152,7 @@ class LongStreamSequenceInfo:
     image_dir: str
     image_paths: List[str]
     camera: Optional[str]
+    original_frame_indices: Optional[List[int]] = None
 
 
 class LongStreamSequence:
@@ -228,6 +229,12 @@ class LongStreamDataLoader:
         self.seq_list = cfg.get("seq_list", None)
         self.stride = int(cfg.get("stride", 1))
         self.max_frames = cfg.get("max_frames", None)
+        self.frame_start = cfg.get("frame_start", None)
+        self.frame_end = cfg.get("frame_end", None)
+        if self.frame_start is not None:
+            self.frame_start = int(self.frame_start)
+        if self.frame_end is not None:
+            self.frame_end = int(self.frame_end)
         self.size = int(cfg.get("size", 518))
         self.crop = bool(cfg.get("crop", False))
         self.patch_size = int(cfg.get("patch_size", 14))
@@ -384,7 +391,7 @@ class LongStreamDataLoader:
             return None
         return os.path.basename(image_dir)
 
-    def _collect_filelist(self, dir_path: str) -> List[str]:
+    def _collect_filelist(self, dir_path: str) -> Tuple[List[str], List[int]]:
         filelist = _direct_image_files(dir_path)
         if not filelist:
             nested = []
@@ -396,11 +403,32 @@ class LongStreamDataLoader:
                 if child_images:
                     nested.append(child_images[0])
             filelist = nested
+
+        frame_indices = list(range(len(filelist)))
+
+        start = 0 if self.frame_start is None else max(0, self.frame_start)
+        end_exclusive = (
+            len(filelist)
+            if self.frame_end is None
+            else min(len(filelist), self.frame_end + 1)
+        )
+
+        if start >= end_exclusive:
+            return [], []
+
+        filelist = filelist[start:end_exclusive]
+        frame_indices = frame_indices[start:end_exclusive]
+
         if self.stride > 1:
             filelist = filelist[:: self.stride]
+            frame_indices = frame_indices[:: self.stride]
+
         if self.max_frames is not None:
-            filelist = filelist[: self.max_frames]
-        return filelist
+            max_frames = int(self.max_frames)
+            filelist = filelist[:max_frames]
+            frame_indices = frame_indices[:max_frames]
+
+        return filelist, frame_indices
 
     def _load_images(self, filelist: List[str]) -> torch.Tensor:
         views = load_images_for_eval(
@@ -433,7 +461,7 @@ class LongStreamDataLoader:
                     continue
                 camera = None
 
-            filelist = self._collect_filelist(dir_path)
+            filelist, frame_indices = self._collect_filelist(dir_path)
             if not filelist:
                 continue
             yield LongStreamSequenceInfo(
@@ -441,19 +469,25 @@ class LongStreamDataLoader:
                 scene_root=scene_root,
                 image_dir=dir_path,
                 image_paths=filelist,
+                original_frame_indices=frame_indices,
                 camera=camera,
             )
 
     def _filter_image_paths(
-        self, image_paths: List[str]
-    ) -> Tuple[List[str], Optional[List[int]]]:
+        self,
+        image_paths: List[str],
+        source_indices: Optional[List[int]] = None,
+    ) -> Tuple[List[str], List[int]]:
         """
         当帧质量过滤开启时，逐帧评估 is_high_quality 并返回过滤后的路径列表，
-        同时返回被保留帧的原始索引列表（用于对齐 gt_poses）。
-        未开启过滤时直接返回原列表和 None。
+        同时返回被保留帧相对于原始预处理序列的真实帧号列表（用于对齐 gt_poses/gps）。
+        未开启过滤时直接返回原列表和 source_indices（保持原始帧号不变）。
         """
+        if source_indices is None:
+            source_indices = list(range(len(image_paths)))
+
         if not self.filter_enabled:
-            return image_paths, None
+            return image_paths, source_indices
 
         kept_paths: List[str] = []
         kept_indices: List[int] = []
@@ -471,7 +505,7 @@ class LongStreamDataLoader:
                 motion_threshold=self.filter_motion_threshold,
             ):
                 kept_paths.append(path)
-                kept_indices.append(idx)
+                kept_indices.append(source_indices[idx])
                 prev_img = img
 
         n_orig = len(image_paths)
@@ -558,6 +592,12 @@ class LongStreamDataLoader:
                     continue
                 if gps.ndim == 2 and gps.shape[1] == 3:
                     if kept_indices is not None:
+                        max_idx = max(kept_indices) if kept_indices else -1
+                        if max_idx >= len(gps):
+                            raise IndexError(
+                                f"GPS length={len(gps)} but requested frame index {max_idx}; "
+                                "check data.frame_start/frame_end/stride/max_frames."
+                            )
                         gps = gps[kept_indices]
                     print(
                         f"[longstream][gps] 已从文件加载 {len(gps)} 帧真实 GPS (path={path})",
@@ -579,7 +619,10 @@ class LongStreamDataLoader:
                 flush=True,
             )
             # 帧质量过滤（可选）—— 筛帧和 GT 子采样一次完成
-            filtered_paths, kept_indices = self._filter_image_paths(info.image_paths)
+            filtered_paths, kept_indices = self._filter_image_paths(
+                info.image_paths,
+                info.original_frame_indices,
+            )
             # GT 位姿加载（统一入口，带筛帧子采样）
             gt_poses, gt_source = self._resolve_gt_poses(
                 info.scene_root, info.camera, kept_indices

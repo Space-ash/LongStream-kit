@@ -65,6 +65,8 @@ data:
   seq_list: ["drone_scene"]
   camera: "00"
   stride: 1
+  frame_start: null          # 0-based 闭区间起始帧，null 表示从头
+  frame_end: null            # 0-based 闭区间结束帧，null 表示到末尾
   max_frames: null           # null = 全量；可改为整数限制帧数
   size: 518
   crop: false
@@ -86,17 +88,17 @@ optimizations:
     tto_steps: 20
     tto_lr: 1.0e-3
     tto_weight_decay: 0.0
-    tto_window_size: 40
+    tto_window_size: 20
     tto_min_gps_disp: 1.0
     tto_max_grad_norm: 1.0
     tto_pair_stride: 8
-    tto_pair_strides: [4, 8, 16, 32]
+    tto_pair_strides: [4, 8, 16]
     tto_sampling: deterministic_coverage
     tto_lambda_dir: 0.1
     tto_lambda_endpoint: 0.2
     tto_early_stop_patience: 4
     tto_min_delta: 1.0e-3
-    tto_batch_windows: 2
+    tto_batch_windows: 1
     tto_steps_initial: 12
     tto_steps_update: 4
     tto_update_interval_frames: 40
@@ -128,9 +130,9 @@ output:
   root: outputs/drone_scene/drone_scene
   save_videos: false
   save_images: false
-  save_depth: false
+  save_depth: true
   save_points: true
-  save_frame_points: false
+  save_frame_points: true
   save_point_head: false
   save_dpt_unproj: true
   enable_sky_mask: true
