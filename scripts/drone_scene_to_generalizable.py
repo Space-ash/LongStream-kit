@@ -1209,9 +1209,9 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--src",
-        default="drone_scene",
-        help="输入目录，包含 drone_scene.avi / odom_data.csv 等。默认 drone_scene。",
+        "--input-root",
+        default="../drone_scene",
+        help="输入目录，包含 drone_scene.avi / odom_data.csv 等。默认 ../drone_scene。",
     )
     parser.add_argument(
         "--out",
@@ -1316,7 +1316,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # 路径解析（相对于 cwd）
-    src = args.src
+    src = args.input_root
     out = args.out
 
     # 解析 --ocr-roi
@@ -1327,7 +1327,7 @@ def main() -> None:
 
     log("=" * 60)
     log("[drone_scene] 开始预处理")
-    log(f"  src         : {os.path.abspath(src)}")
+    log(f"  input_root  : {os.path.abspath(src)}")
     log(f"  out         : {os.path.abspath(out)}")
     log(f"  scene_name  : {args.scene_name}")
     log(f"  camera_id   : {args.camera_id}")
