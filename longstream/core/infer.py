@@ -377,6 +377,242 @@ def _tto_multiscale_loss_inline(pred_centers, gps_tto, pair_strides, min_gps_dis
     return torch.stack(losses).sum()
 
 
+# ---------------------------------------------------------------------------
+# Boundary-refresh TTO helpers
+# ---------------------------------------------------------------------------
+
+def _tto_build_boundary_indices(S, keyframe_stride, refresh):
+    """构建 batch_refresh 新 batch 起点（接缝边界）索引列表。
+
+    step_frames = (refresh-1)*keyframe_stride 是相邻拼接之间的有效帧数。
+    boundaries = [step_frames, 2*step_frames, ...] in [0, S)。
+
+    Returns:
+        boundaries     : List[int]
+        step_frames    : int
+        frames_per_batch: int
+    """
+    step_frames = (refresh - 1) * keyframe_stride
+    frames_per_batch = step_frames + 1
+    boundaries = list(range(step_frames, S, step_frames))
+    return boundaries, step_frames, frames_per_batch
+
+
+def _run_tto_boundary_refresh_forward(
+    model,
+    images,              # [B, S, C, H, W]，可在 CPU 或 device 上
+    device,
+    selector,
+    streaming_mode,
+    rel_pose_num_iters,
+    keyframe_stride,
+    refresh,
+    boundary,            # int：新 batch 起点（全局帧号）
+):
+    """对接缝两侧的 prev/next 局部 batch 独立前向推理，返回相机中心。
+
+    两个 batch 分开 forward 并及时释放，不 cat，以控制显存。
+    使用 SKIP_DENSE_HEADS=1（通过 _run_tto_pose_forward 保证）。
+
+    Returns:
+        dict 含 centers_prev [T_prev,3]、centers_next [T_next,3] 及元信息，
+        或 None（帧数不足）。
+    """
+    S = images.shape[1]
+    step_frames = (refresh - 1) * keyframe_stride
+    frames_per_batch = step_frames + 1
+
+    prev_start = max(0, boundary - step_frames)
+    prev_end = min(prev_start + frames_per_batch, S)
+    next_start = boundary
+    next_end = min(next_start + frames_per_batch, S)
+
+    T_prev = prev_end - prev_start
+    T_next = next_end - next_start
+
+    if T_prev < 2 or T_next < 2:
+        return None
+
+    # ---- prev local batch ----
+    images_prev = images[:, prev_start:prev_end].to(device)
+    B = images_prev.shape[0]
+    is_kf_prev, kfi_prev = selector.select_keyframes(T_prev, B, device)
+    outputs_prev = _run_tto_pose_forward(
+        model, images_prev, is_kf_prev, kfi_prev, streaming_mode, rel_pose_num_iters
+    )
+    if "rel_pose_enc" in outputs_prev:
+        centers_prev = _compute_camera_centers_differentiable(
+            outputs_prev["rel_pose_enc"][0], kfi_prev[0]
+        )
+    elif "pose_enc" in outputs_prev:
+        centers_prev = _compute_camera_centers_differentiable(
+            outputs_prev["pose_enc"][0], keyframe_indices=None
+        )
+    else:
+        del outputs_prev, images_prev
+        return None
+    del outputs_prev, images_prev
+
+    # ---- next local batch ----
+    images_next = images[:, next_start:next_end].to(device)
+    is_kf_next, kfi_next = selector.select_keyframes(T_next, B, device)
+    # 与 run_batch_refresh 一致：新 batch 第 0 帧强制为 keyframe
+    is_kf_next[:, 0] = True
+    kfi_next[:, 0] = 0
+    outputs_next = _run_tto_pose_forward(
+        model, images_next, is_kf_next, kfi_next, streaming_mode, rel_pose_num_iters
+    )
+    if "rel_pose_enc" in outputs_next:
+        centers_next = _compute_camera_centers_differentiable(
+            outputs_next["rel_pose_enc"][0], kfi_next[0]
+        )
+    elif "pose_enc" in outputs_next:
+        centers_next = _compute_camera_centers_differentiable(
+            outputs_next["pose_enc"][0], keyframe_indices=None
+        )
+    else:
+        del outputs_next, images_next
+        return None
+    del outputs_next, images_next
+
+    return {
+        "centers_prev": centers_prev,    # [T_prev, 3]
+        "centers_next": centers_next,    # [T_next, 3]
+        "prev_start": prev_start,
+        "next_start": next_start,
+        "step_frames": step_frames,
+        "T_prev": T_prev,
+        "T_next": T_next,
+    }
+
+
+def _tto_boundary_refresh_loss_inline(
+    fwd_result,
+    gps_tensor,           # [S, 3] on device
+    boundary,             # int：新 batch 起点（全局帧号 b）
+    min_gps_disp,         # float：boundary 专用 GPS 位移阈值
+    duplicate_weight,     # float：同帧一致性损失权重
+):
+    """计算 batch_refresh 接缝处的诊断 loss。
+
+    b = boundary（新 batch 起点）。真实拼接为 prev 保留 global b，
+    next 丢弃 local 0，保留 global b+1，断点是 b -> b+1。
+
+    pair 说明：
+      1. exact seam  : global b   -> (b+1)  [真实拼接断点，主 pair，用于日志]
+      2. bridge pair : global (b-1) -> (b+1) [跨接缝桥接，辅助约束]
+      3. next-start  : global (b+1) -> (b+2) [新 batch 起点局部尺度]
+      4. prev-end    : global (b-1) -> b      [旧 batch 末端一跳参照]
+      5. duplicate   : prev local b == next local 0 [同帧两上下文一致性]
+
+    每个有效 pair 的 loss = huber_vec + 0.5 * huber_disp。
+
+    Returns:
+        (loss_tensor_or_None, info_dict)
+        info_dict 含 seam_pred/seam_gps（exact seam）、bridge_pred/bridge_gps、dup。
+    """
+    F_nn = torch.nn.functional
+    centers_prev = fwd_result["centers_prev"]   # [T_prev, 3]
+    centers_next = fwd_result["centers_next"]   # [T_next, 3]
+    prev_start = fwd_result["prev_start"]
+    T_prev = fwd_result["T_prev"]
+    T_next = fwd_result["T_next"]
+    S_gps = gps_tensor.shape[0]
+
+    losses = []
+    info = {}
+
+    # local_dup_prev = index of global frame b in prev batch coords
+    local_dup_prev = boundary - prev_start      # global b in prev coords
+    local_bridge_prev = local_dup_prev - 1      # global b-1 in prev coords
+
+    # -- 1. Exact seam: prev local b -> next local 1 ; global b -> (b+1) --
+    if (
+        0 <= local_dup_prev < T_prev
+        and T_next > 1
+        and boundary + 1 < S_gps
+    ):
+        gps_exact = gps_tensor[boundary + 1] - gps_tensor[boundary]
+        gps_exact_disp = torch.linalg.norm(gps_exact).item()
+        if gps_exact_disp > min_gps_disp:
+            pred_exact = centers_next[1] - centers_prev[local_dup_prev]
+            loss_vec = F_nn.huber_loss(pred_exact, gps_exact)
+            loss_disp = F_nn.huber_loss(
+                torch.linalg.norm(pred_exact),
+                torch.linalg.norm(gps_exact).detach(),
+            )
+            losses.append(loss_vec + 0.5 * loss_disp)
+            info["seam_pred"] = torch.linalg.norm(pred_exact).detach().item()
+            info["seam_gps"] = gps_exact_disp
+
+    # -- 2. Bridge pair: prev local (b-1) -> next local 1 ; global (b-1) -> (b+1) --
+    if (
+        0 <= local_bridge_prev < T_prev
+        and T_next > 1
+        and boundary - 1 >= 0
+        and boundary + 1 < S_gps
+    ):
+        gps_bridge = gps_tensor[boundary + 1] - gps_tensor[boundary - 1]
+        gps_bridge_disp = torch.linalg.norm(gps_bridge).item()
+        if gps_bridge_disp > min_gps_disp:
+            pred_bridge = centers_next[1] - centers_prev[local_bridge_prev]
+            losses.append(
+                F_nn.huber_loss(pred_bridge, gps_bridge)
+                + 0.5 * F_nn.huber_loss(
+                    torch.linalg.norm(pred_bridge),
+                    torch.linalg.norm(gps_bridge).detach(),
+                )
+            )
+            info["bridge_pred"] = torch.linalg.norm(pred_bridge).detach().item()
+            info["bridge_gps"] = gps_bridge_disp
+
+    # -- 3. Next-start pair: next local 1->2 ; global (b+1)->(b+2) --
+    if T_next > 2 and boundary + 2 < S_gps:
+        gps_nb = gps_tensor[boundary + 2] - gps_tensor[boundary + 1]
+        gps_nb_disp = torch.linalg.norm(gps_nb).item()
+        if gps_nb_disp > min_gps_disp:
+            pred_nb = centers_next[2] - centers_next[1]
+            losses.append(
+                F_nn.huber_loss(pred_nb, gps_nb)
+                + 0.5 * F_nn.huber_loss(
+                    torch.linalg.norm(pred_nb),
+                    torch.linalg.norm(gps_nb).detach(),
+                )
+            )
+
+    # -- 4. Prev-end pair: prev local (b-1)->b ; global (b-1)->b --
+    if (
+        0 <= local_bridge_prev
+        and local_dup_prev < T_prev
+        and boundary - 1 >= 0
+        and boundary < S_gps
+    ):
+        gps_pe = gps_tensor[boundary] - gps_tensor[boundary - 1]
+        gps_pe_disp = torch.linalg.norm(gps_pe).item()
+        if gps_pe_disp > min_gps_disp:
+            pred_pe = centers_prev[local_dup_prev] - centers_prev[local_bridge_prev]
+            losses.append(
+                F_nn.huber_loss(pred_pe, gps_pe)
+                + 0.5 * F_nn.huber_loss(
+                    torch.linalg.norm(pred_pe),
+                    torch.linalg.norm(gps_pe).detach(),
+                )
+            )
+
+    # -- 5. Duplicate consistency: same global frame b in prev/next --
+    if 0 <= local_dup_prev < T_prev:
+        loss_dup = F_nn.huber_loss(centers_prev[local_dup_prev], centers_next[0])
+        losses.append(duplicate_weight * loss_dup)
+        info["dup"] = torch.linalg.norm(
+            (centers_prev[local_dup_prev] - centers_next[0]).detach()
+        ).item()
+
+    if not losses:
+        return None, info
+
+    return torch.stack(losses).sum(), info
+
+
 def run_inference_cfg(cfg: dict):
     device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     device_type = torch.device(device).type
@@ -429,6 +665,13 @@ def run_inference_cfg(cfg: dict):
     tto_early_stop_patience = int(corr_cfg.get("tto_early_stop_patience", 0))
     tto_min_delta = float(corr_cfg.get("tto_min_delta", 1.0e-3))
     tto_batch_windows = int(corr_cfg.get("tto_batch_windows", 1))
+    # Boundary-refresh TTO diagnostic loss 配置
+    tto_boundary_enabled = bool(corr_cfg.get("tto_boundary_enabled", False))
+    tto_boundary_weight = float(corr_cfg.get("tto_boundary_weight", 1.0))
+    tto_boundary_min_gps_disp = float(corr_cfg.get("tto_boundary_min_gps_disp", 0.005))
+    tto_boundary_batch_windows = int(corr_cfg.get("tto_boundary_batch_windows", 1))
+    tto_boundary_log = bool(corr_cfg.get("tto_boundary_log", True))
+    tto_boundary_duplicate_weight = float(corr_cfg.get("tto_boundary_duplicate_weight", 0.2))
     initial_scale_token = None
     if tto_enabled:
         if not hasattr(model.longstream, "scale_token"):
@@ -575,6 +818,26 @@ def run_inference_cfg(cfg: dict):
                         f" valid_windows={len(valid_start_indices)}",
                         flush=True,
                     )
+                    # 构建 batch_refresh 接缝边界索引
+                    _boundary_indices = []
+                    if tto_boundary_enabled and mode == "batch_refresh":
+                        _boundary_indices, _step_frames_bnd, _ = (
+                            _tto_build_boundary_indices(min_len, keyframe_stride, refresh)
+                        )
+                        if _boundary_indices:
+                            print(
+                                f"[longstream][TTO-boundary] seq={seq.name}"
+                                f" boundaries={_boundary_indices}"
+                                f" step_frames={_step_frames_bnd}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[longstream][TTO-boundary] seq={seq.name}"
+                                f" no boundaries found (min_len={min_len},"
+                                f" step_frames={_step_frames_bnd}), disabled",
+                                flush=True,
+                            )
                     model.eval()
                     best_loss = float("inf")
                     bad_steps = 0
@@ -642,7 +905,8 @@ def run_inference_cfg(cfg: dict):
 
                             pred_centers = torch.stack(centers, dim=0)  # [B_tto, T, 3]
 
-                            loss = _tto_multiscale_loss_inline(
+                            # ---- 主窗口 loss：计算后立即 backward，释放 graph ----
+                            main_loss = _tto_multiscale_loss_inline(
                                 pred_centers,
                                 gps_tto,
                                 _pair_strides,
@@ -650,27 +914,87 @@ def run_inference_cfg(cfg: dict):
                                 tto_lambda_dir,
                                 tto_lambda_endpoint,
                             )
+                            main_loss_value = 0.0
+                            _had_any_loss = False
+                            if main_loss is not None:
+                                main_loss_value = float(main_loss.detach().item())
+                                _had_any_loss = True
+                                with CriticalOperationProfiler(
+                                    f"TTO_backward_main_seq_{seq.name}_step_{step}"
+                                ):
+                                    main_loss.backward()
+                            # 主窗口 graph 已释放，立即清理引用
+                            del main_loss, pred_centers, centers, gps_tto, outputs_tto, images_tto
+                            outputs_tto = None
 
-                            if loss is None:
+                            # ---- boundary-refresh seam loss：每 boundary 独立 forward+backward ----
+                            boundary_total_value = 0.0
+                            _bd_info_list = []
+                            if tto_boundary_enabled and _boundary_indices:
+                                _sel_bds = [
+                                    _boundary_indices[step % len(_boundary_indices)]
+                                ]
+                                for _ in range(tto_boundary_batch_windows - 1):
+                                    _sel_bds.append(random.choice(_boundary_indices))
+                                for _b in _sel_bds:
+                                    _fwd = _run_tto_boundary_refresh_forward(
+                                        model, images, device, selector,
+                                        streaming_mode, rel_pose_num_iters,
+                                        keyframe_stride, refresh, _b,
+                                    )
+                                    if _fwd is not None:
+                                        _b_loss, _b_info = _tto_boundary_refresh_loss_inline(
+                                            _fwd, gps_tensor, _b,
+                                            tto_boundary_min_gps_disp,
+                                            tto_boundary_duplicate_weight,
+                                        )
+                                        if _b_loss is not None:
+                                            _weighted = tto_boundary_weight * _b_loss
+                                            boundary_total_value += float(
+                                                _weighted.detach().item()
+                                            )
+                                            _had_any_loss = True
+                                            _weighted.backward()
+                                            del _weighted, _b_loss
+                                            _b_info["boundary"] = _b
+                                            _bd_info_list.append(_b_info)
+                                        else:
+                                            del _b_loss
+                                        del _fwd
+
+                            # 本 step 无任何有效 loss，终止 TTO
+                            if not _had_any_loss:
                                 if step == 0:
                                     print(
                                         f"[longstream][TTO] seq={seq.name}"
                                         " step=0 无有效 GPS 配对，跳过 TTO",
                                         flush=True,
                                     )
-                                    tto_skipped = True
-                                del outputs_tto, images_tto
-                                outputs_tto = None
+                                tto_skipped = True
                                 break
 
                             with CriticalOperationProfiler(f"TTO_backward_seq_{seq.name}_step_{step}"):
-                                loss.backward()
                                 torch.nn.utils.clip_grad_norm_(
                                     [model.longstream.scale_token], tto_max_grad_norm
                                 )
                                 tto_seq_optimizer.step()
 
-                            loss_value = float(loss.detach().item())
+                            loss_value = main_loss_value + boundary_total_value
+
+                            if (
+                                tto_boundary_log
+                                and _bd_info_list
+                                and (step == 0 or (step + 1) % 5 == 0)
+                            ):
+                                for _bi in _bd_info_list:
+                                    print(
+                                        f"[TTO-boundary] step={step + 1}"
+                                        f" boundary={_bi.get('boundary', '?')}"
+                                        f" seam_pred={_bi.get('seam_pred', float('nan')):.3f}"
+                                        f" seam_gps={_bi.get('seam_gps', float('nan')):.3f}"
+                                        f" dup={_bi.get('dup', float('nan')):.3f}",
+                                        flush=True,
+                                    )
 
                             if step == 0 or (step + 1) % 5 == 0:
                                 print(
@@ -694,13 +1018,7 @@ def run_inference_cfg(cfg: dict):
                                     f" best_loss={best_loss:.6f}",
                                     flush=True,
                                 )
-                                del outputs_tto, images_tto
-                                outputs_tto = None
                                 break
-
-                            # 显式释放局部引用，避免图引用滞留
-                            del outputs_tto, images_tto
-                            outputs_tto = None
 
                     if not tto_skipped:
                         print(
@@ -709,6 +1027,32 @@ def run_inference_cfg(cfg: dict):
                             f"{model.longstream.scale_token.data.norm().item():.4f}",
                             flush=True,
                         )
+                        # ---- Post-TTO boundary diagnostic (pose-only, no grad) ----
+                        if tto_boundary_enabled and _boundary_indices and tto_boundary_log:
+                            print(
+                                f"[TTO-boundary] === Post-TTO diagnostic: seq={seq.name} ===\n"
+                                f"{'boundary':>10} {'seam_pred':>10} {'seam_gps':>10} {'dup':>10}",
+                                flush=True,
+                            )
+                            for _b_diag in _boundary_indices:
+                                _fwd_diag = _run_tto_boundary_refresh_forward(
+                                    model, images, device, selector,
+                                    streaming_mode, rel_pose_num_iters,
+                                    keyframe_stride, refresh, _b_diag,
+                                )
+                                if _fwd_diag is not None:
+                                    _, _bi_diag = _tto_boundary_refresh_loss_inline(
+                                        _fwd_diag, gps_tensor, _b_diag,
+                                        tto_boundary_min_gps_disp,
+                                        tto_boundary_duplicate_weight,
+                                    )
+                                    print(
+                                        f"{_b_diag:>10}"
+                                        f" {_bi_diag.get('seam_pred', float('nan')):>10.3f}"
+                                        f" {_bi_diag.get('seam_gps', float('nan')):>10.3f}"
+                                        f" {_bi_diag.get('dup', float('nan')):>10.3f}",
+                                        flush=True,
+                                    )
 
                 if outputs_tto is not None:
                     del outputs_tto

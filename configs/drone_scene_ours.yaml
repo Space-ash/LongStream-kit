@@ -103,6 +103,13 @@ optimizations:
     tto_steps_update: 4
     tto_update_interval_frames: 40
     tto_window_step: 40
+    # Boundary-refresh TTO diagnostic loss（接缝诊断，仅 batch_refresh 模式生效）
+    tto_boundary_enabled: true
+    tto_boundary_weight: 1.0
+    tto_boundary_min_gps_disp: 0.005
+    tto_boundary_batch_windows: 1
+    tto_boundary_log: true
+    tto_boundary_duplicate_weight: 0.2
   pose_post_correction:
     enabled: true
     method: segment_se3
