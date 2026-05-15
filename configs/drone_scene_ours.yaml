@@ -1,6 +1,8 @@
-# KITTI Odometry 05, first 500 frames, non-streaming.
-# Variant G: optimized-strength TTO + best-so-far GPS segment SE3 correction.
-# Purpose: recover optimized-style depth metrics while keeping post-corrected pose export.
+﻿# drone_scene 测试配置
+# 用途：对无人机场景数据（drone_scene）进行重建+轨迹校正。
+# 数据预处理：python scripts/drone_scene_to_generalizable.py
+#   (默认输出到 prepared_inputs/drone_scene/)
+# 运行方式：python infer.py --config configs/drone_scene_ours.yaml
 
 device: cuda
 
@@ -59,17 +61,17 @@ inference:
 data:
   format: generalizable
   data_roots_file: data_roots.txt
-  img_path: prepared_inputs/kitti_odometry_500
-  seq_list: ["07"]
-  camera: "02"
+  img_path: prepared_inputs/drone_scene
+  seq_list: ["drone_scene"]
+  camera: "00"
   stride: 1
-  max_frames: 500
+  max_frames: null           # null = 全量；可改为整数限制帧数
   size: 518
   crop: false
   patch_size: 14
-  gt_source: auto
-  gt_poses_file: gt_poses.npy
-  depth_gt_type: auto
+  gt_source: auto            # 自动检测 gps_xyz.npy；无 GT 深度/位姿
+  gt_poses_file: null        # 无相机位姿真值
+  depth_gt_type: none        # 无深度真值
 
 optimizations:
   filter:
@@ -123,7 +125,7 @@ optimizations:
       kalman_dt: 1.0
 
 output:
-  root: outputs/kitti_odometry_500/07
+  root: outputs/drone_scene/drone_scene
   save_videos: false
   save_images: false
   save_depth: false
@@ -157,17 +159,6 @@ output:
   opencv_num_threads: 1
   timing_log_interval: 0
   vram_log_enabled: false
-
-evaluation:
-  align_scale: false
-  depth_rel_delta_threshold: 1.25
-  point_f1_threshold: 0.25
-  point_eval_max_points: 100000
-  point_eval_voxel_size: null
-  point_eval_oversample_factor: 4
-  sparse_depth_pointcloud_policy: recall_only
-  allow_sparse_chamfer_f1: false
-  min_valid_depth_pixels: 1
 
 monitoring:
   enabled: true

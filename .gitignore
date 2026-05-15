@@ -3,6 +3,7 @@
 # Local model
 model/
 KITTI_Odometry/
+drone_scene/
 
 # Python cache and build artifacts
 __pycache__/
