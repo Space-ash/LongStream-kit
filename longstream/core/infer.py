@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import yaml
@@ -613,6 +614,389 @@ def _tto_boundary_refresh_loss_inline(
     return torch.stack(losses).sum(), info
 
 
+# ---------------------------------------------------------------------------
+# Overlap-stitching helpers (C1 方案)
+# ---------------------------------------------------------------------------
+
+def _center_from_extri(extri_4x4):
+    """从 4x4 w2c 矩阵提取相机世界坐标中心 [3]"""
+    R = extri_4x4[:3, :3]
+    t = extri_4x4[:3, 3]
+    return -R.T @ t
+
+
+def _align_centers_fixed_scale(src, dst, scale):
+    """
+    Kabsch 对齐：dst ≈ scale * R @ src + t
+
+    src: [N, 3] new overlap centers
+    dst: [N, 3] stitched old overlap centers
+    Returns: R [3,3], t [3]
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    src_mean = src.mean(0)
+    dst_mean = dst.mean(0)
+    src_c = src - src_mean
+    dst_c = dst - dst_mean
+    cov = dst_c.T @ (scale * src_c)
+    U, _, Vt = np.linalg.svd(cov)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+    t = dst_mean - scale * (R @ src_mean)
+    return R, t
+
+
+def _apply_sim3_to_w2c(extri_local, scale, R_align, t_align):
+    """
+    对 [N, 4, 4] w2c 矩阵应用 Sim3(scale, R_align, t_align) 变换。
+
+    世界坐标变换：C_new = scale * R_align @ C_old + t_align
+    对应旋转变换：Rcw_new = (R_align @ Rwc_old)^T = Rwc_old^T @ R_align^T
+    但更直接写法见下方 einsum。
+    """
+    extri_local = np.asarray(extri_local, dtype=np.float64)
+    Rcw = extri_local[:, :3, :3]           # [N, 3, 3]
+    tcw = extri_local[:, :3, 3]            # [N, 3]
+    C   = -np.einsum("nij,nj->ni", Rcw.transpose(0, 2, 1), tcw)  # [N, 3]
+    C2  = scale * (R_align @ C.T).T + t_align                     # [N, 3]
+    Rwc  = Rcw.transpose(0, 2, 1)                                  # [N, 3, 3]
+    Rwc2 = np.einsum("ij,njk->nik", R_align, Rwc)                 # [N, 3, 3]
+    Rcw2 = Rwc2.transpose(0, 2, 1)                                 # [N, 3, 3]
+    t2   = -np.einsum("nij,nj->ni", Rcw2, C2)                     # [N, 3]
+    out  = np.zeros_like(extri_local)
+    out[:, :3, :3] = Rcw2
+    out[:, :3, 3]  = t2
+    out[:, 3, 3]   = 1.0
+    return out.astype(np.float32)
+
+
+def _run_batch_refresh_overlap_export(
+    model,
+    images,
+    selector,
+    streaming_mode,
+    keyframe_stride,
+    refresh,
+    rel_pose_cfg,
+    H,
+    W,
+    stitch_cfg,
+    device,
+):
+    """
+    Overlap batch refresh 推理路径（C1 方案）。
+
+    单 batch 仍是 frames_per_batch=(refresh-1)*keyframe_stride+1 帧（不增加显存），
+    但相邻 batch 步长缩短为 step_frames = frames_per_batch - overlap_frames，
+    使相邻 batch 有 overlap_frames 帧重叠。
+    通过深度中值比 + Kabsch 算法估计 batch 间 Sim3 并拼接。
+
+    Returns dict:
+        depth        : torch.Tensor [1, S, H, W, 1] on CPU
+        depth_conf   : torch.Tensor [1, S, H, W, 1] or None
+        extri_np     : np.ndarray [S, 4, 4]
+        intri_np     : np.ndarray [S, 3, 3]
+        stitch_report: list[dict]
+    """
+    B, S = images.shape[:2]
+
+    overlap_frames  = int(stitch_cfg.get("overlap_frames", 9))
+    scale_min       = float(stitch_cfg.get("scale_min", 0.25))
+    scale_max       = float(stitch_cfg.get("scale_max", 1.5))
+    min_ov_frames   = int(stitch_cfg.get("min_overlap_frames", 4))
+    blend_overlap   = str(stitch_cfg.get("blend_overlap", "keep_old"))
+
+    refresh_intervals = refresh - 1
+    frames_per_batch  = refresh_intervals * keyframe_stride + 1
+    step_frames       = frames_per_batch - overlap_frames
+
+    if step_frames < 1:
+        raise ValueError(
+            f"overlap_frames={overlap_frames} must be < "
+            f"frames_per_batch={frames_per_batch}"
+        )
+
+    # ---------- batch start 列表 ----------
+    # 先确定 last_start，再从 0 到 last_start（包含）生成，避免 step 赶过 last_start 后
+    # 出现尾部多个无新帧的冠余 batch。
+    last_start = max(0, S - frames_per_batch)
+    starts = list(range(0, last_start + 1, step_frames))
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    starts = sorted(set(starts))
+
+    # ---------- stitched 缓冲 ----------
+    stitched_extri      = [None] * S
+    stitched_intri      = [None] * S
+    stitched_depth      = np.zeros((S, H, W), dtype=np.float32)
+    stitched_depth_conf = [None] * S
+    filled              = np.zeros(S, dtype=bool)
+
+    rel_pose_num_iters = rel_pose_cfg.get("num_iterations", 4) if rel_pose_cfg else 4
+    stitch_report: list = []
+
+    dev_is_cuda = (
+        (isinstance(device, str) and "cuda" in device)
+        or (isinstance(device, torch.device) and device.type == "cuda")
+    )
+
+    for batch_idx, start in enumerate(starts):
+        end = min(start + frames_per_batch, S)
+        T   = end - start
+
+        batch_images = images[:, start:end].to(device)
+        is_kf, kfi   = selector.select_keyframes(T, B, device)
+
+        if batch_idx > 0:
+            is_kf[:, 0] = True
+            kfi[:, 0]   = 0
+
+        rel_pose_inputs = None
+        if rel_pose_cfg is not None:
+            rel_pose_inputs = {
+                "is_keyframe":      is_kf,
+                "keyframe_indices": kfi,
+                "num_iterations":   rel_pose_num_iters,
+            }
+
+        with CriticalOperationProfiler(
+            f"overlap_batch_refresh_forward_batch_{batch_idx}"
+        ):
+            batch_outputs = model(
+                images=batch_images,
+                mode=streaming_mode,
+                rel_pose_inputs=rel_pose_inputs,
+                is_keyframe=is_kf,
+            )
+        del batch_images
+
+        # ---------- decode local pose ----------
+        extri_local, intri_local, _ = _decode_predicted_extri_intri(
+            batch_outputs, kfi, H, W
+        )
+        if extri_local is None or "depth" not in batch_outputs:
+            print(
+                f"[overlap-stitch] batch={batch_idx} start={start}: "
+                "pose/depth decode failed, skipping",
+                flush=True,
+            )
+            del batch_outputs
+            if dev_is_cuda:
+                torch.cuda.empty_cache()
+            continue
+
+        depth_local = (
+            batch_outputs["depth"][0, :, :, :, 0].detach().cpu().numpy()
+        )  # [T, H, W]
+
+        depth_conf_local = None
+        _raw_dc = batch_outputs.get("depth_conf")
+        if _raw_dc is not None:
+            try:
+                dc_arr = _raw_dc[0].detach().cpu().numpy()
+                if dc_arr.ndim == 4:
+                    dc_arr = dc_arr[..., 0]
+                depth_conf_local = dc_arr  # [T, H, W]
+            except Exception:
+                depth_conf_local = None
+
+        del batch_outputs
+        if dev_is_cuda:
+            torch.cuda.empty_cache()
+
+        global_indices = np.arange(start, end)
+
+        # -------- 第 0 批：直接写入 --------
+        if batch_idx == 0:
+            for li, g in enumerate(global_indices):
+                stitched_extri[g]  = extri_local[li]
+                stitched_intri[g]  = intri_local[li]
+                stitched_depth[g]  = depth_local[li]
+                if depth_conf_local is not None:
+                    stitched_depth_conf[g] = depth_conf_local[li]
+                filled[g] = True
+            stitch_report.append({
+                "batch_idx": 0,
+                "start": int(start),
+                "end": int(end),
+                "overlap_frames": [],
+                "new_only_start": int(start),
+                "s_depth": None,
+                "scale_used": None,
+                "pose_rmse_before": None,
+                "pose_rmse_after": None,
+                "depth_ratio_median_before": None,
+                "depth_ratio_median_after": None,
+                "fallback": False,
+            })
+            print(
+                f"[overlap-stitch] batch=0 start={start} end={end}"
+                " (first batch, direct write)",
+                flush=True,
+            )
+            continue
+
+        # -------- overlap 对齐 --------
+        overlap_global   = [int(g) for g in global_indices if filled[g]]
+        new_only_global  = [int(g) for g in global_indices if not filled[g]]
+        local_ov_indices = [int(g - start) for g in overlap_global]
+
+        fallback = len(overlap_global) < min_ov_frames
+        report: dict = {
+            "batch_idx": batch_idx,
+            "start": int(start),
+            "end": int(end),
+            "overlap_frames": overlap_global,
+            "new_only_start": int(new_only_global[0]) if new_only_global else int(end),
+            "s_depth": None,
+            "scale_used": None,
+            "pose_rmse_before": None,
+            "pose_rmse_after": None,
+            "depth_ratio_median_before": None,
+            "depth_ratio_median_after": None,
+            "fallback": fallback,
+        }
+
+        if fallback:
+            print(
+                f"[overlap-stitch] batch={batch_idx} start={start} "
+                f"overlap={len(overlap_global)} < min={min_ov_frames},"
+                " fallback (hard append)",
+                flush=True,
+            )
+            for li, g in enumerate(global_indices):
+                if not filled[g]:
+                    stitched_extri[g]  = extri_local[li]
+                    stitched_intri[g]  = intri_local[li]
+                    stitched_depth[g]  = depth_local[li]
+                    if depth_conf_local is not None:
+                        stitched_depth_conf[g] = depth_conf_local[li]
+                    filled[g] = True
+            stitch_report.append(report)
+            continue
+
+        # -------- 深度尺度：robust median --------
+        def _median_depth(d):
+            pos = d[d > 0]
+            return float(np.median(pos)) if pos.size > 0 else float(np.median(d))
+
+        old_meds = np.array([_median_depth(stitched_depth[g]) for g in overlap_global])
+        new_meds = np.array([_median_depth(depth_local[li]) for li in local_ov_indices])
+        valid    = new_meds > 1e-6
+        if valid.sum() < 2:
+            s_depth = 1.0
+        else:
+            ratios  = old_meds[valid] / new_meds[valid]
+            s_depth = float(np.median(ratios))
+        s_depth = float(np.clip(s_depth, scale_min, scale_max))
+
+        # -------- Kabsch 位姿对齐 --------
+        C_old = np.array(
+            [_center_from_extri(stitched_extri[g]) for g in overlap_global],
+            dtype=np.float64,
+        )
+        C_new = np.array(
+            [_center_from_extri(extri_local[li]) for li in local_ov_indices],
+            dtype=np.float64,
+        )
+
+        pose_rmse_before = float(np.sqrt(np.mean(
+            np.sum((C_old - s_depth * C_new) ** 2, axis=-1)
+        )))
+        depth_ratio_before = (
+            float(np.median(old_meds[valid] / new_meds[valid])) if valid.any() else 1.0
+        )
+
+        R_align, t_align   = _align_centers_fixed_scale(C_new, C_old, s_depth)
+        extri_aligned      = _apply_sim3_to_w2c(extri_local, s_depth, R_align, t_align)
+        depth_local_scaled = depth_local * s_depth
+
+        C_new_after = np.array(
+            [_center_from_extri(extri_aligned[li]) for li in local_ov_indices],
+            dtype=np.float64,
+        )
+        pose_rmse_after = float(np.sqrt(np.mean(
+            np.sum((C_old - C_new_after) ** 2, axis=-1)
+        )))
+
+        # depth_ratio_median_after: median(old / (new * s_depth))，理论上应接近 1.0
+        depth_ratio_after = (
+            float(np.median(old_meds[valid] / (new_meds[valid] * s_depth)))
+            if valid.any() else 1.0
+        )
+        report.update({
+            "s_depth":                   s_depth,
+            "scale_used":                s_depth,
+            "pose_rmse_before":          pose_rmse_before,
+            "pose_rmse_after":           pose_rmse_after,
+            "depth_ratio_median_before": depth_ratio_before,
+            "depth_ratio_median_after":  depth_ratio_after,
+        })
+
+        # -------- 写入帧 --------
+        for li, g in enumerate(global_indices):
+            if filled[g] and blend_overlap == "keep_old":
+                continue
+            stitched_extri[g]  = extri_aligned[li]
+            stitched_intri[g]  = intri_local[li]
+            stitched_depth[g]  = depth_local_scaled[li]
+            if depth_conf_local is not None:
+                stitched_depth_conf[g] = depth_conf_local[li]
+            filled[g] = True
+
+        stitch_report.append(report)
+        print(
+            f"[overlap-stitch] batch={batch_idx} start={start}"
+            f" overlap={len(overlap_global)} s_depth={s_depth:.4f}"
+            f" pose_rmse_before={pose_rmse_before:.4f}"
+            f" pose_rmse_after={pose_rmse_after:.4f}",
+            flush=True,
+        )
+
+    # ---------- 完整性检查 ----------
+    unfilled = np.where(~filled)[0]
+    if len(unfilled) > 0:
+        print(
+            f"[overlap-stitch] WARNING: {len(unfilled)} frames unfilled"
+            f" (first 10: {unfilled[:10].tolist()})",
+            flush=True,
+        )
+
+    # ---------- 组装输出 ----------
+    extri_out    = np.stack(stitched_extri, axis=0)  # [S, 4, 4]
+    intri_out    = np.stack(stitched_intri, axis=0)  # [S, 3, 3]
+    depth_tensor = (
+        torch.from_numpy(stitched_depth).unsqueeze(0).unsqueeze(-1)
+    )  # [1, S, H, W, 1]
+
+    depth_conf_tensor = None
+    if any(x is not None for x in stitched_depth_conf):
+        try:
+            dc_arr = np.stack(
+                [
+                    x if x is not None else np.zeros((H, W), dtype=np.float32)
+                    for x in stitched_depth_conf
+                ],
+                axis=0,
+            )  # [S, H, W]
+            depth_conf_tensor = (
+                torch.from_numpy(dc_arr).unsqueeze(0).unsqueeze(-1)
+            )  # [1, S, H, W, 1]
+        except Exception:
+            depth_conf_tensor = None
+
+    return {
+        "depth":          depth_tensor,
+        "depth_conf":     depth_conf_tensor,
+        "extri_np":       extri_out,
+        "intri_np":       intri_out,
+        "stitch_report":  stitch_report,
+    }
+
+
 def run_inference_cfg(cfg: dict):
     device = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
     device_type = torch.device(device).type
@@ -710,6 +1094,10 @@ def run_inference_cfg(cfg: dict):
         mode = "streaming_refresh"
     streaming_mode = infer_cfg.get("streaming_mode", "causal")
     window_size = int(infer_cfg.get("window_size", 5))
+    stitch_cfg = dict(infer_cfg.get("stitch", {}))
+    # 允许将 inference.overlap_frames 作为顶层配置传入，
+    # stitch 子段的同名字段优先级更高。
+    stitch_cfg.setdefault("overlap_frames", infer_cfg.get("overlap_frames", 9))
 
     selector = KeyframeSelector(
         min_interval=keyframe_stride,
@@ -1058,6 +1446,7 @@ def run_inference_cfg(cfg: dict):
                     del outputs_tto
                     outputs_tto = None
 
+            overlap_result = None
             if mode == "batch_refresh":
                 with CriticalOperationProfiler(f"refresh_batch_refresh_seq_{seq.name}"):
                     outputs = run_batch_refresh(
@@ -1082,6 +1471,27 @@ def run_inference_cfg(cfg: dict):
                         refresh,
                         rel_pose_cfg,
                     )
+            elif mode == "batch_refresh_overlap":
+                with CriticalOperationProfiler(
+                    f"refresh_batch_refresh_overlap_seq_{seq.name}"
+                ):
+                    overlap_result = _run_batch_refresh_overlap_export(
+                        model=model,
+                        images=images,
+                        selector=selector,
+                        streaming_mode=streaming_mode,
+                        keyframe_stride=keyframe_stride,
+                        refresh=refresh,
+                        rel_pose_cfg=rel_pose_cfg,
+                        H=H,
+                        W=W,
+                        stitch_cfg=stitch_cfg,
+                        device=device,
+                    )
+                outputs = {
+                    "depth":      overlap_result["depth"],
+                    "depth_conf": overlap_result.get("depth_conf"),
+                }
             else:
                 raise ValueError(f"Unsupported inference mode: {mode}")
             print(f"[longstream] sequence {seq.name}: inference done", flush=True)
@@ -1100,9 +1510,31 @@ def run_inference_cfg(cfg: dict):
             # ============================================================
             # 统一解码预测位姿（只做一次）
             # ============================================================
-            extri_np, intri_np, rel_pose_enc = _decode_predicted_extri_intri(
-                outputs, keyframe_indices, H, W
-            )
+            if overlap_result is not None:
+                extri_np     = overlap_result["extri_np"]
+                intri_np     = overlap_result["intri_np"]
+                rel_pose_enc = None
+            else:
+                extri_np, intri_np, rel_pose_enc = _decode_predicted_extri_intri(
+                    outputs, keyframe_indices, H, W
+                )
+
+            # ============================================================
+            # 保存 overlap stitch 诊断报告（batch_refresh_overlap 专用）
+            # ============================================================
+            if overlap_result is not None and stitch_cfg.get("save_report", True):
+                _diag_dir = os.path.join(seq_dir, "diagnostics")
+                _ensure_dir(_diag_dir)
+                _report_path = os.path.join(
+                    _diag_dir, "batch_overlap_stitch_report.json"
+                )
+                with open(_report_path, "w", encoding="utf-8") as _rp_f:
+                    json.dump(
+                        overlap_result.get("stitch_report", []), _rp_f, indent=2
+                    )
+                print(
+                    f"[overlap-stitch] saved report: {_report_path}", flush=True
+                )
 
             # ============================================================
             # GPS 分段 SE3 后处理（可选，仅在 gps_source="file" 时生效）

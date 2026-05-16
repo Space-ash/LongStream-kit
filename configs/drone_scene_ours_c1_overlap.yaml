@@ -1,0 +1,123 @@
+﻿# drone_scene C1 配置：overlap batch refresh 拼接方案
+# 基于 drone_scene_ours.yaml，改用 batch_refresh_overlap 模式。
+# 单 batch 仍为 25 帧（不增加显存），相邻 batch 有 9 帧 overlap，
+# 通过深度中值 + Kabsch 估计 batch 间 Sim3 变换并拼接。
+#
+# 运行方式：python infer.py --config configs/drone_scene_ours_c1_overlap.yaml
+
+device: cuda
+
+model:
+  checkpoint: checkpoints/50_longstream.pt
+  strict_load: false
+  hf:
+    repo_id: null
+    filename: null
+    revision: null
+    local_dir: checkpoints
+  longstream_cfg:
+    img_size: 518
+    patch_size: 14
+    embed_dim: 1024
+    window_size: 48
+    use_role_embedding: false
+    enable_scale_token: true
+    disable_keyframe_distinction: true
+    use_segment_mask: false
+    enable_camera_head: false
+    use_rel_pose_head: true
+    freeze: none
+    rel_pose_head_cfg:
+      enabled: true
+      keyframe_mode: fixed
+      keyframe_stride: 8
+      reference_source: pred
+      detach_reference: false
+      trunk_depth: 4
+      pose_mode: SE3
+      num_heads: 16
+      mlp_ratio: 4
+      init_values: 0.01
+      trans_act: linear
+      quat_act: linear
+      use_pair_cross_attn: false
+      xattn_temperature: 1.0
+      use_precat: false
+      use_kf_role_embed: false
+      kf_role_embed_init_std: 0.02
+      fl_act: relu
+      use_global_scale: false
+      reinit_camera_head: false
+
+inference:
+  mode: batch_refresh_overlap       # C1 新模式
+  streaming_mode: causal
+  window_size: 48
+  keyframe_mode: fixed
+  keyframe_stride: 8
+  refresh: 4                        # frames_per_batch = (4-1)*8+1 = 25
+  overlap_frames: 9                 # step_frames = 25-9 = 16
+  rel_pose_head_cfg:
+    num_iterations: 4
+  stitch:
+    enabled: true
+    scale_source: depth             # 主尺度驱动：深度中值比
+    scale_min: 0.25
+    scale_max: 1.5
+    min_overlap_frames: 4           # overlap 不足时 fallback 到 hard append
+    blend_overlap: keep_old         # overlap 区域保留旧 stitched 结果
+    save_report: true               # 保存诊断报告到 diagnostics/batch_overlap_stitch_report.json
+
+data:
+  format: generalizable
+  data_roots_file: data_roots.txt
+  img_path: prepared_inputs/drone_scene
+  seq_list: ["drone_scene"]
+  camera: "00"
+  stride: 1
+  frame_start: 200
+  frame_end: 270
+  max_frames: null
+  size: 518
+  crop: false
+  patch_size: 14
+  gt_source: auto
+  gt_poses_file: null
+  depth_gt_type: none
+
+optimizations:
+  filter:
+    frame_filter_enabled: false
+    confidence_filter_enabled: true
+  correction:
+    tto_enabled: false              # 关闭 TTO：C1 不需要，避免干扰
+  pose_post_correction:
+    enabled: false                  # 显式禁止 GPS SE(3) 后处理，避免配置复制时意外开启
+
+output:
+  root: outputs/drone_scene/drone_scene_200to270_c1_overlap
+  save_videos: false
+  save_images: false
+  save_depth: true
+  save_points: true
+  save_frame_points: true
+  save_point_head: false
+  save_dpt_unproj: true
+  enable_sky_mask: true
+  save_sky_mask: false
+  skyseg_path: model/skyseg.onnx
+  skyseg_num_threads: 1
+  skyseg_provider: auto
+  skyseg_cuda_min_free_gb: 4.0
+  skyseg_reuse_enabled: false
+  skyseg_stride: 4
+  skyseg_run_on_keyframes: true
+  skyseg_max_stale_frames: 8
+  skyseg_cache_enabled: true
+  skyseg_cache_dir: null
+  max_full_pointcloud_points: 2000000
+  max_frame_pointcloud_points: 200000
+  torch_num_threads: 2
+  opencv_num_threads: 1
+  timing_log_interval: 0
+  vram_log_enabled: false

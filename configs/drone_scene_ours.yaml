@@ -65,8 +65,8 @@ data:
   seq_list: ["drone_scene"]
   camera: "00"
   stride: 1
-  frame_start: null          # 0-based 闭区间起始帧，null 表示从头
-  frame_end: null            # 0-based 闭区间结束帧，null 表示到末尾
+  frame_start: 200          # 0-based 闭区间起始帧，null 表示从头
+  frame_end: 270            # 0-based 闭区间结束帧，null 表示到末尾
   max_frames: null           # null = 全量；可改为整数限制帧数
   size: 518
   crop: false
